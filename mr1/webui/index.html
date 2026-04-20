@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MR1 Web Visualizer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">MR1</p>
+          <h1>Web timeline</h1>
+        </div>
+        <div class="topbar-actions">
+          <button id="followButton" class="ghost-button">Follow MR1</button>
+          <div id="statusPill" class="status-pill">Connecting…</div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="stage-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Timeline tree</h2>
+              <p>Job-only view. MR1 anchors live work while finished branches freeze and darken.</p>
+            </div>
+            <div class="panel-meta">
+              <span id="zoomValue">2.0s / 96px</span>
+              <span id="runningCount">0 running</span>
+            </div>
+          </div>
+          <canvas id="timelineCanvas" width="1400" height="620"></canvas>
+        </section>
+
+        <aside class="side-panel">
+          <section class="card">
+            <h3>Controls</h3>
+            <ul>
+              <li>Drag left/right to scrub time</li>
+              <li>Scroll to zoom</li>
+              <li>Press <kbd>f</kbd> to relock on MR1</li>
+              <li>Use <kbd>/test spawn agents 3</kbd> to create a demo tree</li>
+            </ul>
+          </section>
+          <section class="card">
+            <h3>Session</h3>
+            <p id="sessionMeta">Waiting for snapshot…</p>
+          </section>
+          <section class="card">
+            <div class="section-head">
+              <h3>Jobs</h3>
+              <span id="jobMeta">0 total</span>
+            </div>
+            <div id="jobList" class="job-list"></div>
+          </section>
+          <section class="card">
+            <h3>Latest</h3>
+            <p id="latestEvent">No events yet.</p>
+          </section>
+        </aside>
+      </main>
+
+      <section class="bottom-row">
+        <section class="card transcript-card">
+          <div class="section-head">
+            <h3>Conversation</h3>
+            <span id="conversationMeta">0 messages</span>
+          </div>
+          <div id="conversationList" class="conversation-list"></div>
+        </section>
+
+        <section class="card prompt-card">
+          <div class="section-head">
+            <h3>Talk to MR1</h3>
+            <span>viewer + prompt</span>
+          </div>
+          <form id="promptForm" class="prompt-form">
+            <textarea
+              id="promptInput"
+              rows="5"
+              placeholder="Ask MR1 something, or run /test spawn agents 3 and /test kill agents."
+            ></textarea>
+            <div class="prompt-actions">
+              <p id="promptStatus">Idle.</p>
+              <button type="submit" id="sendButton">Send</button>
+            </div>
+          </form>
+        </section>
+      </section>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

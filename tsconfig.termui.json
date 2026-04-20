@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsxImportSource": "@termuijs/jsx"
+  },
+  "include": ["viz-termui/**/*.ts", "viz-termui/**/*.tsx", "viz/**/*.ts"]
+}

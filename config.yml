@@ -1,0 +1,7 @@
+# MR1 System Configuration
+# ========================
+
+# Maximum depth of the MRn agent hierarchy.
+# MR1 (level 1) is always present. MR2..MR{h} can be spawned.
+# At level h, agents can only spawn Kazis — no more managers.
+height_limit: 4

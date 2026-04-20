@@ -1,0 +1,4 @@
+{"timestamp":"2026-04-20T16:57:26.120782+00:00","task_id":"test-agent-8176787b-d2-n2","agent_type":"test_agent","action":"delegate","result":"ok","metadata":{"description":"synthetic branch depth 2 node 2","parent_task_id":"test-agent-8176787b-d1-n0","lane":"conversation"}}
+{"timestamp":"2026-04-20T16:57:26.122484+00:00","task_id":"test-agent-8176787b-d2-n2","agent_type":"test_agent","action":"spawn","result":"ok","metadata":{"pid":62795,"cmd":["python","-m","mr1.test_worker"]}}
+{"timestamp":"2026-04-20T16:57:50.355147+00:00","task_id":"test-agent-8176787b-d2-n2","agent_type":"test_agent","action":"exit","result":"ok","metadata":{"pid":62795,"returncode":0}}
+{"timestamp":"2026-04-20T16:57:50.355611+00:00","task_id":"test-agent-8176787b-d2-n2","agent_type":"test_agent","action":"complete","result":"ok","metadata":{"duration_s":24.23,"lane":"conversation"}}

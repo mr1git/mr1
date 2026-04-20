@@ -1,0 +1,13 @@
+# Kazi — Task worker
+# Executes scoped, well-defined units of work. No delegation capability.
+
+name: kazi
+model: haiku
+allowed_tools:
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+lifetime: ephemeral     # Spawned per-task, exits when done.
+memory_access: rag_only # Can query memory via RAG but cannot write to it.

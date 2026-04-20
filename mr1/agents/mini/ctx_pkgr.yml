@@ -1,0 +1,13 @@
+# ctx_pkgr — Context Packager
+# Assembles relevant context (files, memory, task history) into a
+# structured bundle that gets injected into agent prompts.
+
+name: ctx_pkgr
+model: claude-haiku-4-5
+allowed_tools:
+  - Read
+  - Glob
+  - Grep
+  - Write
+lifetime: ephemeral
+memory_access: rag_only # Reads memory to package it, but never writes.

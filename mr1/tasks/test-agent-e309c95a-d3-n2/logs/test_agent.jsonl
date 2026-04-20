@@ -1,0 +1,2 @@
+{"timestamp":"2026-04-20T16:51:52.010503+00:00","task_id":"test-agent-e309c95a-d3-n2","agent_type":"test_agent","action":"delegate","result":"ok","metadata":{"description":"synthetic branch depth 3 node 2","parent_task_id":"test-agent-e309c95a-d2-n0","lane":"conversation"}}
+{"timestamp":"2026-04-20T16:51:52.011813+00:00","task_id":"test-agent-e309c95a-d3-n2","agent_type":"test_agent","action":"spawn","result":"ok","metadata":{"pid":60324,"cmd":["python","-m","mr1.test_worker"]}}

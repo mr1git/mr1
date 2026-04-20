@@ -1,0 +1,4 @@
+{"timestamp":"2026-04-20T16:53:57.971246+00:00","task_id":"test-agent-67b455d6-d0-n0","agent_type":"test_agent","action":"delegate","result":"ok","metadata":{"description":"synthetic branch depth 0 node 0","parent_task_id":"mr1","lane":"conversation"}}
+{"timestamp":"2026-04-20T16:53:57.973959+00:00","task_id":"test-agent-67b455d6-d0-n0","agent_type":"test_agent","action":"spawn","result":"ok","metadata":{"pid":61250,"cmd":["python","-m","mr1.test_worker"]}}
+{"timestamp":"2026-04-20T16:54:24.247125+00:00","task_id":"test-agent-67b455d6-d0-n0","agent_type":"test_agent","action":"exit","result":"ok","metadata":{"pid":61250,"returncode":0}}
+{"timestamp":"2026-04-20T16:54:24.247562+00:00","task_id":"test-agent-67b455d6-d0-n0","agent_type":"test_agent","action":"complete","result":"ok","metadata":{"duration_s":26.27,"lane":"conversation"}}

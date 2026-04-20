@@ -1,0 +1,158 @@
+# MR1 Permission Allowlist
+# ========================
+# Defines exactly what each agent type is permitted to execute.
+# If a command or flag is not listed here, the dispatcher REJECTS it.
+# No wildcards. No defaults. No exceptions.
+
+agents:
+  mr1:
+    description: "Top-level orchestrator — can spawn mr2, kazi"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+      - "--output-format"
+      - "--append-system-prompt"
+    shell_commands:
+      - "ls"
+      - "cat"
+      - "echo"
+      - "mkdir"
+      - "cp"
+    allowed_tools:
+      - "Read"
+      - "Write"
+      - "Edit"
+      - "Bash"
+      - "Glob"
+      - "Grep"
+      - "Agent"
+
+  mr2:
+    description: "Job orchestrator — can spawn mr3, kazi"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+      - "--output-format"
+      - "--bare"
+      - "--dangerously-skip-permissions"
+    shell_commands:
+      - "ls"
+      - "cat"
+      - "echo"
+      - "mkdir"
+      - "cp"
+      - "git"
+      - "npm"
+      - "python3"
+    allowed_tools:
+      - "Read"
+      - "Write"
+      - "Edit"
+      - "Bash"
+      - "Glob"
+      - "Grep"
+
+  mr3:
+    description: "Task executor — can spawn kazi, mr4+ if height allows"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+      - "--output-format"
+      - "--bare"
+      - "--dangerously-skip-permissions"
+    shell_commands:
+      - "ls"
+      - "cat"
+      - "echo"
+      - "mkdir"
+      - "cp"
+      - "git"
+      - "npm"
+      - "python3"
+    allowed_tools:
+      - "Read"
+      - "Write"
+      - "Edit"
+      - "Bash"
+      - "Glob"
+      - "Grep"
+
+  kazi:
+    description: "Task worker — scoped to file operations and search"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+      - "--output-format"
+      - "--bare"
+      - "--dangerously-skip-permissions"
+    shell_commands:
+      - "ls"
+      - "cat"
+      - "echo"
+    allowed_tools:
+      - "Read"
+      - "Write"
+      - "Edit"
+      - "Glob"
+      - "Grep"
+
+  mem_dltr:
+    description: "Memory deletion agent — can remove memory files"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+    shell_commands:
+      - "rm"
+      - "ls"
+    allowed_tools:
+      - "Read"
+      - "Bash"
+
+  mem_rtvr:
+    description: "Memory retrieval agent — read-only access to memory"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+    shell_commands:
+      - "ls"
+      - "cat"
+    allowed_tools:
+      - "Read"
+      - "Glob"
+      - "Grep"
+
+  ctx_pkgr:
+    description: "Context packager — reads and bundles context for other agents"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+    shell_commands:
+      - "ls"
+      - "cat"
+      - "echo"
+    allowed_tools:
+      - "Read"
+      - "Glob"
+      - "Grep"
+      - "Write"
+
+  com_smrzr:
+    description: "Communication summarizer — read-only, produces summaries"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+    shell_commands:
+      - "cat"
+      - "ls"
+    allowed_tools:
+      - "Read"
+      - "Glob"
+      - "Grep"

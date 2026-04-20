@@ -1,0 +1,10 @@
+# mem_dltr — Memory Deletion Agent
+# Handles garbage collection and pruning of stale memory entries.
+
+name: mem_dltr
+model: claude-haiku-4-5
+allowed_tools:
+  - Read
+  - Bash
+lifetime: ephemeral
+memory_access: full     # Needs write access to delete memory files.

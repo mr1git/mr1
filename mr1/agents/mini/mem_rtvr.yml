@@ -1,0 +1,11 @@
+# mem_rtvr — Memory Retrieval Agent
+# Fetches and ranks relevant memory entries for context packaging.
+
+name: mem_rtvr
+model: claude-haiku-4-5
+allowed_tools:
+  - Read
+  - Glob
+  - Grep
+lifetime: ephemeral
+memory_access: rag_only # Read-only access to memory stores.

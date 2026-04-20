@@ -1,0 +1,19 @@
+# MRn — Parameterized manager agent (levels 2+)
+# Model and role vary by level. Level is passed at spawn time.
+
+name: mrn
+level_models:
+  1: haiku    # MR1: persistent, talks to human
+  2: haiku    # MR2: job orchestrator
+  3: haiku    # MR3: task executor
+  4: haiku    # MR4+: deeper task executors
+default_model: haiku
+allowed_tools:
+  - Read
+  - Write
+  - Edit
+  - Bash
+  - Glob
+  - Grep
+lifetime: ephemeral     # MRn (n>=2) are spawned per-job, then die.
+memory_access: full

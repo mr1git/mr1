@@ -1,0 +1,11 @@
+# com_smrzr — Communication Summarizer
+# Produces concise summaries of agent outputs, task results, and logs.
+
+name: com_smrzr
+model: claude-haiku-4-5
+allowed_tools:
+  - Read
+  - Glob
+  - Grep
+lifetime: ephemeral
+memory_access: none     # Pure function — reads inputs, writes summary to stdout.
