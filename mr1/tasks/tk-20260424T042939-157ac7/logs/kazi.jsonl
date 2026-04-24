@@ -1,2 +1,0 @@
-{"timestamp":"2026-04-24T04:29:59.738499+00:00","task_id":"tk-20260424T042939-157ac7","agent_type":"kazi","action":"spawn","result":"ok","metadata":{"pid":16319,"cmd":["claude","-p","Say the file appeared.","--model","haiku","--allowedTools","Read,Write,Edit,Glob,Grep","--output-format","json","--bare","--dangerously-skip-permissions"]}}
-{"timestamp":"2026-04-24T04:30:01.749641+00:00","task_id":"tk-20260424T042939-157ac7","agent_type":"kazi","action":"exit","result":"error","metadata":{"pid":16319,"returncode":1}}
