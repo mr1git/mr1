@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
+from mr1.dataflow import Artifact, TaskInputSpec
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -142,6 +144,7 @@ class Task:
     last_check_result: Optional[dict[str, Any]] = None
     condition: Optional[dict[str, Any]] = None
     depends_on: list[str] = field(default_factory=list)
+    inputs: list[TaskInputSpec] = field(default_factory=list)
     status: TaskStatus = TaskStatus.CREATED
     created_by: Optional[Provenance] = None
     created_at: str = field(default_factory=_now_iso)
@@ -153,6 +156,11 @@ class Task:
     log_stdout_path: Optional[str] = None
     log_stderr_path: Optional[str] = None
     result_path: Optional[str] = None
+    output_path: Optional[str] = None
+    inputs_path: Optional[str] = None
+    materialized_prompt_path: Optional[str] = None
+    artifacts: list[Artifact] = field(default_factory=list)
+    dataflow_error: Optional[str] = None
     blocked_reason: Optional[str] = None
     blocked_by: list[str] = field(default_factory=list)
     blocked_at: Optional[str] = None
@@ -165,6 +173,8 @@ class Task:
         d = asdict(self)
         d["status"] = self.status.value
         d["created_by"] = self.created_by.to_dict() if self.created_by else None
+        d["inputs"] = [item.to_dict() for item in self.inputs]
+        d["artifacts"] = [artifact.to_dict() for artifact in self.artifacts]
         return d
 
     @classmethod
@@ -188,6 +198,10 @@ class Task:
             condition=dict(data["condition"])
             if data.get("condition") is not None else None,
             depends_on=list(data.get("depends_on", [])),
+            inputs=[
+                TaskInputSpec.from_dict(item)
+                for item in data.get("inputs", [])
+            ],
             status=TaskStatus(data.get("status", "created")),
             created_by=(
                 Provenance.from_dict(raw_created_by)
@@ -202,6 +216,14 @@ class Task:
             log_stdout_path=data.get("log_stdout_path"),
             log_stderr_path=data.get("log_stderr_path"),
             result_path=data.get("result_path"),
+            output_path=data.get("output_path"),
+            inputs_path=data.get("inputs_path"),
+            materialized_prompt_path=data.get("materialized_prompt_path"),
+            artifacts=[
+                Artifact.from_dict(item)
+                for item in data.get("artifacts", [])
+            ],
+            dataflow_error=data.get("dataflow_error"),
             blocked_reason=data.get("blocked_reason"),
             blocked_by=list(data.get("blocked_by", [])),
             blocked_at=data.get("blocked_at"),

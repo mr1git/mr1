@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, PropertyMock
 
 import pytest
+from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.mr1 import (
     MR1,
     MR1Process,
@@ -300,6 +301,68 @@ class TestWorkflowBuiltinCommands:
         events_result = mr1_instance._handle_builtin(f"/events {wf_id}")
         assert events_result is not None
         assert "workflow_submitted" in events_result
+
+    def test_result_inputs_and_artifacts_commands(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        a = wf.task_by_label("a")
+        b = wf.task_by_label("b")
+        mr1_instance._workflow_store.write_task_output(
+            wf_id,
+            a.task_id,
+            TaskOutput(
+                task_id=a.task_id,
+                workflow_id=wf_id,
+                status="succeeded",
+                summary="done",
+                text="hello world",
+                artifacts=[
+                    Artifact(
+                        artifact_id="art-1",
+                        workflow_id=wf_id,
+                        task_id=a.task_id,
+                        name="report",
+                        kind="json",
+                        path="/tmp/report.json",
+                    )
+                ],
+            ),
+        )
+        mr1_instance._workflow_store.write_task_inputs(
+            wf_id,
+            b.task_id,
+            [
+                ResolvedTaskInput(
+                    name="producer_text",
+                    source="a.result.text",
+                    resolved_task_id=a.task_id,
+                    resolved_type="text",
+                    value="hello world",
+                )
+            ],
+        )
+        a.artifacts = [
+            Artifact(
+                artifact_id="art-1",
+                workflow_id=wf_id,
+                task_id=a.task_id,
+                name="report",
+                kind="json",
+                path="/tmp/report.json",
+            )
+        ]
+        mr1_instance._workflow_store.save_workflow(wf)
+
+        result_output = mr1_instance._handle_builtin(f"/result {a.task_id}")
+        assert "hello world" in result_output
+
+        inputs_output = mr1_instance._handle_builtin(f"/inputs {b.task_id}")
+        assert "producer_text" in inputs_output
+
+        artifacts_output = mr1_instance._handle_builtin(f"/artifacts {wf_id}")
+        assert "report" in artifacts_output
 
     def test_shutdown_stops_scheduler(self, mr1_instance):
         mr1_instance._process = MagicMock(spec=MR1Process)

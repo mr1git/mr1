@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from mr1.dataflow import ResolvedTaskInput, TaskOutput
 from mr1.workflow_models import (
     Provenance,
     Task,
@@ -193,6 +194,46 @@ class TestResults:
 
     def test_read_missing(self, store):
         assert store.read_result("wf-1", "tk-1") is None
+
+    def test_write_and_load_task_output(self, store):
+        output = TaskOutput(
+            task_id="tk-1",
+            workflow_id="wf-1",
+            status="succeeded",
+            summary="done",
+            text="hello",
+        )
+        path = store.write_task_output("wf-1", "tk-1", output)
+        assert path.exists()
+        loaded = store.load_task_output("wf-1", "tk-1")
+        assert loaded is not None
+        assert loaded.to_dict() == output.to_dict()
+
+    def test_write_and_load_task_inputs(self, store):
+        inputs = [
+            ResolvedTaskInput(
+                name="producer_text",
+                source="produce.result.text",
+                resolved_task_id="tk-1",
+                resolved_type="text",
+                value="hello",
+            )
+        ]
+        path = store.write_task_inputs("wf-1", "tk-2", inputs)
+        assert path.exists()
+        loaded = store.load_task_inputs("wf-1", "tk-2")
+        assert loaded is not None
+        assert [item.to_dict() for item in loaded] == [item.to_dict() for item in inputs]
+
+    def test_write_materialized_prompt(self, store):
+        path = store.write_materialized_prompt("wf-1", "tk-2", "prompt body")
+        assert path.exists()
+        assert path.read_text(encoding="utf-8") == "prompt body"
+
+    def test_task_artifacts_dir_created(self, store):
+        path = store.task_artifacts_dir("wf-1", "tk-1")
+        assert path.exists()
+        assert path.is_dir()
 
 
 class TestLockingAtomicity:

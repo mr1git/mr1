@@ -153,6 +153,9 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/workflow submit <path>` | Load a JSON spec from disk and submit it |
 | `/workflow trigger <id> <label-or-task-id> [event_name]` | Trigger a manual watcher |
 | `/task <id>` | Show one task's detail |
+| `/result <task_id>` | Show one task's normalized output |
+| `/inputs <task_id>` | Show one task's resolved workflow inputs |
+| `/artifacts <workflow_id>` | List registered artifacts for a workflow |
 | `/jobs` | List live workflow tasks |
 | `/watchers` | List active watcher tasks |
 | `/events <workflow_id>` | Show recent workflow events |
@@ -187,6 +190,9 @@ You can submit the same spec without entering MR1 by using the deterministic CLI
 python -m mr1.workflow_cli submit path/to/workflow.json
 python -m mr1.workflow_cli workflows
 python -m mr1.workflow_cli workflow <workflow_id>
+python -m mr1.workflow_cli result <task_id>
+python -m mr1.workflow_cli inputs <task_id>
+python -m mr1.workflow_cli artifacts <workflow_id>
 ```
 
 Phase 2 watcher tasks use `task_kind: "watcher"` plus a watcher-specific `watcher_type` and `watch_config`:
@@ -226,6 +232,96 @@ An example watcher workflow is available at `examples/workflows/watcher_demo.jso
 3. Create the file with `touch /tmp/mr1_watcher_demo.txt`.
 4. Run `/scheduler tick` again.
 5. Confirm the watcher succeeded and the downstream Kazi task unlocked.
+
+## Phase 3: Workflow Dataflow + Artifacts
+
+Phase 3 standardises task outputs and lets downstream tasks consume upstream results through deterministic references. `depends_on` still controls scheduling only. `inputs` controls data passing.
+
+Normalized task outputs are written to:
+
+```text
+mr1/memory/workflows/<wf_id>/tasks/<task_id>/output.json
+```
+
+The normalized schema is:
+
+```json
+{
+  "task_id": "tk-...",
+  "workflow_id": "wf-...",
+  "status": "succeeded",
+  "summary": "Short human-readable summary",
+  "text": "Main textual output",
+  "data": {},
+  "metrics": {},
+  "artifacts": [],
+  "created_at": "...",
+  "metadata": {}
+}
+```
+
+Supported input references:
+
+```text
+<label>.result
+<label>.result.summary
+<label>.result.text
+<label>.result.data
+<label>.result.data.<key>
+<label>.result.metrics
+<label>.result.metrics.<key>
+<label>.stdout
+<label>.stderr
+<label>.artifact.<artifact_name>
+```
+
+Artifact metadata is stored by path and never inlined into `workflow.json`. Artifact names are exact-match and must be unique per task.
+
+Example Phase 3 workflow:
+
+```json
+{
+  "title": "Dataflow demo",
+  "tasks": [
+    {
+      "label": "producer",
+      "title": "Produce text",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "prompt": "Write hello world."
+    },
+    {
+      "label": "consumer",
+      "title": "Consume producer output",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": ["producer"],
+      "inputs": [
+        {"name": "producer_text", "from": "producer.result.text"}
+      ],
+      "prompt": "Summarize the producer text."
+    }
+  ]
+}
+```
+
+Phase 3 adds deterministic inspection commands:
+
+```bash
+python -m mr1.workflow_cli result <task_id>
+python -m mr1.workflow_cli inputs <task_id>
+python -m mr1.workflow_cli artifacts <workflow_id>
+```
+
+Manual smoke test with `examples/workflows/dataflow_demo.json`:
+
+1. Submit the workflow.
+2. Run `/scheduler tick` until the producer succeeds.
+3. Confirm `tasks/<producer_task_id>/output.json` exists.
+4. Confirm the consumer has `inputs.json` and `materialized_prompt.txt`.
+5. Run `/result <producer_task_id>`.
+6. Run `/inputs <consumer_task_id>`.
+7. Run `/artifacts <workflow_id>` and confirm it behaves deterministically even when no artifacts are present.
 
 ## Running mem_dltr manually
 

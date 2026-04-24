@@ -1,0 +1,28 @@
+{
+  "title": "Dataflow Demo",
+  "tasks": [
+    {
+      "label": "producer",
+      "title": "Produce text",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "prompt": "Write hello world."
+    },
+    {
+      "label": "consumer",
+      "title": "Consume producer output",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": [
+        "producer"
+      ],
+      "inputs": [
+        {
+          "name": "producer_text",
+          "from": "producer.result.text"
+        }
+      ],
+      "prompt": "Summarize the producer text."
+    }
+  ]
+}

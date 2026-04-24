@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.workflow_models import Workflow, WorkflowEvent
 
 
@@ -79,6 +80,26 @@ class WorkflowStore:
         base = self.workflow_dir(workflow_id) / "tasks" / task_id
         base.mkdir(parents=True, exist_ok=True)
         return base / "result.json"
+
+    def task_output_path(self, workflow_id: str, task_id: str) -> Path:
+        base = self.workflow_dir(workflow_id) / "tasks" / task_id
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "output.json"
+
+    def task_inputs_path(self, workflow_id: str, task_id: str) -> Path:
+        base = self.workflow_dir(workflow_id) / "tasks" / task_id
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "inputs.json"
+
+    def materialized_prompt_path(self, workflow_id: str, task_id: str) -> Path:
+        base = self.workflow_dir(workflow_id) / "tasks" / task_id
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "materialized_prompt.txt"
+
+    def task_artifacts_dir(self, workflow_id: str, task_id: str) -> Path:
+        base = self.workflow_dir(workflow_id) / "tasks" / task_id / "artifacts"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
 
     # ------------------------------------------------------------------
     # Locking
@@ -209,17 +230,80 @@ class WorkflowStore:
         payload: dict[str, Any],
     ) -> Path:
         """Write the final result.json for a task. Atomic."""
+        return self._write_json_file(
+            self.task_result_path(workflow_id, task_id),
+            payload,
+        )
+
+    def write_task_output(
+        self,
+        workflow_id: str,
+        task_id: str,
+        output: TaskOutput | dict[str, Any],
+    ) -> Path:
+        payload = output.to_dict() if isinstance(output, TaskOutput) else dict(output)
+        return self._write_json_file(
+            self.task_output_path(workflow_id, task_id),
+            payload,
+        )
+
+    def load_task_output(self, workflow_id: str, task_id: str) -> Optional[TaskOutput]:
+        payload = self._read_json_file(self.task_output_path(workflow_id, task_id))
+        return TaskOutput.from_dict(payload) if payload is not None else None
+
+    def write_task_inputs(
+        self,
+        workflow_id: str,
+        task_id: str,
+        inputs: list[ResolvedTaskInput | dict[str, Any]],
+    ) -> Path:
+        payload = [
+            item.to_dict() if isinstance(item, ResolvedTaskInput) else dict(item)
+            for item in inputs
+        ]
+        return self._write_json_file(
+            self.task_inputs_path(workflow_id, task_id),
+            payload,
+        )
+
+    def load_task_inputs(self, workflow_id: str, task_id: str) -> Optional[list[ResolvedTaskInput]]:
+        payload = self._read_json_file(self.task_inputs_path(workflow_id, task_id))
+        if payload is None:
+            return None
+        return [ResolvedTaskInput.from_dict(item) for item in payload]
+
+    def write_materialized_prompt(self, workflow_id: str, task_id: str, prompt: str) -> Path:
         with self._lock:
-            target = self.task_result_path(workflow_id, task_id)
-            tmp = target.with_suffix(".json.tmp")
+            target = self.materialized_prompt_path(workflow_id, task_id)
+            tmp = target.with_suffix(".txt.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(prompt)
+            tmp.replace(target)
+            return target
+
+    def register_artifact(
+        self,
+        workflow_id: str,
+        task_id: str,
+        artifact: Artifact | dict[str, Any],
+    ) -> Artifact:
+        resolved = artifact if isinstance(artifact, Artifact) else Artifact.from_dict(artifact)
+        self.task_artifacts_dir(workflow_id, task_id)
+        return resolved
+
+    def read_result(self, workflow_id: str, task_id: str) -> Optional[dict[str, Any]]:
+        return self._read_json_file(self.task_result_path(workflow_id, task_id))
+
+    def _write_json_file(self, target: Path, payload: Any) -> Path:
+        with self._lock:
+            tmp = target.with_suffix(f"{target.suffix}.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
             tmp.replace(target)
             return target
 
-    def read_result(self, workflow_id: str, task_id: str) -> Optional[dict[str, Any]]:
+    def _read_json_file(self, path: Path) -> Optional[Any]:
         with self._lock:
-            path = self.task_result_path(workflow_id, task_id)
             if not path.exists():
                 return None
             with open(path, "r", encoding="utf-8") as f:

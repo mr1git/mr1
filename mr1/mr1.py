@@ -1347,6 +1347,30 @@ class MR1:
             if wf is None or task is None:
                 return f"task not found: {task_id}"
             return workflow_cli._format_task_detail(wf, task)
+        if cmd.startswith("/result "):
+            task_id = cmd[len("/result "):].strip()
+            wf, task = workflow_cli._find_workflow_for_task(
+                self._workflow_store, task_id
+            )
+            if wf is None or task is None:
+                return f"task not found: {task_id}"
+            output = self._workflow_store.load_task_output(wf.workflow_id, task.task_id)
+            return workflow_cli._format_result(task, output)
+        if cmd.startswith("/inputs "):
+            task_id = cmd[len("/inputs "):].strip()
+            wf, task = workflow_cli._find_workflow_for_task(
+                self._workflow_store, task_id
+            )
+            if wf is None or task is None:
+                return f"task not found: {task_id}"
+            inputs = self._workflow_store.load_task_inputs(wf.workflow_id, task.task_id)
+            return workflow_cli._format_inputs(task, inputs)
+        if cmd.startswith("/artifacts "):
+            wf_id = cmd[len("/artifacts "):].strip()
+            wf = self._scheduler.get_workflow(wf_id)
+            if wf is None:
+                return f"workflow not found: {wf_id}"
+            return workflow_cli._format_artifacts(wf)
         if cmd == "/jobs":
             return workflow_cli._format_jobs(self._scheduler.list_workflows())
         if cmd.startswith("/events "):

@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.scheduler import (
     WatcherTriggerError,
     WorkflowSpecError,
@@ -125,6 +126,14 @@ def _format_task_detail(wf: Workflow, task: Task) -> str:
         lines.append(f"stderr:     {task.log_stderr_path}")
     if task.result_path:
         lines.append(f"result:     {task.result_path}")
+    if task.output_path:
+        lines.append(f"output:     {task.output_path}")
+    if task.inputs_path:
+        lines.append(f"inputs:     {task.inputs_path}")
+    if task.materialized_prompt_path:
+        lines.append(f"prompt:     {task.materialized_prompt_path}")
+    if task.dataflow_error:
+        lines.append(f"dataflow:   {task.dataflow_error}")
     if task.status is TaskStatus.BLOCKED:
         lines.append(f"blocked_by:     {', '.join(task.blocked_by) or '-'}")
         lines.append(f"blocked_reason: {task.blocked_reason or '-'}")
@@ -200,6 +209,62 @@ def _format_watchers(workflows: list[Workflow]) -> str:
             ))
     if len(rows) == 1:
         return "No active watchers."
+    return _render_table(rows)
+
+
+def _format_result(task: Task, output: Optional[TaskOutput]) -> str:
+    if output is None:
+        return f"No normalized output for task: {task.task_id}"
+    lines = [
+        f"task:       {task.task_id}",
+        f"label:      {task.label}",
+        f"status:     {output.status}",
+        f"summary:    {output.summary or '-'}",
+        "text:",
+        output.text or "",
+        "",
+        "data:",
+        json.dumps(output.data, indent=2, sort_keys=True),
+        "",
+        "metrics:",
+        json.dumps(output.metrics, indent=2, sort_keys=True),
+        "",
+        "artifacts:",
+    ]
+    if output.artifacts:
+        rows = [("NAME", "KIND", "PATH")]
+        for artifact in output.artifacts:
+            rows.append((artifact.name, artifact.kind, artifact.path))
+        lines.append(_render_table(rows, indent="  "))
+    else:
+        lines.append("  none")
+    return "\n".join(lines)
+
+
+def _format_inputs(task: Task, inputs: Optional[list[ResolvedTaskInput]]) -> str:
+    if not inputs:
+        return f"No materialized inputs for task: {task.task_id}"
+    lines = [f"task:       {task.task_id}", f"label:      {task.label}", "inputs:"]
+    for item in inputs:
+        lines.extend([
+            f"  - name:   {item.name}",
+            f"    source: {item.source}",
+            f"    type:   {item.resolved_type}",
+            f"    value:  {_format_inline_value(item)}",
+        ])
+    return "\n".join(lines)
+
+
+def _format_artifacts(workflow: Workflow) -> str:
+    artifacts: list[tuple[str, Artifact]] = []
+    for task in workflow.tasks.values():
+        for artifact in task.artifacts:
+            artifacts.append((task.label, artifact))
+    if not artifacts:
+        return f"No artifacts registered in workflow: {workflow.workflow_id}"
+    rows = [("TASK", "NAME", "KIND", "PATH")]
+    for label, artifact in artifacts:
+        rows.append((label, artifact.name, artifact.kind, artifact.path))
     return _render_table(rows)
 
 
@@ -314,6 +379,33 @@ def _cmd_watchers(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
+def _cmd_result(args: argparse.Namespace, store: WorkflowStore) -> int:
+    wf, task = _find_workflow_for_task(store, args.task_id)
+    if wf is None or task is None:
+        print(f"error: task not found: {args.task_id}", file=sys.stderr)
+        return 2
+    print(_format_result(task, store.load_task_output(wf.workflow_id, task.task_id)))
+    return 0
+
+
+def _cmd_inputs(args: argparse.Namespace, store: WorkflowStore) -> int:
+    wf, task = _find_workflow_for_task(store, args.task_id)
+    if wf is None or task is None:
+        print(f"error: task not found: {args.task_id}", file=sys.stderr)
+        return 2
+    print(_format_inputs(task, store.load_task_inputs(wf.workflow_id, task.task_id)))
+    return 0
+
+
+def _cmd_artifacts(args: argparse.Namespace, store: WorkflowStore) -> int:
+    wf = store.load_workflow(args.workflow_id)
+    if wf is None:
+        print(f"error: workflow not found: {args.workflow_id}", file=sys.stderr)
+        return 2
+    print(_format_artifacts(wf))
+    return 0
+
+
 def _cmd_trigger(args: argparse.Namespace, store: WorkflowStore) -> int:
     try:
         task_id = trigger_watcher_on_disk(
@@ -377,6 +469,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_watchers = subs.add_parser("watchers", help="List active watcher tasks.")
     p_watchers.set_defaults(func=_cmd_watchers)
 
+    p_result = subs.add_parser("result", help="Show normalized task output.")
+    p_result.add_argument("task_id")
+    p_result.set_defaults(func=_cmd_result)
+
+    p_inputs = subs.add_parser("inputs", help="Show materialized task inputs.")
+    p_inputs.add_argument("task_id")
+    p_inputs.set_defaults(func=_cmd_inputs)
+
+    p_artifacts = subs.add_parser("artifacts", help="List artifacts for a workflow.")
+    p_artifacts.add_argument("workflow_id")
+    p_artifacts.set_defaults(func=_cmd_artifacts)
+
     p_trigger = subs.add_parser("trigger", help="Trigger a manual_event watcher.")
     p_trigger.add_argument("workflow_id")
     p_trigger.add_argument("label_or_task_id")
@@ -391,6 +495,17 @@ def main(argv: Optional[list[str]] = None, *, store: Optional[WorkflowStore] = N
     args = parser.parse_args(argv)
     active_store = store if store is not None else WorkflowStore(root=args.store_root)
     return args.func(args, active_store)
+
+
+def _format_inline_value(item: ResolvedTaskInput) -> str:
+    if item.resolved_type == "artifact":
+        return item.artifact_path or "-"
+    if item.value is None:
+        return "-"
+    if isinstance(item.value, str):
+        compact = item.value.replace("\n", "\\n")
+        return compact[:120] + ("..." if len(compact) > 120 else "")
+    return json.dumps(item.value, sort_keys=True)[:120]
 
 
 if __name__ == "__main__":

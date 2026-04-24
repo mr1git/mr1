@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from mr1 import workflow_cli
+from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -162,6 +163,76 @@ class TestReadCommands:
         rc = workflow_cli.main(["events", "wf-missing"], store=store)
         assert rc == 2
         assert "not found" in capsys.readouterr().err
+
+    def test_result_inputs_and_artifacts_commands(self, tmp_path, store, capsys):
+        path = _write_spec(tmp_path, SPEC)
+        workflow_cli.main(["submit", str(path)], store=store)
+        wf_id = capsys.readouterr().out.strip()
+        wf = store.load_workflow(wf_id)
+        a = wf.task_by_label("a")
+        b = wf.task_by_label("b")
+        store.write_task_output(
+            wf_id,
+            a.task_id,
+            TaskOutput(
+                task_id=a.task_id,
+                workflow_id=wf_id,
+                status="succeeded",
+                summary="done",
+                text="hello world",
+                artifacts=[
+                    Artifact(
+                        artifact_id="art-1",
+                        workflow_id=wf_id,
+                        task_id=a.task_id,
+                        name="report",
+                        kind="json",
+                        path="/tmp/report.json",
+                    )
+                ],
+            ),
+        )
+        store.write_task_inputs(
+            wf_id,
+            b.task_id,
+            [
+                ResolvedTaskInput(
+                    name="producer_text",
+                    source="a.result.text",
+                    resolved_task_id=a.task_id,
+                    resolved_type="text",
+                    value="hello world",
+                )
+            ],
+        )
+        a.artifacts = [
+            Artifact(
+                artifact_id="art-1",
+                workflow_id=wf_id,
+                task_id=a.task_id,
+                name="report",
+                kind="json",
+                path="/tmp/report.json",
+            )
+        ]
+        store.save_workflow(wf)
+
+        rc = workflow_cli.main(["result", a.task_id], store=store)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "summary:" in out
+        assert "hello world" in out
+
+        rc = workflow_cli.main(["inputs", b.task_id], store=store)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "producer_text" in out
+        assert "a.result.text" in out
+
+        rc = workflow_cli.main(["artifacts", wf_id], store=store)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "report" in out
 
 
 class TestSubmitDoesNotStartScheduler:

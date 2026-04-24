@@ -266,6 +266,51 @@ class TestWatcherScheduler:
         assert task.last_checked_at == first_checked
         assert task.last_check_result == first_result
 
+    def test_watcher_output_exists_and_is_consumable_downstream(self, store, tmp_path):
+        watched = tmp_path / "watched.txt"
+        started_prompts: dict[str, str] = {}
+        runner = MockRunner(on_start=lambda task: started_prompts.setdefault(task.label, task.prompt))
+        scheduler = Scheduler(store, runner, auto_tick=False, agent_id="scheduler")
+        try:
+            spec = {
+                "title": "Watcher dataflow",
+                "tasks": [
+                    {
+                        "label": "wait_file",
+                        "title": "Wait for file",
+                        "task_kind": "watcher",
+                        "watcher_type": "file_exists",
+                        "watch_config": {"path": str(watched), "poll_interval_s": 0},
+                    },
+                    {
+                        "label": "after",
+                        "title": "After",
+                        "task_kind": "agent",
+                        "agent_type": "kazi",
+                        "depends_on": ["wait_file"],
+                        "inputs": [{"name": "watch_msg", "from": "wait_file.result.text"}],
+                        "prompt": "Use the watcher message.",
+                    },
+                ],
+            }
+            wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))
+            scheduler.tick()
+            scheduler.tick()
+            watched.write_text("ready", encoding="utf-8")
+            scheduler.tick()
+
+            wf = store.load_workflow(wf_id)
+            wait_task = _task_by_label(wf, "wait_file")
+            after_task = _task_by_label(wf, "after")
+            output = store.load_task_output(wf_id, wait_task.task_id)
+            assert output is not None
+            assert output.text == wait_task.last_check_result["message"]
+            assert after_task.inputs_path is not None
+            assert "path exists" in Path(after_task.materialized_prompt_path).read_text(encoding="utf-8")
+            assert "path exists" in started_prompts["after"]
+        finally:
+            scheduler.shutdown()
+
 
 class TestWatcherValidation:
     def test_rejects_missing_watcher_type(self):

@@ -4,3 +4,18 @@ node_modules/
 .viz-build/
 .DS_Store
 /tmp/
+# MR1 runtime state
+mr1/memory/**
+!mr1/memory/
+!mr1/memory/active/
+!mr1/memory/dumps/
+!mr1/memory/rag/
+!mr1/memory/active/.gitkeep
+!mr1/memory/dumps/.gitkeep
+!mr1/memory/rag/.gitkeep
+mr1/tasks/
+
+# Logs / runtime artifacts
+*.log
+*.jsonl
+

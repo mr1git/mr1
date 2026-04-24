@@ -26,6 +26,7 @@ Every state change follows the same atomic shape:
 
 from __future__ import annotations
 
+from dataclasses import replace
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mr1 import workflow_events as ev
+from mr1.dataflow import (
+    DataflowError,
+    TaskInputSpec,
+    build_agent_task_output,
+    build_materialized_prompt,
+    build_watcher_task_output,
+    materialize_task_inputs,
+    parse_input_reference,
+    register_artifacts,
+)
 from mr1.kazi_runner import (
     MockRunner,
     RunHandle,
@@ -138,8 +149,11 @@ def validate_spec(
             )
 
     # depends_on reference check.
+    depends_on_by_label: dict[str, list[str]] = {}
     for raw in tasks:
-        for dep in raw.get("depends_on", []) or []:
+        deps = list(raw.get("depends_on", []) or [])
+        depends_on_by_label[raw["label"]] = deps
+        for dep in deps:
             if dep not in label_set:
                 raise WorkflowSpecError(
                     f"task '{raw['label']}' depends_on unknown label '{dep}'"
@@ -164,6 +178,39 @@ def validate_spec(
                 ready.append(nxt)
     if visited != len(labels):
         raise WorkflowSpecError("workflow spec contains a dependency cycle")
+
+    ancestors = _compute_ancestor_labels(depends_on_by_label)
+    for raw in tasks:
+        raw_inputs = raw.get("inputs", [])
+        if not isinstance(raw_inputs, list):
+            raise WorkflowSpecError(f"task '{raw['label']}': inputs must be a list")
+        for idx, item in enumerate(raw_inputs):
+            if not isinstance(item, dict):
+                raise WorkflowSpecError(
+                    f"task '{raw['label']}': inputs[{idx}] must be a JSON object"
+                )
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                raise WorkflowSpecError(
+                    f"task '{raw['label']}': inputs[{idx}] missing non-empty 'name'"
+                )
+            from_ref = item.get("from")
+            if not isinstance(from_ref, str) or not from_ref:
+                raise WorkflowSpecError(
+                    f"task '{raw['label']}': inputs[{idx}] missing non-empty 'from'"
+                )
+            try:
+                parsed = parse_input_reference(from_ref)
+            except DataflowError as exc:
+                raise WorkflowSpecError(f"task '{raw['label']}': {exc}") from exc
+            if parsed.label not in label_set:
+                raise WorkflowSpecError(
+                    f"task '{raw['label']}': input source label '{parsed.label}' is unknown"
+                )
+            if parsed.label not in ancestors.get(raw["label"], set()):
+                raise WorkflowSpecError(
+                    f"task '{raw['label']}': input source '{parsed.label}' must be an upstream dependency"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +260,10 @@ def build_workflow_from_spec(
             status=TaskStatus.CREATED,
             created_by=created_by,
             timeout_s=raw.get("timeout_s"),
+            inputs=[
+                TaskInputSpec.from_dict(item)
+                for item in (raw.get("inputs") or [])
+            ],
         )
         task_objs.append((raw, task))
 
@@ -318,6 +369,13 @@ def trigger_watcher_on_disk(
             "event": expected_event,
             "trigger_metadata": trigger_metadata,
         }
+        output = build_watcher_task_output(task)
+        output_path = store.write_task_output(
+            wf.workflow_id,
+            task.task_id,
+            output,
+        )
+        task.output_path = str(output_path)
         store.save_workflow(wf)
         event_log.emit(
             ev.WATCHER_SATISFIED,
@@ -334,6 +392,14 @@ def trigger_watcher_on_disk(
             agent_id=agent_id,
             message=task.last_check_result["message"],
             metadata={"status": TaskStatus.SUCCEEDED.value, "watcher_type": task.watcher_type},
+        )
+        event_log.emit(
+            ev.OUTPUT_WRITTEN,
+            wf.workflow_id,
+            task_id=task.task_id,
+            agent_id=agent_id,
+            message="normalized output written",
+            metadata={"path": str(output_path)},
         )
         return task.task_id
 
@@ -617,6 +683,16 @@ class Scheduler:
             return True
 
         if evaluation.state == "satisfied":
+            task.status = TaskStatus.SUCCEEDED
+            task.last_checked_at = checked_at
+            task.last_check_result = check_payload
+            task.watch_satisfied_at = _now_iso()
+            output = build_watcher_task_output(task)
+            output_path = str(self._store.write_task_output(
+                wf.workflow_id,
+                task.task_id,
+                output,
+            ))
             self._commit(
                 wf,
                 task,
@@ -631,7 +707,12 @@ class Scheduler:
                     ev.WATCHER_SATISFIED,
                     evaluation.message,
                     check_payload,
+                ), (
+                    ev.OUTPUT_WRITTEN,
+                    "normalized output written",
+                    {"path": output_path},
                 )],
+                output_path=output_path,
             )
             return True
 
@@ -749,15 +830,68 @@ class Scheduler:
             wf.workflow_id, task.task_id, result.result_payload or {},
         )
 
+        extra_events: list[tuple[str, str, dict[str, Any]]] = []
+        output_path: Optional[str] = None
+        dataflow_error: Optional[str] = None
+        try:
+            task.artifacts = register_artifacts(
+                task,
+                self._store,
+                (result.result_payload or {}).get("artifacts"),
+            )
+            for artifact in task.artifacts:
+                extra_events.append((
+                    ev.ARTIFACT_REGISTERED,
+                    f"artifact registered: {artifact.name}",
+                    {"name": artifact.name, "kind": artifact.kind, "path": artifact.path},
+                ))
+            if target_status is TaskStatus.SUCCEEDED:
+                output = build_agent_task_output(
+                    replace(
+                        task,
+                        status=target_status,
+                        result_summary=(result.summary or "")[:500] if result.summary else None,
+                        exit_code=result.exit_code,
+                    ),
+                    result.result_payload or {},
+                )
+                output_path = str(self._store.write_task_output(
+                    wf.workflow_id,
+                    task.task_id,
+                    output,
+                ))
+                extra_events.append((
+                    ev.OUTPUT_WRITTEN,
+                    "normalized output written",
+                    {"path": output_path},
+                ))
+        except DataflowError as exc:
+            target_status = TaskStatus.FAILED
+            event_type = ev.TASK_FAILED
+            dataflow_error = str(exc)
+            result = RunResult(
+                status=RunStatus.FAILED,
+                exit_code=result.exit_code if result.exit_code is not None else 1,
+                summary=result.summary,
+                error=str(exc),
+                stdout_path=result.stdout_path,
+                stderr_path=result.stderr_path,
+                result_payload=result.result_payload,
+            )
+
         self._commit(
             wf, task, target_status, event=event_type,
-            message=result.error or result.summary or "",
+            message=dataflow_error or result.error or result.summary or "",
             finished=True,
             exit_code=result.exit_code,
             result_summary=(result.summary or "")[:500] if result.summary else None,
             log_stdout_path=str(result.stdout_path) if result.stdout_path else None,
             log_stderr_path=str(result.stderr_path) if result.stderr_path else None,
             result_path=str(self._store.task_result_path(wf.workflow_id, task.task_id)),
+            output_path=output_path,
+            dataflow_error=dataflow_error,
+            artifacts=task.artifacts,
+            extra_events=extra_events,
         )
         return True
 
@@ -881,8 +1015,12 @@ class Scheduler:
                 continue
             if slots <= 0:
                 break
+            if task.inputs:
+                if self._materialize_inputs_for_task(wf, task):
+                    continue
             try:
-                handle = self._runner.start(task)
+                launch_task = self._build_launch_task(task)
+                handle = self._runner.start(launch_task)
             except Exception as exc:
                 self._commit(
                     wf, task, TaskStatus.FAILED, event=ev.TASK_FAILED,
@@ -900,6 +1038,72 @@ class Scheduler:
                 pid=handle.pid,
             )
             slots -= 1
+
+    def _build_launch_task(self, task: Task) -> Task:
+        prompt = task.prompt
+        if task.materialized_prompt_path:
+            materialized_path = Path(task.materialized_prompt_path)
+            if materialized_path.exists():
+                prompt = materialized_path.read_text(encoding="utf-8")
+        return replace(task, prompt=prompt)
+
+    def _materialize_inputs_for_task(self, wf: Workflow, task: Task) -> bool:
+        resolved_inputs = materialize_task_inputs(wf, task, self._store)
+        inputs_path = self._store.write_task_inputs(
+            wf.workflow_id,
+            task.task_id,
+            resolved_inputs,
+        )
+        materialized_prompt = build_materialized_prompt(task.prompt, resolved_inputs)
+        prompt_path = self._store.write_materialized_prompt(
+            wf.workflow_id,
+            task.task_id,
+            materialized_prompt,
+        )
+        missing = [item for item in resolved_inputs if item.resolved_type == "missing"]
+        extra_events = [(
+            ev.INPUT_MATERIALIZED,
+            f"materialized {len(resolved_inputs)} workflow input(s)",
+            {
+                "count": len(resolved_inputs),
+                "inputs_path": str(inputs_path),
+                "materialized_prompt_path": str(prompt_path),
+            },
+        )]
+        if missing:
+            missing_sources = [item.source for item in missing]
+            self._commit(
+                wf,
+                task,
+                TaskStatus.FAILED,
+                event=ev.TASK_FAILED,
+                message=f"failed to resolve workflow input(s): {', '.join(missing_sources)}",
+                finished=True,
+                inputs_path=str(inputs_path),
+                materialized_prompt_path=str(prompt_path),
+                dataflow_error=f"failed to resolve workflow input(s): {', '.join(missing_sources)}",
+                extra_events=extra_events + [(
+                    ev.INPUT_RESOLUTION_FAILED,
+                    f"failed to resolve workflow input(s): {', '.join(missing_sources)}",
+                    {"sources": missing_sources},
+                )],
+            )
+            return True
+        with self._store.locked():
+            task.inputs_path = str(inputs_path)
+            task.materialized_prompt_path = str(prompt_path)
+            task.dataflow_error = None
+            self._store.save_workflow(wf)
+            for event_type, event_message, event_metadata in extra_events:
+                self._events.emit(
+                    event_type,
+                    wf.workflow_id,
+                    task_id=task.task_id,
+                    agent_id=self._agent_id,
+                    message=event_message,
+                    metadata=dict(event_metadata),
+                )
+        return False
 
     # ------------------------------------------------------------------
     # Atomic commit helper
@@ -921,6 +1125,11 @@ class Scheduler:
         log_stdout_path: Optional[str] = None,
         log_stderr_path: Optional[str] = None,
         result_path: Optional[str] = None,
+        output_path: Optional[str] = None,
+        inputs_path: Optional[str] = None,
+        materialized_prompt_path: Optional[str] = None,
+        artifacts: Optional[list[Any]] = None,
+        dataflow_error: Any = _UNSET,
         blocked_by: Optional[list[str]] = None,
         blocked_reason: Optional[str] = None,
         blocked_at: Optional[str] = None,
@@ -953,6 +1162,16 @@ class Scheduler:
                 task.log_stderr_path = log_stderr_path
             if result_path is not None:
                 task.result_path = result_path
+            if output_path is not None:
+                task.output_path = output_path
+            if inputs_path is not None:
+                task.inputs_path = inputs_path
+            if materialized_prompt_path is not None:
+                task.materialized_prompt_path = materialized_prompt_path
+            if artifacts is not None:
+                task.artifacts = list(artifacts)
+            if dataflow_error is not _UNSET:
+                task.dataflow_error = dataflow_error
             if blocked_by is not None:
                 task.blocked_by = list(blocked_by)
             if blocked_reason is not None:
@@ -981,6 +1200,8 @@ class Scheduler:
                 metadata["blocked_by"] = blocked_by
             if task.watcher_type:
                 metadata["watcher_type"] = task.watcher_type
+            if task.dataflow_error:
+                metadata["dataflow_error"] = task.dataflow_error
             self._events.emit(
                 event, wf.workflow_id,
                 task_id=task.task_id,
@@ -1031,3 +1252,19 @@ class Scheduler:
                 message="workflow cancelled",
             )
         return True
+
+
+def _compute_ancestor_labels(depends_on_by_label: dict[str, list[str]]) -> dict[str, set[str]]:
+    memo: dict[str, set[str]] = {}
+
+    def visit(label: str) -> set[str]:
+        if label in memo:
+            return memo[label]
+        ancestors: set[str] = set()
+        for dep in depends_on_by_label.get(label, []):
+            ancestors.add(dep)
+            ancestors.update(visit(dep))
+        memo[label] = ancestors
+        return ancestors
+
+    return {label: visit(label) for label in depends_on_by_label}

@@ -37,6 +37,11 @@ WATCHER_SATISFIED = "watcher_satisfied"
 WATCHER_FAILED = "watcher_failed"
 WATCHER_TIMED_OUT = "watcher_timed_out"
 
+INPUT_MATERIALIZED = "input_materialized"
+INPUT_RESOLUTION_FAILED = "input_resolution_failed"
+ARTIFACT_REGISTERED = "artifact_registered"
+OUTPUT_WRITTEN = "output_written"
+
 
 class WorkflowEventLog:
     """
@@ -126,3 +131,15 @@ class WorkflowEventLog:
 
     def watcher_timed_out(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(WATCHER_TIMED_OUT, workflow_id, task_id=task_id, **kw)
+
+    def input_materialized(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(INPUT_MATERIALIZED, workflow_id, task_id=task_id, **kw)
+
+    def input_resolution_failed(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(INPUT_RESOLUTION_FAILED, workflow_id, task_id=task_id, **kw)
+
+    def artifact_registered(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(ARTIFACT_REGISTERED, workflow_id, task_id=task_id, **kw)
+
+    def output_written(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(OUTPUT_WRITTEN, workflow_id, task_id=task_id, **kw)

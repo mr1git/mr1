@@ -6,6 +6,8 @@ scheduler is built with `auto_tick=False` so tests can drive `tick()`
 deterministically.
 """
 
+from pathlib import Path
+
 import pytest
 
 from mr1 import workflow_events as ev
@@ -159,6 +161,20 @@ class TestDagProgression:
         assert payload.get("status") == "succeeded"
         assert payload.get("summary") == "hello"
 
+    def test_output_json_written_for_succeeded_task(self, scheduler, store, runner):
+        wf_id = scheduler.submit_workflow(SPEC, Provenance(type="agent", id="MR1"))
+        scheduler.tick()
+        wf = store.load_workflow(wf_id)
+        a_id = wf.label_to_task_id["a"]
+        runner.complete(a_id, RunStatus.SUCCEEDED, summary="hello")
+        scheduler.tick()
+
+        output = store.load_task_output(wf_id, a_id)
+        assert output is not None
+        assert output.status == "succeeded"
+        assert output.text == "hello"
+        assert output.summary == "hello"
+
     def test_concurrency_cap_is_respected(self, store):
         runner = MockRunner()
         sched = Scheduler(store, runner, auto_tick=False, concurrency=1)
@@ -183,5 +199,144 @@ class TestDagProgression:
             ready = [t for t in wf.tasks.values() if t.status is TaskStatus.READY]
             assert len(running) == 1
             assert len(ready) == 2
+        finally:
+            sched.shutdown()
+
+
+class TestDataflowDag:
+    def test_downstream_receives_materialized_prompt_and_raw_prompt_is_preserved(self, tmp_path):
+        store = WorkflowStore(root=tmp_path / "workflows")
+        started_prompts: dict[str, str] = {}
+
+        def on_start(task):
+            started_prompts[task.label] = task.prompt
+
+        runner = MockRunner(on_start=on_start)
+        sched = Scheduler(store, runner, auto_tick=False, concurrency=4)
+        spec = {
+            "title": "Dataflow",
+            "tasks": [
+                {
+                    "label": "a",
+                    "title": "Produce",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "Produce text",
+                },
+                {
+                    "label": "b",
+                    "title": "Consume",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "Summarize the upstream text.",
+                    "depends_on": ["a"],
+                    "inputs": [{"name": "producer_text", "from": "a.result.text"}],
+                },
+            ],
+        }
+        try:
+            wf_id = sched.submit_workflow(spec, Provenance(type="agent", id="MR1"))
+            sched.tick()
+            wf = store.load_workflow(wf_id)
+            runner.complete(wf.label_to_task_id["a"], RunStatus.SUCCEEDED, summary="hello world")
+            sched.tick()
+
+            wf = store.load_workflow(wf_id)
+            b = wf.task_by_label("b")
+            assert b.status is TaskStatus.RUNNING
+            assert b.prompt == "Summarize the upstream text."
+            assert b.inputs_path is not None
+            assert b.materialized_prompt_path is not None
+            assert "hello world" in Path(b.materialized_prompt_path).read_text(encoding="utf-8")
+            assert started_prompts["b"] == Path(b.materialized_prompt_path).read_text(encoding="utf-8")
+
+            resolved_inputs = store.load_task_inputs(wf_id, b.task_id)
+            assert resolved_inputs is not None
+            assert resolved_inputs[0].value == "hello world"
+        finally:
+            sched.shutdown()
+
+    def test_missing_input_fails_before_launch_and_emits_event(self, tmp_path):
+        store = WorkflowStore(root=tmp_path / "workflows")
+        runner = MockRunner()
+        sched = Scheduler(store, runner, auto_tick=False, concurrency=4)
+        spec = {
+            "title": "Missing input",
+            "tasks": [
+                {
+                    "label": "a",
+                    "title": "Produce",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "Produce text",
+                },
+                {
+                    "label": "b",
+                    "title": "Consume",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "Consume metrics",
+                    "depends_on": ["a"],
+                    "inputs": [{"name": "accuracy", "from": "a.result.metrics.accuracy"}],
+                },
+            ],
+        }
+        try:
+            wf_id = sched.submit_workflow(spec, Provenance(type="agent", id="MR1"))
+            sched.tick()
+            wf = store.load_workflow(wf_id)
+            runner.complete(wf.label_to_task_id["a"], RunStatus.SUCCEEDED, summary="hello world")
+            sched.tick()
+
+            wf = store.load_workflow(wf_id)
+            b = wf.task_by_label("b")
+            assert b.status is TaskStatus.FAILED
+            assert b.dataflow_error is not None
+            assert runner.started_task_ids == [wf.label_to_task_id["a"]]
+            event_types = [event.event_type for event in store.load_events(wf_id)]
+            assert ev.INPUT_RESOLUTION_FAILED in event_types
+        finally:
+            sched.shutdown()
+
+    def test_duplicate_artifact_names_fail_task(self, tmp_path):
+        store = WorkflowStore(root=tmp_path / "workflows")
+        runner = MockRunner()
+        sched = Scheduler(store, runner, auto_tick=False, concurrency=4)
+        try:
+            wf_id = sched.submit_workflow(
+                {
+                    "title": "Artifacts",
+                    "tasks": [
+                        {
+                            "label": "a",
+                            "title": "Produce",
+                            "task_kind": "agent",
+                            "agent_type": "kazi",
+                            "prompt": "Produce artifact",
+                        }
+                    ],
+                },
+                Provenance(type="agent", id="MR1"),
+            )
+            sched.tick()
+            wf = store.load_workflow(wf_id)
+            a_id = wf.label_to_task_id["a"]
+            runner.complete(
+                a_id,
+                RunStatus.SUCCEEDED,
+                summary="done",
+                result_payload={
+                    "status": "succeeded",
+                    "summary": "done",
+                    "artifacts": [
+                        {"name": "report", "kind": "json", "path": "/tmp/r1.json"},
+                        {"name": "report", "kind": "json", "path": "/tmp/r2.json"},
+                    ],
+                },
+            )
+            sched.tick()
+            wf = store.load_workflow(wf_id)
+            assert wf.task_by_label("a").status is TaskStatus.FAILED
+            assert "duplicate artifact name" in (wf.task_by_label("a").dataflow_error or "")
         finally:
             sched.shutdown()

@@ -75,6 +75,51 @@ class TestValidationRejects:
         with pytest.raises(WorkflowSpecError, match="agent_type"):
             validate_spec(spec)
 
+    def test_rejects_inputs_non_list(self):
+        spec = {"tasks": [{**_base_task("a"), "inputs": "bad"}]}
+        with pytest.raises(WorkflowSpecError, match="inputs must be a list"):
+            validate_spec(spec)
+
+    def test_rejects_unknown_input_label(self):
+        spec = {
+            "tasks": [
+                _base_task("a"),
+                {
+                    **_base_task("b", deps=["a"]),
+                    "inputs": [{"name": "x", "from": "ghost.result.text"}],
+                },
+            ],
+        }
+        with pytest.raises(WorkflowSpecError, match="input source label"):
+            validate_spec(spec)
+
+    def test_rejects_non_ancestor_input_reference(self):
+        spec = {
+            "tasks": [
+                _base_task("a"),
+                _base_task("b"),
+                {
+                    **_base_task("c", deps=["a"]),
+                    "inputs": [{"name": "x", "from": "b.result.text"}],
+                },
+            ],
+        }
+        with pytest.raises(WorkflowSpecError, match="upstream dependency"):
+            validate_spec(spec)
+
+    def test_rejects_unsupported_input_root(self):
+        spec = {
+            "tasks": [
+                _base_task("a"),
+                {
+                    **_base_task("b", deps=["a"]),
+                    "inputs": [{"name": "x", "from": "a.nope"}],
+                },
+            ],
+        }
+        with pytest.raises(WorkflowSpecError, match="unsupported input reference root"):
+            validate_spec(spec)
+
 
 class TestValidationAccepts:
     def test_simple_linear_dag(self):
@@ -100,6 +145,18 @@ class TestValidationAccepts:
             ],
         })
 
+    def test_accepts_transitive_input_source(self):
+        validate_spec({
+            "tasks": [
+                _base_task("a"),
+                _base_task("b", deps=["a"]),
+                {
+                    **_base_task("c", deps=["b"]),
+                    "inputs": [{"name": "upstream", "from": "a.result.text"}],
+                },
+            ],
+        })
+
 
 class TestBuildWorkflow:
     def test_resolves_labels_to_task_ids(self):
@@ -117,6 +174,22 @@ class TestBuildWorkflow:
         assert wf.tasks[b_id].depends_on == [a_id]
         assert all(t.task_id.startswith("tk-") for t in wf.tasks.values())
         assert wf.workflow_id.startswith("wf-")
+
+    def test_parses_inputs(self):
+        spec = {
+            "tasks": [
+                _base_task("a"),
+                {
+                    **_base_task("b", deps=["a"]),
+                    "inputs": [{"name": "upstream", "from": "a.result.text"}],
+                },
+            ],
+        }
+        wf = build_workflow_from_spec(spec, PROV)
+        b = wf.task_by_label("b")
+        assert len(b.inputs) == 1
+        assert b.inputs[0].name == "upstream"
+        assert b.inputs[0].from_ref == "a.result.text"
 
 
 class TestSubmitDoesNotLeakOnFailure:

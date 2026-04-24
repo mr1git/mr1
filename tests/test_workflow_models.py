@@ -4,6 +4,7 @@ import re
 
 import pytest
 
+from mr1.dataflow import Artifact, TaskInputSpec
 from mr1.workflow_models import (
     Provenance,
     Task,
@@ -79,6 +80,33 @@ class TestTask:
             last_checked_at="2026-04-24T10:00:30+00:00",
             last_check_result={"state": "satisfied", "message": "ok"},
             condition={"triggered": True},
+        )
+        assert Task.from_dict(t.to_dict()).to_dict() == t.to_dict()
+
+    def test_dataflow_fields_roundtrip(self):
+        t = Task(
+            task_id="tk-data",
+            workflow_id="wf-1",
+            label="consume",
+            title="Consume",
+            task_kind="agent",
+            agent_type="kazi",
+            prompt="Summarize",
+            inputs=[TaskInputSpec(name="upstream", from_ref="produce.result.text")],
+            output_path="/tmp/output.json",
+            inputs_path="/tmp/inputs.json",
+            materialized_prompt_path="/tmp/materialized_prompt.txt",
+            artifacts=[
+                Artifact(
+                    artifact_id="art-1",
+                    workflow_id="wf-1",
+                    task_id="tk-data",
+                    name="report",
+                    kind="json",
+                    path="/tmp/report.json",
+                )
+            ],
+            dataflow_error="missing input",
         )
         assert Task.from_dict(t.to_dict()).to_dict() == t.to_dict()
 

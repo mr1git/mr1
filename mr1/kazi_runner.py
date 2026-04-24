@@ -450,6 +450,7 @@ class MockRunner(Runner):
         summary: Optional[str] = None,
         error: Optional[str] = None,
         exit_code: Optional[int] = None,
+        result_payload: Optional[dict[str, Any]] = None,
     ) -> None:
         """Flag a running task to return `status` on the next poll."""
         self._terminal[task_id] = RunResult(
@@ -457,5 +458,9 @@ class MockRunner(Runner):
             exit_code=exit_code if exit_code is not None else (0 if status is RunStatus.SUCCEEDED else 1),
             summary=summary,
             error=error,
-            result_payload={"status": status.value, "summary": summary, "error": error},
+            result_payload=result_payload or {
+                "status": status.value,
+                "summary": summary,
+                "error": error,
+            },
         )
