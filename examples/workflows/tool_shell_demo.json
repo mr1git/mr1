@@ -1,0 +1,41 @@
+{
+  "title": "Tool shell demo",
+  "tasks": [
+    {
+      "label": "shell",
+      "title": "Run python --version",
+      "task_kind": "tool",
+      "tool_type": "shell_command",
+      "tool_config": {
+        "argv": [
+          "python3",
+          "--version"
+        ],
+        "cwd": ".",
+        "timeout_s": 10,
+        "capture_max_bytes": 65536,
+        "env": {}
+      }
+    },
+    {
+      "label": "summarize",
+      "title": "Summarize shell output",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": [
+        "shell"
+      ],
+      "inputs": [
+        {
+          "name": "stdout_text",
+          "from": "shell.result.data.stdout"
+        },
+        {
+          "name": "stdout_artifact",
+          "from": "shell.artifact.stdout"
+        }
+      ],
+      "prompt": "Summarize the shell command output."
+    }
+  ]
+}

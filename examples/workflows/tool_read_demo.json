@@ -1,0 +1,29 @@
+{
+  "title": "Tool read demo",
+  "tasks": [
+    {
+      "label": "read_notes",
+      "title": "Read notes",
+      "task_kind": "tool",
+      "tool_type": "read_file",
+      "tool_config": {
+        "path": "/tmp/mr1_notes.txt",
+        "max_bytes": 65536
+      }
+    },
+    {
+      "label": "summarize",
+      "title": "Summarize notes",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": ["read_notes"],
+      "inputs": [
+        {
+          "name": "notes",
+          "from": "read_notes.result.text"
+        }
+      ],
+      "prompt": "Summarize these notes."
+    }
+  ]
+}

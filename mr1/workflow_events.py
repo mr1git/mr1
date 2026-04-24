@@ -36,6 +36,10 @@ WATCHER_CHECKED = "watcher_checked"
 WATCHER_SATISFIED = "watcher_satisfied"
 WATCHER_FAILED = "watcher_failed"
 WATCHER_TIMED_OUT = "watcher_timed_out"
+TOOL_STARTED = "tool_started"
+TOOL_SUCCEEDED = "tool_succeeded"
+TOOL_FAILED = "tool_failed"
+TOOL_TIMED_OUT = "tool_timed_out"
 
 INPUT_MATERIALIZED = "input_materialized"
 INPUT_RESOLUTION_FAILED = "input_resolution_failed"
@@ -131,6 +135,18 @@ class WorkflowEventLog:
 
     def watcher_timed_out(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(WATCHER_TIMED_OUT, workflow_id, task_id=task_id, **kw)
+
+    def tool_started(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TOOL_STARTED, workflow_id, task_id=task_id, **kw)
+
+    def tool_succeeded(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TOOL_SUCCEEDED, workflow_id, task_id=task_id, **kw)
+
+    def tool_failed(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TOOL_FAILED, workflow_id, task_id=task_id, **kw)
+
+    def tool_timed_out(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TOOL_TIMED_OUT, workflow_id, task_id=task_id, **kw)
 
     def input_materialized(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(INPUT_MATERIALIZED, workflow_id, task_id=task_id, **kw)

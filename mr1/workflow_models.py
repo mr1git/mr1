@@ -133,13 +133,18 @@ class Task:
     workflow_id: str
     label: str
     title: str
-    task_kind: str                  # "agent" | "command" | "watcher" | "manual"
+    task_kind: str                  # "agent" | "watcher" | "tool"
     agent_type: Optional[str]       # "kazi" | "mrn" | None
     prompt: str
     watcher_type: Optional[str] = None
     watch_config: dict[str, Any] = field(default_factory=dict)
     watch_started_at: Optional[str] = None
     watch_satisfied_at: Optional[str] = None
+    tool_type: Optional[str] = None
+    tool_config: dict[str, Any] = field(default_factory=dict)
+    tool_started_at: Optional[str] = None
+    tool_finished_at: Optional[str] = None
+    tool_error: Optional[str] = None
     last_checked_at: Optional[str] = None
     last_check_result: Optional[dict[str, Any]] = None
     condition: Optional[dict[str, Any]] = None
@@ -192,6 +197,11 @@ class Task:
             watch_config=dict(data.get("watch_config", {})),
             watch_started_at=data.get("watch_started_at"),
             watch_satisfied_at=data.get("watch_satisfied_at"),
+            tool_type=data.get("tool_type"),
+            tool_config=dict(data.get("tool_config", {})),
+            tool_started_at=data.get("tool_started_at"),
+            tool_finished_at=data.get("tool_finished_at"),
+            tool_error=data.get("tool_error"),
             last_checked_at=data.get("last_checked_at"),
             last_check_result=dict(data["last_check_result"])
             if data.get("last_check_result") is not None else None,

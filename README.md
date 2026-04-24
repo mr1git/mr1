@@ -158,6 +158,7 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/artifacts <workflow_id>` | List registered artifacts for a workflow |
 | `/jobs` | List live workflow tasks |
 | `/watchers` | List active watcher tasks |
+| `/tools` | List registered deterministic workflow tools |
 | `/events <workflow_id>` | Show recent workflow events |
 | `/scheduler tick` | Force one deterministic scheduler pass |
 
@@ -190,6 +191,7 @@ You can submit the same spec without entering MR1 by using the deterministic CLI
 python -m mr1.workflow_cli submit path/to/workflow.json
 python -m mr1.workflow_cli workflows
 python -m mr1.workflow_cli workflow <workflow_id>
+python -m mr1.workflow_cli tools
 python -m mr1.workflow_cli result <task_id>
 python -m mr1.workflow_cli inputs <task_id>
 python -m mr1.workflow_cli artifacts <workflow_id>
@@ -322,6 +324,111 @@ Manual smoke test with `examples/workflows/dataflow_demo.json`:
 5. Run `/result <producer_task_id>`.
 6. Run `/inputs <consumer_task_id>`.
 7. Run `/artifacts <workflow_id>` and confirm it behaves deterministically even when no artifacts are present.
+
+## Phase 4: Deterministic Tool Tasks
+
+Phase 4 adds first-class deterministic tool tasks. Tools are bounded capabilities and actions. They are not agents and they do not invoke an LLM.
+
+Tool tasks use `task_kind: "tool"` plus a `tool_type` and `tool_config`:
+
+```json
+{
+  "label": "read_notes",
+  "title": "Read notes",
+  "task_kind": "tool",
+  "tool_type": "read_file",
+  "tool_config": {
+    "path": "notes.txt"
+  }
+}
+```
+
+Supported built-in tools:
+
+| Tool | Required config | Meaning |
+|------|------------------|---------|
+| `read_file` | `path` | Read a file and expose contents through normalized output |
+| `write_file` | `path`, `content` | Write UTF-8 text to a file and register it as an artifact |
+| `shell_command` | `argv` | Run a bounded argv command with `shell=False` and structured captured output |
+
+Tool tasks write the same normalized `output.json` schema as agent and watcher tasks, so downstream references work without new syntax:
+
+```text
+read_notes.result.text
+shell.result.data.exit_code
+shell.result.data.stdout
+shell.artifact.stdout
+write_file.artifact.written_file
+```
+
+Example tool to agent handoff:
+
+```json
+{
+  "title": "Tool read demo",
+  "tasks": [
+    {
+      "label": "read_notes",
+      "title": "Read notes",
+      "task_kind": "tool",
+      "tool_type": "read_file",
+      "tool_config": {
+        "path": "notes.txt"
+      }
+    },
+    {
+      "label": "summarize",
+      "title": "Summarize notes",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": ["read_notes"],
+      "inputs": [
+        {"name": "notes", "from": "read_notes.result.text"}
+      ],
+      "prompt": "Summarize these notes."
+    }
+  ]
+}
+```
+
+Deterministic inspection surfaces:
+
+```bash
+python -m mr1.workflow_cli tools
+python -m mr1.workflow_cli task <task_id>
+python -m mr1.workflow_cli result <task_id>
+```
+
+Inside MR1 you can use:
+
+```text
+/tools
+/task <task_id>
+/result <task_id>
+```
+
+Examples are available at:
+
+```text
+examples/workflows/tool_read_demo.json
+examples/workflows/tool_shell_demo.json
+```
+
+Manual smoke test:
+
+1. Create `/tmp/mr1_notes.txt`.
+2. Submit `examples/workflows/tool_read_demo.json` with its `path` updated to that file.
+3. Run `/scheduler tick`.
+4. Confirm the read task wrote `output.json`.
+5. Run `/result <read_task_id>` and inspect `result.text`.
+6. Run `/task <downstream_task_id>` and inspect `materialized_prompt.txt`.
+
+Shell smoke test:
+
+1. Submit `examples/workflows/tool_shell_demo.json`.
+2. Run `/scheduler tick`.
+3. Run `/result <shell_task_id>`.
+4. Confirm `result.data.exit_code`, `result.data.stdout`, and the `stdout` artifact are present.
 
 ## Running mem_dltr manually
 

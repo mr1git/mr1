@@ -223,9 +223,12 @@ def normalize_artifacts(
         raise DataflowError("artifacts payload must be a list")
     artifacts: list[Artifact] = []
     for idx, raw in enumerate(raw_artifacts):
-        if not isinstance(raw, dict):
+        if isinstance(raw, Artifact):
+            data = raw.to_dict()
+        elif isinstance(raw, dict):
+            data = dict(raw)
+        else:
             raise DataflowError(f"artifact[{idx}] must be an object")
-        data = dict(raw)
         data.setdefault("artifact_id", new_artifact_id())
         data.setdefault("workflow_id", workflow_id)
         data.setdefault("task_id", task_id)
@@ -318,6 +321,32 @@ def build_watcher_task_output(task: Any) -> TaskOutput:
             "task_kind": getattr(task, "task_kind", None),
             "watcher_type": getattr(task, "watcher_type", None),
         },
+    )
+
+
+def build_tool_task_output(task: Any, tool_result: Any) -> TaskOutput:
+    artifacts = normalize_artifacts(
+        getattr(tool_result, "artifacts", []),
+        workflow_id=task.workflow_id,
+        task_id=task.task_id,
+    )
+    metadata = {
+        "task_kind": getattr(task, "task_kind", None),
+        "tool_type": getattr(task, "tool_type", None),
+    }
+    if getattr(tool_result, "error", None):
+        metadata["error"] = tool_result.error
+    metadata.update(dict(getattr(tool_result, "metadata", {}) or {}))
+    return TaskOutput(
+        task_id=task.task_id,
+        workflow_id=task.workflow_id,
+        status=getattr(getattr(task, "status", None), "value", getattr(task, "status", getattr(tool_result, "state", "succeeded"))),
+        summary=getattr(tool_result, "summary", "") or "",
+        text=getattr(tool_result, "text", "") or "",
+        data=dict(getattr(tool_result, "data", {}) or {}),
+        metrics=dict(getattr(tool_result, "metrics", {}) or {}),
+        artifacts=artifacts,
+        metadata=metadata,
     )
 
 

@@ -1,0 +1,52 @@
+{
+  "title": "Read file and check Python version",
+  "tasks": [
+    {
+      "label": "read_notes",
+      "title": "Read notes from file",
+      "task_kind": "tool",
+      "tool_type": "read_file",
+      "tool_config": {
+        "path": "/tmp/test_notes.txt",
+        "max_bytes": 65536
+      }
+    },
+    {
+      "label": "python_version",
+      "title": "Print Python version",
+      "task_kind": "tool",
+      "tool_type": "shell_command",
+      "tool_config": {
+        "argv": [
+          "python3",
+          "--version"
+        ],
+        "cwd": ".",
+        "timeout_s": 10,
+        "capture_max_bytes": 65536,
+        "env": {}
+      }
+    },
+    {
+      "label": "summarize",
+      "title": "Summarize results into report",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": [
+        "read_notes",
+        "python_version"
+      ],
+      "inputs": [
+        {
+          "name": "notes_content",
+          "from": "read_notes.result.text"
+        },
+        {
+          "name": "python_version_output",
+          "from": "python_version.result.data.stdout"
+        }
+      ],
+      "prompt": "Create a short report summarizing the notes content and the Python version output."
+    }
+  ]
+}

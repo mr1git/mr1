@@ -1312,6 +1312,8 @@ class MR1:
             )
         if cmd == "/watchers":
             return workflow_cli._format_watchers(self._scheduler.list_workflows())
+        if cmd == "/tools":
+            return workflow_cli._format_tools()
         if cmd.startswith("/workflow "):
             rest = cmd[len("/workflow "):].strip()
             if rest.startswith("submit "):
@@ -1430,7 +1432,7 @@ class MR1:
         print(f"Session: {self._state.session_id}")
         print(
             "Commands: /status  /tasks  /kill  /history  /memdltr  "
-            "/workflows  /watchers  /vizualize  /visualize-web  "
+            "/workflows  /watchers  /tools  /vizualize  /visualize-web  "
             "/test spawn agents <h>  /test kill agents"
         )
         print("Type 'exit' or Ctrl+C to quit.\n")

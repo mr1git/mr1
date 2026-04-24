@@ -39,6 +39,7 @@ from mr1.dataflow import (
     TaskInputSpec,
     build_agent_task_output,
     build_materialized_prompt,
+    build_tool_task_output,
     build_watcher_task_output,
     materialize_task_inputs,
     parse_input_reference,
@@ -50,6 +51,12 @@ from mr1.kazi_runner import (
     RunResult,
     RunStatus,
     Runner,
+)
+from mr1.tools import (
+    ToolConfigError,
+    ToolRegistry,
+    ToolResult,
+    default_tool_registry,
 )
 from mr1.watchers import (
     WatcherConfigError,
@@ -94,6 +101,7 @@ class WatcherTriggerError(ValueError):
 def validate_spec(
     spec: dict[str, Any],
     watcher_registry: Optional[WatcherRegistry] = None,
+    tool_registry: Optional[ToolRegistry] = None,
 ) -> None:
     """
     Validate a user-submitted workflow spec without mutating it.
@@ -108,6 +116,7 @@ def validate_spec(
       * no cycles (topological sort must succeed).
     """
     registry = watcher_registry or default_watcher_registry()
+    tools = tool_registry or default_tool_registry()
     if not isinstance(spec, dict):
         raise WorkflowSpecError("workflow spec must be a JSON object")
 
@@ -142,6 +151,14 @@ def validate_spec(
                     raw.get("watch_config", {}),
                 )
             except WatcherConfigError as exc:
+                raise WorkflowSpecError(f"task '{label}': {exc}") from exc
+        elif task_kind == "tool":
+            try:
+                tools.validate_spec(
+                    raw.get("tool_type"),
+                    raw.get("tool_config", {}),
+                )
+            except ToolConfigError as exc:
                 raise WorkflowSpecError(f"task '{label}': {exc}") from exc
         else:
             raise WorkflowSpecError(
@@ -222,12 +239,17 @@ def build_workflow_from_spec(
     spec: dict[str, Any],
     created_by: Provenance,
     watcher_registry: Optional[WatcherRegistry] = None,
+    tool_registry: Optional[ToolRegistry] = None,
 ) -> Workflow:
     """
     Convert a validated spec into a `Workflow` with generated IDs and
     resolved dependencies. Does not touch disk.
     """
-    validate_spec(spec, watcher_registry=watcher_registry)
+    validate_spec(
+        spec,
+        watcher_registry=watcher_registry,
+        tool_registry=tool_registry,
+    )
 
     workflow_id = new_workflow_id()
     title = spec.get("title") or f"workflow {workflow_id}"
@@ -253,9 +275,12 @@ def build_workflow_from_spec(
             task_kind=raw.get("task_kind", "agent"),
             agent_type=raw.get("agent_type", "kazi")
             if raw.get("task_kind", "agent") == "agent" else None,
-            prompt=raw.get("prompt", ""),
+            prompt=raw.get("prompt", "")
+            if raw.get("task_kind", "agent") == "agent" else "",
             watcher_type=raw.get("watcher_type"),
             watch_config=dict(raw.get("watch_config", {})),
+            tool_type=raw.get("tool_type"),
+            tool_config=dict(raw.get("tool_config", {})),
             condition=dict(raw["condition"]) if raw.get("condition") is not None else None,
             status=TaskStatus.CREATED,
             created_by=created_by,
@@ -284,6 +309,7 @@ def submit_spec_to_disk(
     created_by: Provenance,
     store: WorkflowStore,
     watcher_registry: Optional[WatcherRegistry] = None,
+    tool_registry: Optional[ToolRegistry] = None,
 ) -> str:
     """
     Persist a submitted workflow so the MR1-owned scheduler will pick
@@ -296,6 +322,7 @@ def submit_spec_to_disk(
         spec,
         created_by,
         watcher_registry=watcher_registry,
+        tool_registry=tool_registry,
     )
     log = WorkflowEventLog(store, default_agent_id=created_by.id)
     with store.locked():
@@ -426,6 +453,7 @@ class Scheduler:
         *,
         event_log: Optional[WorkflowEventLog] = None,
         watcher_registry: Optional[WatcherRegistry] = None,
+        tool_registry: Optional[ToolRegistry] = None,
         concurrency: int = 4,
         auto_tick: bool = True,
         tick_interval_s: float = 1.0,
@@ -437,6 +465,7 @@ class Scheduler:
         self._runner = runner or MockRunner()
         self._events = event_log or WorkflowEventLog(store, default_agent_id=agent_id)
         self._watchers = watcher_registry or default_watcher_registry()
+        self._tools = tool_registry or default_tool_registry()
         self._concurrency = concurrency
         self._tick_interval_s = tick_interval_s
         self._agent_id = agent_id
@@ -498,6 +527,7 @@ class Scheduler:
             created_by,
             self._store,
             watcher_registry=self._watchers,
+            tool_registry=self._tools,
         )
 
     # ------------------------------------------------------------------
@@ -1013,6 +1043,26 @@ class Scheduler:
                     )],
                 )
                 continue
+            if task.task_kind == "tool":
+                self._commit(
+                    wf,
+                    task,
+                    TaskStatus.RUNNING,
+                    event=ev.TASK_STARTED,
+                    message="tool started",
+                    started=True,
+                    tool_started=True,
+                    extra_events=[(
+                        ev.TOOL_STARTED,
+                        "tool started",
+                        {
+                            "tool_type": task.tool_type,
+                            "status": TaskStatus.RUNNING.value,
+                        },
+                    )],
+                )
+                self._run_tool_task(wf, task)
+                continue
             if slots <= 0:
                 break
             if task.inputs:
@@ -1105,6 +1155,99 @@ class Scheduler:
                 )
         return False
 
+    def _run_tool_task(self, wf: Workflow, task: Task) -> None:
+        try:
+            tool_result = self._tools.run(task, self._store, wf)
+        except Exception as exc:
+            tool_result = ToolResult(
+                state="failed",
+                summary=f"tool failed: {task.tool_type}",
+                text="",
+                error=str(exc),
+                metadata={"tool_type": task.tool_type},
+            )
+
+        state_map = {
+            "succeeded": (TaskStatus.SUCCEEDED, ev.TASK_SUCCEEDED, ev.TOOL_SUCCEEDED),
+            "failed": (TaskStatus.FAILED, ev.TASK_FAILED, ev.TOOL_FAILED),
+            "timed_out": (TaskStatus.TIMED_OUT, ev.TASK_TIMED_OUT, ev.TOOL_TIMED_OUT),
+        }
+        target_status, task_event, tool_event = state_map.get(
+            tool_result.state,
+            (TaskStatus.FAILED, ev.TASK_FAILED, ev.TOOL_FAILED),
+        )
+
+        extra_events: list[tuple[str, str, dict[str, Any]]] = []
+        output_path: Optional[str] = None
+        dataflow_error: Optional[str] = None
+        artifacts: list[Any] = []
+        try:
+            artifacts = register_artifacts(task, self._store, tool_result.artifacts)
+            for artifact in artifacts:
+                extra_events.append((
+                    ev.ARTIFACT_REGISTERED,
+                    f"artifact registered: {artifact.name}",
+                    {"name": artifact.name, "kind": artifact.kind, "path": artifact.path},
+                ))
+            output = build_tool_task_output(
+                replace(
+                    task,
+                    status=target_status,
+                    tool_error=tool_result.error,
+                ),
+                tool_result,
+            )
+            output_path = str(self._store.write_task_output(
+                wf.workflow_id,
+                task.task_id,
+                output,
+            ))
+            extra_events.append((
+                ev.OUTPUT_WRITTEN,
+                "normalized output written",
+                {"path": output_path},
+            ))
+        except DataflowError as exc:
+            target_status = TaskStatus.FAILED
+            task_event = ev.TASK_FAILED
+            tool_event = ev.TOOL_FAILED
+            dataflow_error = str(exc)
+            tool_result = ToolResult(
+                state="failed",
+                summary=tool_result.summary,
+                text=tool_result.text,
+                data=tool_result.data,
+                metrics=tool_result.metrics,
+                artifacts=[],
+                metadata=tool_result.metadata,
+                error=str(exc),
+            )
+
+        message = dataflow_error or tool_result.error or tool_result.summary or ""
+        event_metadata = {
+            "tool_type": task.tool_type,
+            "state": target_status.value,
+        }
+        if tool_result.error:
+            event_metadata["error"] = tool_result.error
+        if tool_result.data:
+            event_metadata["data"] = dict(tool_result.data)
+        extra_events.insert(0, (tool_event, message, event_metadata))
+        self._commit(
+            wf,
+            task,
+            target_status,
+            event=task_event,
+            message=message,
+            finished=True,
+            output_path=output_path,
+            artifacts=artifacts,
+            dataflow_error=dataflow_error,
+            tool_finished_at=_now_iso(),
+            tool_error=dataflow_error or tool_result.error,
+            extra_events=extra_events,
+        )
+
     # ------------------------------------------------------------------
     # Atomic commit helper
     # ------------------------------------------------------------------
@@ -1138,6 +1281,9 @@ class Scheduler:
         last_checked_at: Any = _UNSET,
         last_check_result: Any = _UNSET,
         condition: Any = _UNSET,
+        tool_started: bool = False,
+        tool_finished_at: Any = _UNSET,
+        tool_error: Any = _UNSET,
         extra_events: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
     ) -> None:
         """
@@ -1191,6 +1337,12 @@ class Scheduler:
                 )
             if condition is not _UNSET:
                 task.condition = dict(condition) if condition is not None else None
+            if tool_started and task.tool_started_at is None:
+                task.tool_started_at = _now_iso()
+            if tool_finished_at is not _UNSET:
+                task.tool_finished_at = tool_finished_at
+            if tool_error is not _UNSET:
+                task.tool_error = tool_error
 
             self._store.save_workflow(wf)
             metadata: dict[str, Any] = {"status": new_status.value}
@@ -1200,8 +1352,12 @@ class Scheduler:
                 metadata["blocked_by"] = blocked_by
             if task.watcher_type:
                 metadata["watcher_type"] = task.watcher_type
+            if task.tool_type:
+                metadata["tool_type"] = task.tool_type
             if task.dataflow_error:
                 metadata["dataflow_error"] = task.dataflow_error
+            if task.tool_error:
+                metadata["tool_error"] = task.tool_error
             self._events.emit(
                 event, wf.workflow_id,
                 task_id=task.task_id,

@@ -110,6 +110,23 @@ class TestTask:
         )
         assert Task.from_dict(t.to_dict()).to_dict() == t.to_dict()
 
+    def test_tool_fields_roundtrip(self):
+        t = Task(
+            task_id="tk-tool",
+            workflow_id="wf-1",
+            label="read_notes",
+            title="Read notes",
+            task_kind="tool",
+            agent_type=None,
+            prompt="",
+            tool_type="read_file",
+            tool_config={"path": "notes.txt", "max_bytes": 1024},
+            tool_started_at="2026-04-24T10:00:00+00:00",
+            tool_finished_at="2026-04-24T10:00:01+00:00",
+            tool_error=None,
+        )
+        assert Task.from_dict(t.to_dict()).to_dict() == t.to_dict()
+
     def test_status_enum_preserved(self):
         t = self._sample()
         t.status = TaskStatus.BLOCKED

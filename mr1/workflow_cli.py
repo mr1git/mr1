@@ -35,6 +35,7 @@ from mr1.scheduler import (
     submit_spec_to_disk,
     trigger_watcher_on_disk,
 )
+from mr1.tools import ToolRegistry, default_tool_registry
 from mr1.workflow_models import (
     Provenance,
     Task,
@@ -146,6 +147,17 @@ def _format_task_detail(wf: Workflow, task: Task) -> str:
             f"last_checked:  {_short_ts(task.last_checked_at)}",
             f"last_result:   {(task.last_check_result or {}).get('message', '-')}",
             f"condition:     {json.dumps(task.condition, sort_keys=True) if task.condition is not None else '-'}",
+        ])
+    if task.task_kind == "tool":
+        tool_config = json.dumps(task.tool_config, sort_keys=True)
+        if len(tool_config) > 200:
+            tool_config = tool_config[:197] + "..."
+        lines.extend([
+            f"tool:         {task.tool_type or '-'}",
+            f"tool_config:  {tool_config}",
+            f"tool_started: {_short_ts(task.tool_started_at)}",
+            f"tool_done:    {_short_ts(task.tool_finished_at)}",
+            f"tool_error:   {task.tool_error or '-'}",
         ])
     return "\n".join(lines)
 
@@ -268,6 +280,17 @@ def _format_artifacts(workflow: Workflow) -> str:
     return _render_table(rows)
 
 
+def _format_tools(registry: Optional[ToolRegistry] = None) -> str:
+    active_registry = registry or default_tool_registry()
+    tools = active_registry.list_tools()
+    if not tools:
+        return "No tools registered."
+    rows = [("TOOL", "DESCRIPTION", "CONFIG_SHAPE")]
+    for tool in tools:
+        rows.append((tool.tool_type, tool.description, tool.config_shape))
+    return _render_table(rows)
+
+
 def _render_table(rows: list[tuple[str, ...]], indent: str = "") -> str:
     if not rows:
         return ""
@@ -323,6 +346,7 @@ def _cmd_submit(args: argparse.Namespace, store: WorkflowStore) -> int:
             spec,
             Provenance(type="user", id="cli"),
             store,
+            tool_registry=default_tool_registry(),
         )
     except WorkflowSpecError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -376,6 +400,12 @@ def _cmd_events(args: argparse.Namespace, store: WorkflowStore) -> int:
 
 def _cmd_watchers(args: argparse.Namespace, store: WorkflowStore) -> int:
     print(_format_watchers(store.list_workflows()))
+    return 0
+
+
+def _cmd_tools(args: argparse.Namespace, store: WorkflowStore) -> int:
+    del args, store
+    print(_format_tools())
     return 0
 
 
@@ -468,6 +498,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_watchers = subs.add_parser("watchers", help="List active watcher tasks.")
     p_watchers.set_defaults(func=_cmd_watchers)
+
+    p_tools = subs.add_parser("tools", help="List registered deterministic workflow tools.")
+    p_tools.set_defaults(func=_cmd_tools)
 
     p_result = subs.add_parser("result", help="Show normalized task output.")
     p_result.add_argument("task_id")

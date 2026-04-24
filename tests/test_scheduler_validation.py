@@ -145,6 +145,20 @@ class TestValidationAccepts:
             ],
         })
 
+    def test_accepts_tool_task(self):
+        validate_spec({
+            "tasks": [
+                {
+                    "label": "read_notes",
+                    "title": "Read notes",
+                    "task_kind": "tool",
+                    "tool_type": "read_file",
+                    "tool_config": {"path": "notes.txt"},
+                },
+                _base_task("run", deps=["read_notes"]),
+            ],
+        })
+
     def test_accepts_transitive_input_source(self):
         validate_spec({
             "tasks": [
