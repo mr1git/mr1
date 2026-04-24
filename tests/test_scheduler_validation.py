@@ -1,4 +1,4 @@
-"""Spec validation: duplicate labels, unknown deps, cycles, unsupported kinds."""
+"""Spec validation: duplicate labels, unknown deps, cycles, supported kinds."""
 
 import pytest
 
@@ -16,14 +16,16 @@ PROV = Provenance(type="user", id="cli")
 
 
 def _base_task(label, deps=None, task_kind="agent", agent_type="kazi"):
-    return {
+    task = {
         "label": label,
         "title": label.upper(),
         "task_kind": task_kind,
-        "agent_type": agent_type,
         "prompt": "x",
         "depends_on": deps or [],
     }
+    if task_kind == "agent":
+        task["agent_type"] = agent_type
+    return task
 
 
 class TestValidationRejects:
@@ -64,7 +66,7 @@ class TestValidationRejects:
             validate_spec(spec)
 
     def test_unsupported_task_kind(self):
-        spec = {"tasks": [_base_task("a", task_kind="watcher")]}
+        spec = {"tasks": [_base_task("a", task_kind="command")]}
         with pytest.raises(WorkflowSpecError, match="task_kind"):
             validate_spec(spec)
 
@@ -81,6 +83,20 @@ class TestValidationAccepts:
                 _base_task("a"),
                 _base_task("b", deps=["a"]),
                 _base_task("c", deps=["b"]),
+            ],
+        })
+
+    def test_accepts_watcher_task(self):
+        validate_spec({
+            "tasks": [
+                {
+                    "label": "wait",
+                    "title": "Wait",
+                    "task_kind": "watcher",
+                    "watcher_type": "manual_event",
+                    "watch_config": {"event": "approved"},
+                },
+                _base_task("run", deps=["wait"]),
             ],
         })
 

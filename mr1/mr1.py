@@ -43,7 +43,7 @@ sys.path.insert(0, str(_PKG_ROOT.parent))
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 from mr1 import kazi, mrn
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
-from mr1.scheduler import Scheduler, WorkflowSpecError
+from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 from mr1 import workflow_cli
@@ -1310,11 +1310,30 @@ class MR1:
             return workflow_cli._format_workflows_table(
                 self._scheduler.list_workflows()
             )
+        if cmd == "/watchers":
+            return workflow_cli._format_watchers(self._scheduler.list_workflows())
         if cmd.startswith("/workflow "):
             rest = cmd[len("/workflow "):].strip()
             if rest.startswith("submit "):
                 path_str = rest[len("submit "):].strip()
                 return self._submit_workflow_from_path(path_str)
+            if rest.startswith("trigger "):
+                parts = rest.split(maxsplit=3)
+                if len(parts) < 3:
+                    return "Usage: /workflow trigger <workflow_id> <label-or-task-id> [event_name]"
+                wf_id = parts[1]
+                label_or_task_id = parts[2]
+                event_name = parts[3] if len(parts) > 3 else None
+                try:
+                    task_id = self._scheduler.trigger_watcher(
+                        wf_id,
+                        label_or_task_id,
+                        event_name=event_name,
+                    )
+                except WatcherTriggerError as exc:
+                    return str(exc)
+                self._scheduler.tick()
+                return f"triggered watcher: {task_id}"
             wf_id = rest
             wf = self._scheduler.get_workflow(wf_id)
             if wf is None:
@@ -1387,7 +1406,8 @@ class MR1:
         print(f"Session: {self._state.session_id}")
         print(
             "Commands: /status  /tasks  /kill  /history  /memdltr  "
-            "/vizualize  /visualize-web  /test spawn agents <h>  /test kill agents"
+            "/workflows  /watchers  /vizualize  /visualize-web  "
+            "/test spawn agents <h>  /test kill agents"
         )
         print("Type 'exit' or Ctrl+C to quit.\n")
 

@@ -63,6 +63,25 @@ class TestTask:
         t2 = Task.from_dict(data)
         assert t2.to_dict() == data
 
+    def test_watcher_fields_roundtrip(self):
+        t = Task(
+            task_id="tk-watch",
+            workflow_id="wf-1",
+            label="wait",
+            title="Wait",
+            task_kind="watcher",
+            agent_type=None,
+            prompt="",
+            watcher_type="manual_event",
+            watch_config={"event": "approved"},
+            watch_started_at="2026-04-24T10:00:00+00:00",
+            watch_satisfied_at="2026-04-24T10:01:00+00:00",
+            last_checked_at="2026-04-24T10:00:30+00:00",
+            last_check_result={"state": "satisfied", "message": "ok"},
+            condition={"triggered": True},
+        )
+        assert Task.from_dict(t.to_dict()).to_dict() == t.to_dict()
+
     def test_status_enum_preserved(self):
         t = self._sample()
         t.status = TaskStatus.BLOCKED

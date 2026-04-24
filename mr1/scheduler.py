@@ -40,6 +40,12 @@ from mr1.kazi_runner import (
     RunStatus,
     Runner,
 )
+from mr1.watchers import (
+    WatcherConfigError,
+    WatchEvaluation,
+    WatcherRegistry,
+    default_watcher_registry,
+)
 from mr1.workflow_events import WorkflowEventLog
 from mr1.workflow_models import (
     FAILED_TASK_STATUSES,
@@ -58,6 +64,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_UNSET = object()
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -67,18 +76,27 @@ class WorkflowSpecError(ValueError):
     """Raised for any malformed or unsupported workflow spec."""
 
 
-def validate_spec(spec: dict[str, Any]) -> None:
+class WatcherTriggerError(ValueError):
+    """Raised when a manual watcher trigger request is invalid."""
+
+
+def validate_spec(
+    spec: dict[str, Any],
+    watcher_registry: Optional[WatcherRegistry] = None,
+) -> None:
     """
     Validate a user-submitted workflow spec without mutating it.
 
-    Rules (Phase 1):
+    Rules:
       * `tasks` is a non-empty list.
       * each task has a non-empty `label`.
       * labels are unique across the workflow.
-      * each task has `task_kind == "agent"` and `agent_type == "kazi"`.
+      * each agent task has `agent_type == "kazi"`.
+      * each watcher task has a registered `watcher_type` and valid config.
       * `depends_on` entries must reference labels defined in the same spec.
       * no cycles (topological sort must succeed).
     """
+    registry = watcher_registry or default_watcher_registry()
     if not isinstance(spec, dict):
         raise WorkflowSpecError("workflow spec must be a JSON object")
 
@@ -100,15 +118,23 @@ def validate_spec(spec: dict[str, Any]) -> None:
         label_set.add(label)
 
         task_kind = raw.get("task_kind", "agent")
-        if task_kind != "agent":
+        if task_kind == "agent":
+            agent_type = raw.get("agent_type", "kazi")
+            if agent_type != "kazi":
+                raise WorkflowSpecError(
+                    f"task '{label}': agent_type '{agent_type}' not supported (only 'kazi')"
+                )
+        elif task_kind == "watcher":
+            try:
+                registry.validate_spec(
+                    raw.get("watcher_type"),
+                    raw.get("watch_config", {}),
+                )
+            except WatcherConfigError as exc:
+                raise WorkflowSpecError(f"task '{label}': {exc}") from exc
+        else:
             raise WorkflowSpecError(
-                f"task '{label}': task_kind '{task_kind}' not supported in Phase 1 (only 'agent')"
-            )
-
-        agent_type = raw.get("agent_type", "kazi")
-        if agent_type != "kazi":
-            raise WorkflowSpecError(
-                f"task '{label}': agent_type '{agent_type}' not supported in Phase 1 (only 'kazi')"
+                f"task '{label}': task_kind '{task_kind}' not supported"
             )
 
     # depends_on reference check.
@@ -148,12 +174,13 @@ def validate_spec(spec: dict[str, Any]) -> None:
 def build_workflow_from_spec(
     spec: dict[str, Any],
     created_by: Provenance,
+    watcher_registry: Optional[WatcherRegistry] = None,
 ) -> Workflow:
     """
     Convert a validated spec into a `Workflow` with generated IDs and
     resolved dependencies. Does not touch disk.
     """
-    validate_spec(spec)
+    validate_spec(spec, watcher_registry=watcher_registry)
 
     workflow_id = new_workflow_id()
     title = spec.get("title") or f"workflow {workflow_id}"
@@ -177,8 +204,12 @@ def build_workflow_from_spec(
             label=raw["label"],
             title=raw.get("title", raw["label"]),
             task_kind=raw.get("task_kind", "agent"),
-            agent_type=raw.get("agent_type", "kazi"),
+            agent_type=raw.get("agent_type", "kazi")
+            if raw.get("task_kind", "agent") == "agent" else None,
             prompt=raw.get("prompt", ""),
+            watcher_type=raw.get("watcher_type"),
+            watch_config=dict(raw.get("watch_config", {})),
+            condition=dict(raw["condition"]) if raw.get("condition") is not None else None,
             status=TaskStatus.CREATED,
             created_by=created_by,
             timeout_s=raw.get("timeout_s"),
@@ -201,6 +232,7 @@ def submit_spec_to_disk(
     spec: dict[str, Any],
     created_by: Provenance,
     store: WorkflowStore,
+    watcher_registry: Optional[WatcherRegistry] = None,
 ) -> str:
     """
     Persist a submitted workflow so the MR1-owned scheduler will pick
@@ -209,7 +241,11 @@ def submit_spec_to_disk(
     Called by both `Scheduler.submit_workflow` (in-process) and the
     standalone `workflow_cli submit` command.
     """
-    wf = build_workflow_from_spec(spec, created_by)
+    wf = build_workflow_from_spec(
+        spec,
+        created_by,
+        watcher_registry=watcher_registry,
+    )
     log = WorkflowEventLog(store, default_agent_id=created_by.id)
     with store.locked():
         store.save_workflow(wf)
@@ -220,6 +256,86 @@ def submit_spec_to_disk(
             metadata={"task_count": len(wf.tasks)},
         )
     return wf.workflow_id
+
+
+def trigger_watcher_on_disk(
+    store: WorkflowStore,
+    workflow_id: str,
+    label_or_task_id: str,
+    *,
+    event_name: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    agent_id: str = "scheduler",
+) -> str:
+    """
+    Atomically trigger a persisted manual_event watcher without needing
+    a live Scheduler instance.
+    """
+    event_log = WorkflowEventLog(store, default_agent_id=agent_id)
+    with store.locked():
+        wf = store.load_workflow(workflow_id)
+        if wf is None:
+            raise WatcherTriggerError(f"workflow not found: {workflow_id}")
+
+        task = wf.tasks.get(label_or_task_id) or wf.task_by_label(label_or_task_id)
+        if task is None:
+            raise WatcherTriggerError(
+                f"watcher not found in workflow {workflow_id}: {label_or_task_id}"
+            )
+        if task.task_kind != "watcher":
+            raise WatcherTriggerError(f"task is not a watcher: {label_or_task_id}")
+        if task.watcher_type != "manual_event":
+            raise WatcherTriggerError(
+                f"watcher is not manual_event: {task.label or task.task_id}"
+            )
+        if task.is_terminal():
+            raise WatcherTriggerError(
+                f"watcher already terminal: {task.label or task.task_id}"
+            )
+
+        expected_event = task.watch_config.get("event")
+        if event_name and expected_event and event_name != expected_event:
+            raise WatcherTriggerError(
+                f"manual event mismatch: expected '{expected_event}', got '{event_name}'"
+            )
+
+        now_iso = _now_iso()
+        trigger_metadata = dict(metadata or {})
+        task.condition = {
+            "triggered": True,
+            "event": expected_event,
+            "triggered_at": now_iso,
+            "metadata": trigger_metadata,
+        }
+        task.status = TaskStatus.SUCCEEDED
+        task.finished_at = now_iso
+        task.watch_satisfied_at = now_iso
+        task.last_checked_at = now_iso
+        task.last_check_result = {
+            "state": "satisfied",
+            "message": f"manual event triggered: {expected_event}",
+            "watcher_type": task.watcher_type,
+            "event": expected_event,
+            "trigger_metadata": trigger_metadata,
+        }
+        store.save_workflow(wf)
+        event_log.emit(
+            ev.WATCHER_SATISFIED,
+            wf.workflow_id,
+            task_id=task.task_id,
+            agent_id=agent_id,
+            message=task.last_check_result["message"],
+            metadata=dict(task.last_check_result),
+        )
+        event_log.emit(
+            ev.TASK_SUCCEEDED,
+            wf.workflow_id,
+            task_id=task.task_id,
+            agent_id=agent_id,
+            message=task.last_check_result["message"],
+            metadata={"status": TaskStatus.SUCCEEDED.value, "watcher_type": task.watcher_type},
+        )
+        return task.task_id
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +359,7 @@ class Scheduler:
         runner: Optional[Runner] = None,
         *,
         event_log: Optional[WorkflowEventLog] = None,
+        watcher_registry: Optional[WatcherRegistry] = None,
         concurrency: int = 4,
         auto_tick: bool = True,
         tick_interval_s: float = 1.0,
@@ -253,6 +370,7 @@ class Scheduler:
         self._store = store
         self._runner = runner or MockRunner()
         self._events = event_log or WorkflowEventLog(store, default_agent_id=agent_id)
+        self._watchers = watcher_registry or default_watcher_registry()
         self._concurrency = concurrency
         self._tick_interval_s = tick_interval_s
         self._agent_id = agent_id
@@ -309,7 +427,12 @@ class Scheduler:
         Validate a spec, persist the resulting workflow, and emit
         `workflow_submitted`. Returns the new workflow ID.
         """
-        return submit_spec_to_disk(spec, created_by, self._store)
+        return submit_spec_to_disk(
+            spec,
+            created_by,
+            self._store,
+            watcher_registry=self._watchers,
+        )
 
     # ------------------------------------------------------------------
     # Read-through accessors
@@ -326,6 +449,31 @@ class Scheduler:
             if task_id in wf.tasks:
                 return wf.tasks[task_id]
         return None
+
+    def list_watchers(self) -> list[tuple[Workflow, Task]]:
+        watchers: list[tuple[Workflow, Task]] = []
+        for wf in self._store.list_workflows():
+            for task in wf.tasks.values():
+                if task.task_kind != "watcher" or task.is_terminal():
+                    continue
+                watchers.append((wf, task))
+        return watchers
+
+    def trigger_watcher(
+        self,
+        workflow_id: str,
+        label_or_task_id: str,
+        event_name: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
+        return trigger_watcher_on_disk(
+            self._store,
+            workflow_id,
+            label_or_task_id,
+            event_name=event_name,
+            metadata=metadata,
+            agent_id=self._agent_id,
+        )
 
     # ------------------------------------------------------------------
     # Tick — the deterministic advance
@@ -396,6 +544,9 @@ class Scheduler:
         for task in list(wf.tasks.values()):
             if task.status is not TaskStatus.RUNNING:
                 continue
+            if task.task_kind == "watcher":
+                changed |= self._poll_running_watcher(wf, task)
+                continue
             handle = self._handles.get(task.task_id)
             if handle is None:
                 # Lost the handle (e.g. scheduler restart mid-run). Mark
@@ -413,6 +564,167 @@ class Scheduler:
                 continue
             changed |= self._finalize_task(wf, task, handle, result)
         return changed
+
+    def _poll_running_watcher(self, wf: Workflow, task: Task) -> bool:
+        timeout_message = self._watcher_timeout_message(task)
+        if timeout_message is not None:
+            checked_at = _now_iso()
+            payload = {
+                "state": "timed_out",
+                "message": timeout_message,
+                "watcher_type": task.watcher_type,
+            }
+            self._commit(
+                wf,
+                task,
+                TaskStatus.TIMED_OUT,
+                event=ev.TASK_TIMED_OUT,
+                message=timeout_message,
+                finished=True,
+                watch_satisfied_at=_UNSET,
+                last_checked_at=checked_at,
+                last_check_result=payload,
+                extra_events=[(
+                    ev.WATCHER_TIMED_OUT,
+                    timeout_message,
+                    payload,
+                )],
+            )
+            return True
+
+        if not self._should_evaluate_watcher(task):
+            return False
+
+        now = datetime.now(timezone.utc)
+        try:
+            evaluation = self._watchers.evaluate(task, now)
+        except Exception as exc:
+            evaluation = WatchEvaluation(
+                state="failed",
+                message=f"watcher evaluation error: {exc}",
+                metadata={"error": str(exc), "watcher_type": task.watcher_type},
+            )
+
+        checked_at = now.isoformat()
+        check_payload = self._watcher_result_payload(task, evaluation)
+        if evaluation.state == "not_satisfied":
+            self._record_watcher_check(
+                wf,
+                task,
+                checked_at=checked_at,
+                check_payload=check_payload,
+            )
+            return True
+
+        if evaluation.state == "satisfied":
+            self._commit(
+                wf,
+                task,
+                TaskStatus.SUCCEEDED,
+                event=ev.TASK_SUCCEEDED,
+                message=evaluation.message,
+                finished=True,
+                watch_satisfied_at=_now_iso(),
+                last_checked_at=checked_at,
+                last_check_result=check_payload,
+                extra_events=[(
+                    ev.WATCHER_SATISFIED,
+                    evaluation.message,
+                    check_payload,
+                )],
+            )
+            return True
+
+        if evaluation.state == "timed_out":
+            self._commit(
+                wf,
+                task,
+                TaskStatus.TIMED_OUT,
+                event=ev.TASK_TIMED_OUT,
+                message=evaluation.message,
+                finished=True,
+                last_checked_at=checked_at,
+                last_check_result=check_payload,
+                extra_events=[(
+                    ev.WATCHER_TIMED_OUT,
+                    evaluation.message,
+                    check_payload,
+                )],
+            )
+            return True
+
+        self._commit(
+            wf,
+            task,
+            TaskStatus.FAILED,
+            event=ev.TASK_FAILED,
+            message=evaluation.message,
+            finished=True,
+            last_checked_at=checked_at,
+            last_check_result=check_payload,
+            extra_events=[(
+                ev.WATCHER_FAILED,
+                evaluation.message,
+                check_payload,
+            )],
+        )
+        return True
+
+    def _should_evaluate_watcher(self, task: Task) -> bool:
+        if not task.last_checked_at:
+            return True
+        interval_s = task.watch_config.get("poll_interval_s", 1)
+        if not isinstance(interval_s, (int, float)) or interval_s < 0:
+            interval_s = 1
+        last_checked = datetime.fromisoformat(task.last_checked_at)
+        return (datetime.now(timezone.utc) - last_checked).total_seconds() >= interval_s
+
+    def _watcher_timeout_message(self, task: Task) -> Optional[str]:
+        max_wait_s = task.watch_config.get("max_wait_s")
+        if not isinstance(max_wait_s, (int, float)) or max_wait_s <= 0:
+            return None
+        started_at = task.watch_started_at or task.started_at
+        if not started_at:
+            return None
+        started_dt = datetime.fromisoformat(started_at)
+        elapsed_s = (datetime.now(timezone.utc) - started_dt).total_seconds()
+        if elapsed_s < max_wait_s:
+            return None
+        return f"watcher exceeded max_wait_s={int(max_wait_s)}"
+
+    def _watcher_result_payload(
+        self,
+        task: Task,
+        evaluation: WatchEvaluation,
+    ) -> dict[str, Any]:
+        payload = {
+            "state": evaluation.state,
+            "message": evaluation.message,
+            "watcher_type": task.watcher_type,
+        }
+        payload.update(dict(evaluation.metadata))
+        return payload
+
+    def _record_watcher_check(
+        self,
+        wf: Workflow,
+        task: Task,
+        *,
+        checked_at: str,
+        check_payload: dict[str, Any],
+    ) -> None:
+        with self._store.locked():
+            task.last_checked_at = checked_at
+            task.last_check_result = dict(check_payload)
+            self._store.save_workflow(wf)
+            self._events.emit(
+                ev.WATCHER_CHECKED,
+                wf.workflow_id,
+                task_id=task.task_id,
+                agent_id=self._agent_id,
+                message=check_payload.get("message", ""),
+                metadata=dict(check_payload),
+            )
 
     def _finalize_task(
         self,
@@ -540,16 +852,35 @@ class Scheduler:
 
     def _launch_ready(self, wf: Workflow) -> None:
         running_now = sum(
-            1 for t in wf.tasks.values() if t.status is TaskStatus.RUNNING
+            1
+            for t in wf.tasks.values()
+            if t.status is TaskStatus.RUNNING and t.task_kind == "agent"
         )
-        if running_now >= self._concurrency:
-            return
         slots = self._concurrency - running_now
         for task in wf.tasks.values():
-            if slots <= 0:
-                break
             if task.status is not TaskStatus.READY:
                 continue
+            if task.task_kind == "watcher":
+                self._commit(
+                    wf,
+                    task,
+                    TaskStatus.RUNNING,
+                    event=ev.TASK_STARTED,
+                    message="watcher started",
+                    started=True,
+                    watch_started=True,
+                    extra_events=[(
+                        ev.WATCHER_STARTED,
+                        "watcher started",
+                        {
+                            "watcher_type": task.watcher_type,
+                            "status": TaskStatus.RUNNING.value,
+                        },
+                    )],
+                )
+                continue
+            if slots <= 0:
+                break
             try:
                 handle = self._runner.start(task)
             except Exception as exc:
@@ -593,6 +924,12 @@ class Scheduler:
         blocked_by: Optional[list[str]] = None,
         blocked_reason: Optional[str] = None,
         blocked_at: Optional[str] = None,
+        watch_started: bool = False,
+        watch_satisfied_at: Any = _UNSET,
+        last_checked_at: Any = _UNSET,
+        last_check_result: Any = _UNSET,
+        condition: Any = _UNSET,
+        extra_events: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
     ) -> None:
         """
         Mutate the task, persist the workflow, and append the event —
@@ -622,6 +959,19 @@ class Scheduler:
                 task.blocked_reason = blocked_reason
             if blocked_at is not None:
                 task.blocked_at = blocked_at
+            if watch_started and task.watch_started_at is None:
+                task.watch_started_at = _now_iso()
+            if watch_satisfied_at is not _UNSET:
+                task.watch_satisfied_at = watch_satisfied_at
+            if last_checked_at is not _UNSET:
+                task.last_checked_at = last_checked_at
+            if last_check_result is not _UNSET:
+                task.last_check_result = (
+                    dict(last_check_result)
+                    if last_check_result is not None else None
+                )
+            if condition is not _UNSET:
+                task.condition = dict(condition) if condition is not None else None
 
             self._store.save_workflow(wf)
             metadata: dict[str, Any] = {"status": new_status.value}
@@ -629,6 +979,8 @@ class Scheduler:
                 metadata["pid"] = task.pid
             if blocked_by:
                 metadata["blocked_by"] = blocked_by
+            if task.watcher_type:
+                metadata["watcher_type"] = task.watcher_type
             self._events.emit(
                 event, wf.workflow_id,
                 task_id=task.task_id,
@@ -636,6 +988,15 @@ class Scheduler:
                 message=message,
                 metadata=metadata,
             )
+            for event_type, event_message, event_metadata in extra_events or []:
+                self._events.emit(
+                    event_type,
+                    wf.workflow_id,
+                    task_id=task.task_id,
+                    agent_id=self._agent_id,
+                    message=event_message,
+                    metadata=dict(event_metadata),
+                )
 
     # ------------------------------------------------------------------
     # Cancellation

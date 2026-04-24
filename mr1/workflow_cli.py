@@ -28,7 +28,12 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-from mr1.scheduler import WorkflowSpecError, submit_spec_to_disk
+from mr1.scheduler import (
+    WatcherTriggerError,
+    WorkflowSpecError,
+    submit_spec_to_disk,
+    trigger_watcher_on_disk,
+)
 from mr1.workflow_models import (
     Provenance,
     Task,
@@ -124,6 +129,15 @@ def _format_task_detail(wf: Workflow, task: Task) -> str:
         lines.append(f"blocked_by:     {', '.join(task.blocked_by) or '-'}")
         lines.append(f"blocked_reason: {task.blocked_reason or '-'}")
         lines.append(f"blocked_at:     {_short_ts(task.blocked_at)}")
+    if task.task_kind == "watcher":
+        lines.extend([
+            f"watcher:       {task.watcher_type or '-'}",
+            f"watch_started: {_short_ts(task.watch_started_at)}",
+            f"watch_done:    {_short_ts(task.watch_satisfied_at)}",
+            f"last_checked:  {_short_ts(task.last_checked_at)}",
+            f"last_result:   {(task.last_check_result or {}).get('message', '-')}",
+            f"condition:     {json.dumps(task.condition, sort_keys=True) if task.condition is not None else '-'}",
+        ])
     return "\n".join(lines)
 
 
@@ -157,6 +171,35 @@ def _format_events(events: list) -> str:
             ev.task_id or "-",
             (ev.message or "")[:60],
         ))
+    return _render_table(rows)
+
+
+def _format_watchers(workflows: list[Workflow]) -> str:
+    rows = [(
+        "WORKFLOW_ID",
+        "TASK_ID",
+        "LABEL",
+        "WATCHER",
+        "STATUS",
+        "LAST_CHECKED",
+        "LAST_RESULT",
+    )]
+    for wf in workflows:
+        for task in wf.tasks.values():
+            if task.task_kind != "watcher" or task.is_terminal():
+                continue
+            last_result = (task.last_check_result or {}).get("message")
+            rows.append((
+                wf.workflow_id,
+                task.task_id,
+                task.label,
+                task.watcher_type or "-",
+                task.status.value,
+                _short_ts(task.last_checked_at),
+                (last_result or "-")[:60],
+            ))
+    if len(rows) == 1:
+        return "No active watchers."
     return _render_table(rows)
 
 
@@ -266,6 +309,27 @@ def _cmd_events(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
+def _cmd_watchers(args: argparse.Namespace, store: WorkflowStore) -> int:
+    print(_format_watchers(store.list_workflows()))
+    return 0
+
+
+def _cmd_trigger(args: argparse.Namespace, store: WorkflowStore) -> int:
+    try:
+        task_id = trigger_watcher_on_disk(
+            store,
+            args.workflow_id,
+            args.label_or_task_id,
+            event_name=args.event_name,
+            agent_id="cli",
+        )
+    except WatcherTriggerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(task_id)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
@@ -309,6 +373,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_events.add_argument("--task", default=None, dest="task")
     p_events.add_argument("--limit", type=int, default=None)
     p_events.set_defaults(func=_cmd_events)
+
+    p_watchers = subs.add_parser("watchers", help="List active watcher tasks.")
+    p_watchers.set_defaults(func=_cmd_watchers)
+
+    p_trigger = subs.add_parser("trigger", help="Trigger a manual_event watcher.")
+    p_trigger.add_argument("workflow_id")
+    p_trigger.add_argument("label_or_task_id")
+    p_trigger.add_argument("event_name", nargs="?")
+    p_trigger.set_defaults(func=_cmd_trigger)
 
     return parser
 

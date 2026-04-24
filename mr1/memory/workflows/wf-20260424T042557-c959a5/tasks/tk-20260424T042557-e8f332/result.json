@@ -1,0 +1,7 @@
+{
+  "status": "failed",
+  "exit_code": 1,
+  "summary": "[KAZI ERROR] Not logged in \u00b7 Please run /login",
+  "error": "exit 1: ",
+  "pid": 14342
+}

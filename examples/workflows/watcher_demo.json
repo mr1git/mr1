@@ -1,0 +1,24 @@
+{
+  "title": "Watcher Demo",
+  "tasks": [
+    {
+      "label": "wait_file",
+      "title": "Wait for file",
+      "task_kind": "watcher",
+      "watcher_type": "file_exists",
+      "watch_config": {
+        "path": "/tmp/mr1_watcher_demo.txt"
+      }
+    },
+    {
+      "label": "after_file",
+      "title": "Run after file appears",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": [
+        "wait_file"
+      ],
+      "prompt": "Say the file appeared."
+    }
+  ]
+}

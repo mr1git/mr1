@@ -31,6 +31,12 @@ TASK_CANCELLED = "task_cancelled"
 TASK_BLOCKED = "task_blocked"
 TASK_UNBLOCKED = "task_unblocked"
 
+WATCHER_STARTED = "watcher_started"
+WATCHER_CHECKED = "watcher_checked"
+WATCHER_SATISFIED = "watcher_satisfied"
+WATCHER_FAILED = "watcher_failed"
+WATCHER_TIMED_OUT = "watcher_timed_out"
+
 
 class WorkflowEventLog:
     """
@@ -105,3 +111,18 @@ class WorkflowEventLog:
 
     def task_unblocked(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(TASK_UNBLOCKED, workflow_id, task_id=task_id, **kw)
+
+    def watcher_started(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(WATCHER_STARTED, workflow_id, task_id=task_id, **kw)
+
+    def watcher_checked(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(WATCHER_CHECKED, workflow_id, task_id=task_id, **kw)
+
+    def watcher_satisfied(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(WATCHER_SATISFIED, workflow_id, task_id=task_id, **kw)
+
+    def watcher_failed(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(WATCHER_FAILED, workflow_id, task_id=task_id, **kw)
+
+    def watcher_timed_out(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(WATCHER_TIMED_OUT, workflow_id, task_id=task_id, **kw)

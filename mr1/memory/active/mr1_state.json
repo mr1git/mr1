@@ -94,12 +94,13 @@
     },
     "test-agent-e309c95a-d3-n2": {
       "agent_type": "test_agent",
-      "status": "running",
+      "status": "killed",
       "pid": 60324,
       "description": "synthetic branch depth 3 node 2",
       "started_at": "2026-04-20T16:51:52.010712+00:00",
       "parent_task_id": "test-agent-e309c95a-d2-n0",
-      "lane": "conversation"
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:24:07.885939+00:00"
     },
     "test-agent-e309c95a-d3-n3": {
       "agent_type": "test_agent",
@@ -203,12 +204,13 @@
     },
     "test-agent-67b455d6-d2-n2": {
       "agent_type": "test_agent",
-      "status": "running",
+      "status": "killed",
       "pid": 61255,
       "description": "synthetic branch depth 2 node 2",
       "started_at": "2026-04-20T16:53:58.023190+00:00",
       "parent_task_id": "test-agent-67b455d6-d1-n0",
-      "lane": "conversation"
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:24:07.890040+00:00"
     },
     "test-agent-67b455d6-d2-n3": {
       "agent_type": "test_agent",
@@ -289,6 +291,295 @@
       "parent_task_id": "test-agent-8176787b-d1-n0",
       "lane": "conversation",
       "finished_at": "2026-04-20T16:57:48.333344+00:00"
+    },
+    "test-agent-c0cb434e-d0-n0": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86521,
+      "description": "synthetic branch depth 0 node 0",
+      "started_at": "2026-04-24T03:25:00.671863+00:00",
+      "parent_task_id": "mr1",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:26.982527+00:00"
+    },
+    "test-agent-c0cb434e-d1-n0": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86522,
+      "description": "synthetic branch depth 1 node 0",
+      "started_at": "2026-04-24T03:25:00.681796+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d0-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:24.955111+00:00"
+    },
+    "test-agent-c0cb434e-d1-n1": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86523,
+      "description": "synthetic branch depth 1 node 1",
+      "started_at": "2026-04-24T03:25:00.687877+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d0-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:25.951895+00:00"
+    },
+    "test-agent-c0cb434e-d2-n0": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86524,
+      "description": "synthetic branch depth 2 node 0",
+      "started_at": "2026-04-24T03:25:00.692961+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:22.931484+00:00"
+    },
+    "test-agent-c0cb434e-d2-n1": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86525,
+      "description": "synthetic branch depth 2 node 1",
+      "started_at": "2026-04-24T03:25:00.699286+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:23.966956+00:00"
+    },
+    "test-agent-c0cb434e-d2-n2": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86526,
+      "description": "synthetic branch depth 2 node 2",
+      "started_at": "2026-04-24T03:25:00.705784+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:24.970462+00:00"
+    },
+    "test-agent-c0cb434e-d2-n3": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86527,
+      "description": "synthetic branch depth 2 node 3",
+      "started_at": "2026-04-24T03:25:00.712529+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:22.976382+00:00"
+    },
+    "test-agent-c0cb434e-d3-n0": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86528,
+      "description": "synthetic branch depth 3 node 0",
+      "started_at": "2026-04-24T03:25:00.718479+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:20.951901+00:00"
+    },
+    "test-agent-c0cb434e-d3-n1": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86529,
+      "description": "synthetic branch depth 3 node 1",
+      "started_at": "2026-04-24T03:25:00.724605+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:21.938148+00:00"
+    },
+    "test-agent-c0cb434e-d3-n2": {
+      "agent_type": "test_agent",
+      "status": "running",
+      "pid": 86530,
+      "description": "synthetic branch depth 3 node 2",
+      "started_at": "2026-04-24T03:25:00.731407+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n0",
+      "lane": "conversation"
+    },
+    "test-agent-c0cb434e-d3-n3": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86531,
+      "description": "synthetic branch depth 3 node 3",
+      "started_at": "2026-04-24T03:25:00.738854+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:20.961675+00:00"
+    },
+    "test-agent-c0cb434e-d3-n4": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86532,
+      "description": "synthetic branch depth 3 node 4",
+      "started_at": "2026-04-24T03:25:00.746184+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n1",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:21.985784+00:00"
+    },
+    "test-agent-c0cb434e-d3-n5": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86533,
+      "description": "synthetic branch depth 3 node 5",
+      "started_at": "2026-04-24T03:25:00.756260+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n1",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:22.982110+00:00"
+    },
+    "test-agent-c0cb434e-d3-n6": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86534,
+      "description": "synthetic branch depth 3 node 6",
+      "started_at": "2026-04-24T03:25:00.764337+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n1",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:20.981770+00:00"
+    },
+    "test-agent-c0cb434e-d3-n7": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 86535,
+      "description": "synthetic branch depth 3 node 7",
+      "started_at": "2026-04-24T03:25:00.777563+00:00",
+      "parent_task_id": "test-agent-c0cb434e-d2-n1",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:25:21.993035+00:00"
+    },
+    "test-agent-8c2a5ac8-d0-n0": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 88541,
+      "description": "synthetic branch depth 0 node 0",
+      "started_at": "2026-04-24T03:29:27.458277+00:00",
+      "parent_task_id": "mr1",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:29:53.746128+00:00"
+    },
+    "test-agent-8c2a5ac8-d1-n0": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 88542,
+      "description": "synthetic branch depth 1 node 0",
+      "started_at": "2026-04-24T03:29:27.470618+00:00",
+      "parent_task_id": "test-agent-8c2a5ac8-d0-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:29:51.753871+00:00"
+    },
+    "test-agent-8c2a5ac8-d1-n1": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 88543,
+      "description": "synthetic branch depth 1 node 1",
+      "started_at": "2026-04-24T03:29:27.477840+00:00",
+      "parent_task_id": "test-agent-8c2a5ac8-d0-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:29:52.732510+00:00"
+    },
+    "test-agent-8c2a5ac8-d2-n0": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 88544,
+      "description": "synthetic branch depth 2 node 0",
+      "started_at": "2026-04-24T03:29:27.483748+00:00",
+      "parent_task_id": "test-agent-8c2a5ac8-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:29:49.715848+00:00"
+    },
+    "test-agent-8c2a5ac8-d2-n1": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 88545,
+      "description": "synthetic branch depth 2 node 1",
+      "started_at": "2026-04-24T03:29:27.490667+00:00",
+      "parent_task_id": "test-agent-8c2a5ac8-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:29:50.725385+00:00"
+    },
+    "test-agent-8c2a5ac8-d2-n2": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 88546,
+      "description": "synthetic branch depth 2 node 2",
+      "started_at": "2026-04-24T03:29:27.496729+00:00",
+      "parent_task_id": "test-agent-8c2a5ac8-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:29:51.745100+00:00"
+    },
+    "test-agent-8c2a5ac8-d2-n3": {
+      "agent_type": "test_agent",
+      "status": "completed",
+      "pid": 88547,
+      "description": "synthetic branch depth 2 node 3",
+      "started_at": "2026-04-24T03:29:27.502406+00:00",
+      "parent_task_id": "test-agent-8c2a5ac8-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:29:49.709612+00:00"
+    },
+    "test-agent-932660b3-d0-n0": {
+      "agent_type": "test_agent",
+      "status": "killed",
+      "pid": 89053,
+      "description": "synthetic branch depth 0 node 0",
+      "started_at": "2026-04-24T03:30:38.154188+00:00",
+      "parent_task_id": "mr1",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:30:41.448695+00:00"
+    },
+    "test-agent-932660b3-d1-n0": {
+      "agent_type": "test_agent",
+      "status": "killed",
+      "pid": 89054,
+      "description": "synthetic branch depth 1 node 0",
+      "started_at": "2026-04-24T03:30:38.163862+00:00",
+      "parent_task_id": "test-agent-932660b3-d0-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:30:41.454296+00:00"
+    },
+    "test-agent-932660b3-d1-n1": {
+      "agent_type": "test_agent",
+      "status": "killed",
+      "pid": 89055,
+      "description": "synthetic branch depth 1 node 1",
+      "started_at": "2026-04-24T03:30:38.170037+00:00",
+      "parent_task_id": "test-agent-932660b3-d0-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:30:41.460494+00:00"
+    },
+    "test-agent-932660b3-d2-n0": {
+      "agent_type": "test_agent",
+      "status": "killed",
+      "pid": 89056,
+      "description": "synthetic branch depth 2 node 0",
+      "started_at": "2026-04-24T03:30:38.175297+00:00",
+      "parent_task_id": "test-agent-932660b3-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:30:41.464989+00:00"
+    },
+    "test-agent-932660b3-d2-n1": {
+      "agent_type": "test_agent",
+      "status": "killed",
+      "pid": 89057,
+      "description": "synthetic branch depth 2 node 1",
+      "started_at": "2026-04-24T03:30:38.182329+00:00",
+      "parent_task_id": "test-agent-932660b3-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:30:41.468153+00:00"
+    },
+    "test-agent-932660b3-d2-n2": {
+      "agent_type": "test_agent",
+      "status": "killed",
+      "pid": 89058,
+      "description": "synthetic branch depth 2 node 2",
+      "started_at": "2026-04-24T03:30:38.189466+00:00",
+      "parent_task_id": "test-agent-932660b3-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:30:41.471150+00:00"
+    },
+    "test-agent-932660b3-d2-n3": {
+      "agent_type": "test_agent",
+      "status": "killed",
+      "pid": 89059,
+      "description": "synthetic branch depth 2 node 3",
+      "started_at": "2026-04-24T03:30:38.195065+00:00",
+      "parent_task_id": "test-agent-932660b3-d1-n0",
+      "lane": "conversation",
+      "finished_at": "2026-04-24T03:30:41.473807+00:00"
     }
   },
   "decisions": [
@@ -494,6 +785,60 @@
       "timestamp": "2026-04-20T16:57:26.132047+00:00",
       "input_summary": "/test spawn agents 2",
       "action": "spawn_test_agents_h2",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:24:05.103618+00:00",
+      "input_summary": "/kill all",
+      "action": "direct_answer",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:24:19.451081+00:00",
+      "input_summary": "/agents",
+      "action": "direct_answer",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:25:00.783282+00:00",
+      "input_summary": "/test spawn agents 3",
+      "action": "spawn_test_agents_h3",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:28:25.682280+00:00",
+      "input_summary": "hello are u currently available",
+      "action": "direct_answer",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:29:23.382081+00:00",
+      "input_summary": "\u001b[A\u001b[A\u001b[B\u001b[B",
+      "action": "direct_answer",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:29:27.505570+00:00",
+      "input_summary": "/test spawn agents 2",
+      "action": "spawn_test_agents_h2",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:30:38.200140+00:00",
+      "input_summary": "/test spawn agents 2",
+      "action": "spawn_test_agents_h2",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T03:30:41.476194+00:00",
+      "input_summary": "/test kill agents",
+      "action": "kill_test_agents",
+      "task_id": null
+    },
+    {
+      "timestamp": "2026-04-24T04:27:32.174207+00:00",
+      "input_summary": "/watchers",
+      "action": "direct_answer",
       "task_id": null
     }
   ],
@@ -806,6 +1151,86 @@
       "timestamp": "2026-04-20T16:53:42.888822+00:00",
       "role": "mr1",
       "text": "Unknown command: /spawn",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:24:02.949657+00:00",
+      "role": "user",
+      "text": "/kill all",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:24:05.104243+00:00",
+      "role": "mr1",
+      "text": "Unknown command: /kill",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:24:18.419287+00:00",
+      "role": "user",
+      "text": "/agents",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:24:19.452097+00:00",
+      "role": "mr1",
+      "text": "/agents isn't available in this environment.",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:28:23.144074+00:00",
+      "role": "user",
+      "text": "hello are u currently available",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:28:25.683800+00:00",
+      "role": "mr1",
+      "text": "[MR1 ERROR] You've hit your limit \u00b7 resets 1:50am (America/New_York)",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:29:20.478139+00:00",
+      "role": "user",
+      "text": "\u001b[A\u001b[A\u001b[B\u001b[B",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T03:29:23.383566+00:00",
+      "role": "mr1",
+      "text": "[MR1 ERROR] You've hit your limit \u00b7 resets 1:50am (America/New_York)",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T04:27:30.489924+00:00",
+      "role": "user",
+      "text": "/watchers",
+      "kind": "message",
+      "task_id": null,
+      "lane": "conversation"
+    },
+    {
+      "timestamp": "2026-04-24T04:27:32.175856+00:00",
+      "role": "mr1",
+      "text": "Unknown command: /watchers",
       "kind": "message",
       "task_id": null,
       "lane": "conversation"

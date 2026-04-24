@@ -134,6 +134,13 @@ class Task:
     task_kind: str                  # "agent" | "command" | "watcher" | "manual"
     agent_type: Optional[str]       # "kazi" | "mrn" | None
     prompt: str
+    watcher_type: Optional[str] = None
+    watch_config: dict[str, Any] = field(default_factory=dict)
+    watch_started_at: Optional[str] = None
+    watch_satisfied_at: Optional[str] = None
+    last_checked_at: Optional[str] = None
+    last_check_result: Optional[dict[str, Any]] = None
+    condition: Optional[dict[str, Any]] = None
     depends_on: list[str] = field(default_factory=list)
     status: TaskStatus = TaskStatus.CREATED
     created_by: Optional[Provenance] = None
@@ -171,6 +178,15 @@ class Task:
             task_kind=data["task_kind"],
             agent_type=data.get("agent_type"),
             prompt=data.get("prompt", ""),
+            watcher_type=data.get("watcher_type"),
+            watch_config=dict(data.get("watch_config", {})),
+            watch_started_at=data.get("watch_started_at"),
+            watch_satisfied_at=data.get("watch_satisfied_at"),
+            last_checked_at=data.get("last_checked_at"),
+            last_check_result=dict(data["last_check_result"])
+            if data.get("last_check_result") is not None else None,
+            condition=dict(data["condition"])
+            if data.get("condition") is not None else None,
             depends_on=list(data.get("depends_on", [])),
             status=TaskStatus(data.get("status", "created")),
             created_by=(

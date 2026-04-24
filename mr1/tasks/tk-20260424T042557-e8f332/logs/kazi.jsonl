@@ -1,0 +1,2 @@
+{"timestamp":"2026-04-24T04:25:58.059834+00:00","task_id":"tk-20260424T042557-e8f332","agent_type":"kazi","action":"spawn","result":"ok","metadata":{"pid":14342,"cmd":["claude","-p","Wait for file","--model","haiku","--allowedTools","Read,Write,Edit,Glob,Grep","--output-format","json","--bare","--dangerously-skip-permissions"]}}
+{"timestamp":"2026-04-24T04:25:59.069973+00:00","task_id":"tk-20260424T042557-e8f332","agent_type":"kazi","action":"exit","result":"error","metadata":{"pid":14342,"returncode":1}}

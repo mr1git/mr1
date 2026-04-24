@@ -151,12 +151,16 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/workflows` | List all known workflows |
 | `/workflow <id>` | Show one workflow and its tasks |
 | `/workflow submit <path>` | Load a JSON spec from disk and submit it |
+| `/workflow trigger <id> <label-or-task-id> [event_name]` | Trigger a manual watcher |
 | `/task <id>` | Show one task's detail |
 | `/jobs` | List live workflow tasks |
+| `/watchers` | List active watcher tasks |
 | `/events <workflow_id>` | Show recent workflow events |
 | `/scheduler tick` | Force one deterministic scheduler pass |
 
-Phase 1 only supports DAGs of Kazi agent tasks. A minimal spec looks like:
+Phase 1 started with DAGs of Kazi agent tasks. Phase 2 adds deterministic watcher tasks that gate downstream work without invoking an LLM.
+
+A minimal agent-only spec looks like:
 
 ```json
 {
@@ -184,6 +188,44 @@ python -m mr1.workflow_cli submit path/to/workflow.json
 python -m mr1.workflow_cli workflows
 python -m mr1.workflow_cli workflow <workflow_id>
 ```
+
+Phase 2 watcher tasks use `task_kind: "watcher"` plus a watcher-specific `watcher_type` and `watch_config`:
+
+```json
+{
+  "label": "wait_file",
+  "title": "Wait for file",
+  "task_kind": "watcher",
+  "watcher_type": "file_exists",
+  "watch_config": {
+    "path": "/tmp/some_file.txt"
+  }
+}
+```
+
+Supported watcher types:
+
+| Watcher | Required config | Meaning |
+|---------|------------------|---------|
+| `file_exists` | `path` | Succeeds when the path exists |
+| `time_reached` | `at` | Succeeds when current time reaches the timestamp |
+| `manual_event` | `event` | Succeeds only after an explicit trigger |
+| `condition_script` | `path` | Runs a deterministic script where exit `0/1/other` means `satisfied/not_satisfied/failed` |
+
+Watcher inspection and manual trigger are available both inside MR1 and via the deterministic CLI:
+
+```bash
+python -m mr1.workflow_cli watchers
+python -m mr1.workflow_cli trigger <workflow_id> <label-or-task-id> [event_name]
+```
+
+An example watcher workflow is available at `examples/workflows/watcher_demo.json`. Manual smoke test:
+
+1. Submit the example workflow.
+2. Run `/scheduler tick` until `/watchers` shows `wait_file` as running.
+3. Create the file with `touch /tmp/mr1_watcher_demo.txt`.
+4. Run `/scheduler tick` again.
+5. Confirm the watcher succeeded and the downstream Kazi task unlocked.
 
 ## Running mem_dltr manually
 
