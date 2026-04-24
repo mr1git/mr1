@@ -1,0 +1,672 @@
+"""
+Workflow scheduler — deterministic DAG driver.
+
+The scheduler owns the lifecycle of every task in every workflow it
+discovers under its `WorkflowStore` root. It is intentionally dumb:
+
+  * no LLM reasoning,
+  * no conditional branching (Phase 1),
+  * no retry/backoff policies (Phase 1),
+  * dependency rule is "all parents succeeded",
+  * if a parent reaches a non-succeeded terminal status, all descendants
+    transition to `blocked`.
+
+The scheduler runs inside the MR1 process only (Phase 1). The CLI writes
+a new workflow directory to disk and exits; the MR1-owned scheduler
+discovers it on the next `tick()` and drives it to completion.
+
+Concurrency cap is configurable via `concurrency=` (default 4).
+
+Every state change follows the same atomic shape:
+    store.locked():
+        mutate task/workflow
+        store.save_workflow(wf)
+        event_log.emit(...)
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from mr1 import workflow_events as ev
+from mr1.kazi_runner import (
+    MockRunner,
+    RunHandle,
+    RunResult,
+    RunStatus,
+    Runner,
+)
+from mr1.workflow_events import WorkflowEventLog
+from mr1.workflow_models import (
+    FAILED_TASK_STATUSES,
+    Provenance,
+    Task,
+    TaskStatus,
+    Workflow,
+    WorkflowStatus,
+    new_task_id,
+    new_workflow_id,
+)
+from mr1.workflow_store import WorkflowStore
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+class WorkflowSpecError(ValueError):
+    """Raised for any malformed or unsupported workflow spec."""
+
+
+def validate_spec(spec: dict[str, Any]) -> None:
+    """
+    Validate a user-submitted workflow spec without mutating it.
+
+    Rules (Phase 1):
+      * `tasks` is a non-empty list.
+      * each task has a non-empty `label`.
+      * labels are unique across the workflow.
+      * each task has `task_kind == "agent"` and `agent_type == "kazi"`.
+      * `depends_on` entries must reference labels defined in the same spec.
+      * no cycles (topological sort must succeed).
+    """
+    if not isinstance(spec, dict):
+        raise WorkflowSpecError("workflow spec must be a JSON object")
+
+    tasks = spec.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise WorkflowSpecError("workflow spec must contain a non-empty 'tasks' list")
+
+    labels: list[str] = []
+    label_set: set[str] = set()
+    for idx, raw in enumerate(tasks):
+        if not isinstance(raw, dict):
+            raise WorkflowSpecError(f"task[{idx}] must be a JSON object")
+        label = raw.get("label")
+        if not isinstance(label, str) or not label:
+            raise WorkflowSpecError(f"task[{idx}] missing non-empty 'label'")
+        if label in label_set:
+            raise WorkflowSpecError(f"duplicate label '{label}' in workflow spec")
+        labels.append(label)
+        label_set.add(label)
+
+        task_kind = raw.get("task_kind", "agent")
+        if task_kind != "agent":
+            raise WorkflowSpecError(
+                f"task '{label}': task_kind '{task_kind}' not supported in Phase 1 (only 'agent')"
+            )
+
+        agent_type = raw.get("agent_type", "kazi")
+        if agent_type != "kazi":
+            raise WorkflowSpecError(
+                f"task '{label}': agent_type '{agent_type}' not supported in Phase 1 (only 'kazi')"
+            )
+
+    # depends_on reference check.
+    for raw in tasks:
+        for dep in raw.get("depends_on", []) or []:
+            if dep not in label_set:
+                raise WorkflowSpecError(
+                    f"task '{raw['label']}' depends_on unknown label '{dep}'"
+                )
+
+    # Cycle detection via Kahn's algorithm.
+    indeg = {label: 0 for label in labels}
+    graph: dict[str, list[str]] = {label: [] for label in labels}
+    for raw in tasks:
+        label = raw["label"]
+        for dep in raw.get("depends_on", []) or []:
+            graph[dep].append(label)
+            indeg[label] += 1
+    ready = [label for label, d in indeg.items() if d == 0]
+    visited = 0
+    while ready:
+        node = ready.pop()
+        visited += 1
+        for nxt in graph[node]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                ready.append(nxt)
+    if visited != len(labels):
+        raise WorkflowSpecError("workflow spec contains a dependency cycle")
+
+
+# ---------------------------------------------------------------------------
+# Public: write a workflow to disk without running a scheduler
+# ---------------------------------------------------------------------------
+
+
+def build_workflow_from_spec(
+    spec: dict[str, Any],
+    created_by: Provenance,
+) -> Workflow:
+    """
+    Convert a validated spec into a `Workflow` with generated IDs and
+    resolved dependencies. Does not touch disk.
+    """
+    validate_spec(spec)
+
+    workflow_id = new_workflow_id()
+    title = spec.get("title") or f"workflow {workflow_id}"
+    wf = Workflow(
+        workflow_id=workflow_id,
+        title=title,
+        status=WorkflowStatus.PENDING,
+        created_by=created_by,
+    )
+
+    # First pass: create tasks and the label→id map.
+    raw_tasks = spec["tasks"]
+    label_to_task_id: dict[str, str] = {}
+    task_objs: list[tuple[dict[str, Any], Task]] = []
+    for raw in raw_tasks:
+        tid = new_task_id()
+        label_to_task_id[raw["label"]] = tid
+        task = Task(
+            task_id=tid,
+            workflow_id=workflow_id,
+            label=raw["label"],
+            title=raw.get("title", raw["label"]),
+            task_kind=raw.get("task_kind", "agent"),
+            agent_type=raw.get("agent_type", "kazi"),
+            prompt=raw.get("prompt", ""),
+            status=TaskStatus.CREATED,
+            created_by=created_by,
+            timeout_s=raw.get("timeout_s"),
+        )
+        task_objs.append((raw, task))
+
+    # Second pass: resolve depends_on labels to task IDs.
+    for raw, task in task_objs:
+        task.depends_on = [
+            label_to_task_id[label]
+            for label in (raw.get("depends_on") or [])
+        ]
+        wf.tasks[task.task_id] = task
+
+    wf.label_to_task_id = label_to_task_id
+    return wf
+
+
+def submit_spec_to_disk(
+    spec: dict[str, Any],
+    created_by: Provenance,
+    store: WorkflowStore,
+) -> str:
+    """
+    Persist a submitted workflow so the MR1-owned scheduler will pick
+    it up on its next tick. Returns the new workflow ID.
+
+    Called by both `Scheduler.submit_workflow` (in-process) and the
+    standalone `workflow_cli submit` command.
+    """
+    wf = build_workflow_from_spec(spec, created_by)
+    log = WorkflowEventLog(store, default_agent_id=created_by.id)
+    with store.locked():
+        store.save_workflow(wf)
+        log.workflow_submitted(
+            wf.workflow_id,
+            agent_id=created_by.id,
+            message=f"submitted '{wf.title}' with {len(wf.tasks)} task(s)",
+            metadata={"task_count": len(wf.tasks)},
+        )
+    return wf.workflow_id
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+
+class Scheduler:
+    """
+    DAG driver. One scheduler instance per MR1 process.
+
+    The scheduler is event-driven in spirit (every state transition
+    emits a `WorkflowEvent`), but it physically advances inside `tick()`.
+    A daemon thread calls `tick()` on a configurable interval when
+    `auto_tick=True`.
+    """
+
+    def __init__(
+        self,
+        store: WorkflowStore,
+        runner: Optional[Runner] = None,
+        *,
+        event_log: Optional[WorkflowEventLog] = None,
+        concurrency: int = 4,
+        auto_tick: bool = True,
+        tick_interval_s: float = 1.0,
+        agent_id: str = "scheduler",
+    ):
+        if concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
+        self._store = store
+        self._runner = runner or MockRunner()
+        self._events = event_log or WorkflowEventLog(store, default_agent_id=agent_id)
+        self._concurrency = concurrency
+        self._tick_interval_s = tick_interval_s
+        self._agent_id = agent_id
+
+        self._handles: dict[str, RunHandle] = {}
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        if auto_tick:
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                name="workflow-scheduler",
+                daemon=True,
+            )
+            self._thread.start()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def shutdown(self, cancel_running: bool = False) -> None:
+        """Stop the background thread and optionally cancel live runs."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._tick_interval_s * 3)
+        if cancel_running:
+            for handle in list(self._handles.values()):
+                try:
+                    self._runner.cancel(handle)
+                except Exception:
+                    pass
+            self._handles.clear()
+
+    def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception:
+                # A crashing tick must not kill the daemon thread; the
+                # scheduler is a fail-soft control surface in Phase 1.
+                pass
+            self._stop.wait(self._tick_interval_s)
+
+    # ------------------------------------------------------------------
+    # Submission
+    # ------------------------------------------------------------------
+
+    def submit_workflow(
+        self,
+        spec: dict[str, Any],
+        created_by: Provenance,
+    ) -> str:
+        """
+        Validate a spec, persist the resulting workflow, and emit
+        `workflow_submitted`. Returns the new workflow ID.
+        """
+        return submit_spec_to_disk(spec, created_by, self._store)
+
+    # ------------------------------------------------------------------
+    # Read-through accessors
+    # ------------------------------------------------------------------
+
+    def list_workflows(self) -> list[Workflow]:
+        return self._store.list_workflows()
+
+    def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
+        return self._store.load_workflow(workflow_id)
+
+    def get_task(self, task_id: str) -> Optional[Task]:
+        for wf in self._store.list_workflows():
+            if task_id in wf.tasks:
+                return wf.tasks[task_id]
+        return None
+
+    # ------------------------------------------------------------------
+    # Tick — the deterministic advance
+    # ------------------------------------------------------------------
+
+    def tick(self) -> None:
+        """
+        One deterministic pass over every on-disk workflow.
+
+        Order per workflow:
+          1. Poll running tasks and persist terminal transitions.
+          2. Cascade failures → blocked.
+          3. Promote waiting → ready when all parents succeeded.
+          4. Promote created → waiting/ready on first sight.
+          5. Launch ready tasks up to the concurrency cap.
+          6. Finalise the workflow when every task is terminal.
+        """
+        for wf in self._store.list_workflows():
+            if wf.is_terminal():
+                continue
+            self._tick_workflow(wf)
+
+    def _tick_workflow(self, wf: Workflow) -> None:
+        changed = False
+
+        # 0. Promote created → waiting/ready on first discovery.
+        changed |= self._initialize_created_tasks(wf)
+
+        # 1. Poll running tasks.
+        changed |= self._poll_running_tasks(wf)
+
+        # 2. Cascade failures to dependents.
+        changed |= self._cascade_blocked(wf)
+
+        # 3. Promote waiting → ready.
+        changed |= self._promote_ready(wf)
+
+        # 4. Workflow-level transitions.
+        changed |= self._transition_workflow_status(wf)
+
+        # 5. Launch ready tasks (bounded by concurrency).
+        self._launch_ready(wf)
+
+        # Nothing persists here — every mutation above went through
+        # `_commit()` which holds the store lock.
+
+    # ------------------------------------------------------------------
+    # Individual stages
+    # ------------------------------------------------------------------
+
+    def _initialize_created_tasks(self, wf: Workflow) -> bool:
+        """Move newly-seen `created` tasks to `waiting` or `ready`."""
+        changed = False
+        for task in wf.tasks.values():
+            if task.status is not TaskStatus.CREATED:
+                continue
+            if not task.depends_on:
+                self._commit(wf, task, TaskStatus.READY, event=ev.TASK_READY,
+                             message="no dependencies; ready to run")
+            else:
+                self._commit(wf, task, TaskStatus.WAITING, event=ev.TASK_CREATED,
+                             message=f"waiting on {len(task.depends_on)} dependency(ies)")
+            changed = True
+        return changed
+
+    def _poll_running_tasks(self, wf: Workflow) -> bool:
+        changed = False
+        for task in list(wf.tasks.values()):
+            if task.status is not TaskStatus.RUNNING:
+                continue
+            handle = self._handles.get(task.task_id)
+            if handle is None:
+                # Lost the handle (e.g. scheduler restart mid-run). Mark
+                # the task failed so downstream work doesn't stall.
+                self._commit(
+                    wf, task, TaskStatus.FAILED, event=ev.TASK_FAILED,
+                    message="run handle lost (scheduler restart?)",
+                    finished=True, exit_code=None,
+                    result_summary="run handle lost",
+                )
+                changed = True
+                continue
+            result = self._runner.poll(handle)
+            if result is None:
+                continue
+            changed |= self._finalize_task(wf, task, handle, result)
+        return changed
+
+    def _finalize_task(
+        self,
+        wf: Workflow,
+        task: Task,
+        handle: RunHandle,
+        result: RunResult,
+    ) -> bool:
+        self._handles.pop(task.task_id, None)
+
+        status_map = {
+            RunStatus.SUCCEEDED: (TaskStatus.SUCCEEDED, ev.TASK_SUCCEEDED),
+            RunStatus.FAILED: (TaskStatus.FAILED, ev.TASK_FAILED),
+            RunStatus.TIMED_OUT: (TaskStatus.TIMED_OUT, ev.TASK_TIMED_OUT),
+        }
+        target_status, event_type = status_map.get(
+            result.status, (TaskStatus.FAILED, ev.TASK_FAILED),
+        )
+
+        # Persist result.json.
+        self._store.write_result(
+            wf.workflow_id, task.task_id, result.result_payload or {},
+        )
+
+        self._commit(
+            wf, task, target_status, event=event_type,
+            message=result.error or result.summary or "",
+            finished=True,
+            exit_code=result.exit_code,
+            result_summary=(result.summary or "")[:500] if result.summary else None,
+            log_stdout_path=str(result.stdout_path) if result.stdout_path else None,
+            log_stderr_path=str(result.stderr_path) if result.stderr_path else None,
+            result_path=str(self._store.task_result_path(wf.workflow_id, task.task_id)),
+        )
+        return True
+
+    def _cascade_blocked(self, wf: Workflow) -> bool:
+        changed = False
+        for task in list(wf.tasks.values()):
+            if task.is_terminal() or task.status is TaskStatus.RUNNING:
+                continue
+            failed_parents = [
+                parent_id for parent_id in task.depends_on
+                if (p := wf.tasks.get(parent_id)) is not None
+                and p.status in FAILED_TASK_STATUSES
+            ]
+            if not failed_parents:
+                continue
+            parent_statuses = [
+                f"{wf.tasks[pid].label}={wf.tasks[pid].status.value}"
+                for pid in failed_parents
+            ]
+            self._commit(
+                wf, task, TaskStatus.BLOCKED, event=ev.TASK_BLOCKED,
+                message=f"blocked by {', '.join(parent_statuses)}",
+                finished=True,
+                blocked_by=failed_parents,
+                blocked_reason=", ".join(parent_statuses),
+                blocked_at=_now_iso(),
+            )
+            changed = True
+        return changed
+
+    def _promote_ready(self, wf: Workflow) -> bool:
+        changed = False
+        for task in wf.tasks.values():
+            if task.status is not TaskStatus.WAITING:
+                continue
+            parents_ok = all(
+                (p := wf.tasks.get(pid)) is not None
+                and p.status is TaskStatus.SUCCEEDED
+                for pid in task.depends_on
+            )
+            if parents_ok:
+                self._commit(
+                    wf, task, TaskStatus.READY, event=ev.TASK_READY,
+                    message="all dependencies succeeded",
+                )
+                changed = True
+        return changed
+
+    def _transition_workflow_status(self, wf: Workflow) -> bool:
+        """Flip `pending → running → succeeded/failed` based on tasks."""
+        all_terminal = all(t.is_terminal() for t in wf.tasks.values())
+        any_running_or_live = any(
+            t.status in (TaskStatus.RUNNING, TaskStatus.READY, TaskStatus.WAITING)
+            for t in wf.tasks.values()
+        )
+
+        target: Optional[WorkflowStatus] = None
+        event_type: Optional[str] = None
+        message = ""
+
+        if wf.status is WorkflowStatus.PENDING and any_running_or_live:
+            target = WorkflowStatus.RUNNING
+
+        if all_terminal:
+            any_failed = any(
+                t.status in FAILED_TASK_STATUSES
+                for t in wf.tasks.values()
+            )
+            if any_failed:
+                target = WorkflowStatus.FAILED
+                event_type = ev.WORKFLOW_FAILED
+                message = "one or more tasks did not succeed"
+            else:
+                target = WorkflowStatus.SUCCEEDED
+                event_type = ev.WORKFLOW_SUCCEEDED
+                message = "all tasks succeeded"
+
+        if target is None or target is wf.status:
+            return False
+
+        with self._store.locked():
+            wf.status = target
+            if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
+                wf.finished_at = _now_iso()
+            self._store.save_workflow(wf)
+            if event_type is not None:
+                self._events.emit(
+                    event_type, wf.workflow_id,
+                    agent_id=self._agent_id, message=message,
+                )
+        return True
+
+    def _launch_ready(self, wf: Workflow) -> None:
+        running_now = sum(
+            1 for t in wf.tasks.values() if t.status is TaskStatus.RUNNING
+        )
+        if running_now >= self._concurrency:
+            return
+        slots = self._concurrency - running_now
+        for task in wf.tasks.values():
+            if slots <= 0:
+                break
+            if task.status is not TaskStatus.READY:
+                continue
+            try:
+                handle = self._runner.start(task)
+            except Exception as exc:
+                self._commit(
+                    wf, task, TaskStatus.FAILED, event=ev.TASK_FAILED,
+                    message=f"runner.start failed: {exc}",
+                    finished=True,
+                    exit_code=None,
+                    result_summary=str(exc),
+                )
+                continue
+            self._handles[task.task_id] = handle
+            self._commit(
+                wf, task, TaskStatus.RUNNING, event=ev.TASK_STARTED,
+                message="task started",
+                started=True,
+                pid=handle.pid,
+            )
+            slots -= 1
+
+    # ------------------------------------------------------------------
+    # Atomic commit helper
+    # ------------------------------------------------------------------
+
+    def _commit(
+        self,
+        wf: Workflow,
+        task: Task,
+        new_status: TaskStatus,
+        *,
+        event: str,
+        message: str = "",
+        started: bool = False,
+        finished: bool = False,
+        pid: Optional[int] = None,
+        exit_code: Optional[int] = None,
+        result_summary: Optional[str] = None,
+        log_stdout_path: Optional[str] = None,
+        log_stderr_path: Optional[str] = None,
+        result_path: Optional[str] = None,
+        blocked_by: Optional[list[str]] = None,
+        blocked_reason: Optional[str] = None,
+        blocked_at: Optional[str] = None,
+    ) -> None:
+        """
+        Mutate the task, persist the workflow, and append the event —
+        all under the store lock so the trio is atomic.
+        """
+        with self._store.locked():
+            task.status = new_status
+            if started:
+                task.started_at = _now_iso()
+            if finished:
+                task.finished_at = _now_iso()
+            if pid is not None:
+                task.pid = pid
+            if exit_code is not None:
+                task.exit_code = exit_code
+            if result_summary is not None:
+                task.result_summary = result_summary
+            if log_stdout_path is not None:
+                task.log_stdout_path = log_stdout_path
+            if log_stderr_path is not None:
+                task.log_stderr_path = log_stderr_path
+            if result_path is not None:
+                task.result_path = result_path
+            if blocked_by is not None:
+                task.blocked_by = list(blocked_by)
+            if blocked_reason is not None:
+                task.blocked_reason = blocked_reason
+            if blocked_at is not None:
+                task.blocked_at = blocked_at
+
+            self._store.save_workflow(wf)
+            metadata: dict[str, Any] = {"status": new_status.value}
+            if task.pid is not None:
+                metadata["pid"] = task.pid
+            if blocked_by:
+                metadata["blocked_by"] = blocked_by
+            self._events.emit(
+                event, wf.workflow_id,
+                task_id=task.task_id,
+                agent_id=self._agent_id,
+                message=message,
+                metadata=metadata,
+            )
+
+    # ------------------------------------------------------------------
+    # Cancellation
+    # ------------------------------------------------------------------
+
+    def cancel_workflow(self, workflow_id: str) -> bool:
+        wf = self._store.load_workflow(workflow_id)
+        if wf is None or wf.is_terminal():
+            return False
+        for task in list(wf.tasks.values()):
+            if task.is_terminal():
+                continue
+            handle = self._handles.pop(task.task_id, None)
+            if handle is not None:
+                try:
+                    self._runner.cancel(handle)
+                except Exception:
+                    pass
+            self._commit(
+                wf, task, TaskStatus.CANCELLED, event=ev.TASK_CANCELLED,
+                message="workflow cancelled",
+                finished=True,
+            )
+        # Force workflow to cancelled status.
+        with self._store.locked():
+            wf.status = WorkflowStatus.CANCELLED
+            wf.finished_at = _now_iso()
+            self._store.save_workflow(wf)
+            self._events.emit(
+                ev.WORKFLOW_CANCELLED, wf.workflow_id,
+                agent_id=self._agent_id,
+                message="workflow cancelled",
+            )
+        return True

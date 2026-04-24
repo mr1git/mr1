@@ -42,6 +42,11 @@ sys.path.insert(0, str(_PKG_ROOT.parent))
 
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 from mr1 import kazi, mrn
+from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
+from mr1.scheduler import Scheduler, WorkflowSpecError
+from mr1.workflow_models import Provenance, TaskStatus
+from mr1.workflow_store import WorkflowStore
+from mr1 import workflow_cli
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +596,15 @@ class MR1:
       - State persistence (mr1_state.json)
     """
 
-    def __init__(self, event_sink: Optional[Callable[[dict[str, Any]], None]] = None):
+    def __init__(
+        self,
+        event_sink: Optional[Callable[[dict[str, Any]], None]] = None,
+        *,
+        workflow_store: Optional[WorkflowStore] = None,
+        workflow_runner: Optional[Runner] = None,
+        workflow_concurrency: int = 4,
+        workflow_auto_tick: bool = True,
+    ):
         self._dispatcher = Dispatcher()
         self._logger = Logger()
         self._spawner = Spawner(
@@ -611,6 +624,20 @@ class MR1:
         self._web_viz_server = None
         self._test_agent_lock = threading.Lock()
         self._test_agents: dict[str, TestAgentRecord] = {}
+
+        # Workflow scheduler (Phase 1). Lives inside this MR1 process.
+        self._workflow_store = workflow_store or WorkflowStore()
+        runner = workflow_runner or KaziAsyncRunner(
+            self._workflow_store,
+            dispatcher=self._dispatcher,
+        )
+        self._scheduler = Scheduler(
+            self._workflow_store,
+            runner,
+            concurrency=workflow_concurrency,
+            auto_tick=workflow_auto_tick,
+            agent_id="MR1",
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1279,11 +1306,62 @@ class MR1:
             return self.launch_visualizer()
         if cmd in ("/visualize-web", "/vizualize-web"):
             return self.launch_web_visualizer()
+        if cmd == "/workflows":
+            return workflow_cli._format_workflows_table(
+                self._scheduler.list_workflows()
+            )
+        if cmd.startswith("/workflow "):
+            rest = cmd[len("/workflow "):].strip()
+            if rest.startswith("submit "):
+                path_str = rest[len("submit "):].strip()
+                return self._submit_workflow_from_path(path_str)
+            wf_id = rest
+            wf = self._scheduler.get_workflow(wf_id)
+            if wf is None:
+                return f"workflow not found: {wf_id}"
+            return workflow_cli._format_workflow_detail(wf)
+        if cmd.startswith("/task "):
+            task_id = cmd[len("/task "):].strip()
+            wf, task = workflow_cli._find_workflow_for_task(
+                self._workflow_store, task_id
+            )
+            if wf is None or task is None:
+                return f"task not found: {task_id}"
+            return workflow_cli._format_task_detail(wf, task)
+        if cmd == "/jobs":
+            return workflow_cli._format_jobs(self._scheduler.list_workflows())
+        if cmd.startswith("/events "):
+            wf_id = cmd[len("/events "):].strip()
+            if self._scheduler.get_workflow(wf_id) is None:
+                return f"workflow not found: {wf_id}"
+            events = self._workflow_store.load_events(wf_id, limit=50)
+            return workflow_cli._format_events(events)
+        if cmd == "/scheduler tick":
+            self._scheduler.tick()
+            return "scheduler ticked."
         return None
+
+    def _submit_workflow_from_path(self, path_str: str) -> str:
+        path = Path(path_str)
+        if not path.exists():
+            return f"spec file not found: {path}"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                spec = json.load(f)
+        except json.JSONDecodeError as exc:
+            return f"invalid JSON: {exc}"
+        try:
+            wf_id = self._scheduler.submit_workflow(
+                spec, Provenance(type="agent", id="MR1")
+            )
+        except WorkflowSpecError as exc:
+            return f"invalid workflow: {exc}"
+        return f"submitted: {wf_id}"
 
     def shutdown(self, reason: str = "user") -> int:
         killed = self._spawner.kill_all(reason)
         self.kill_test_agents()
+        self._scheduler.shutdown(cancel_running=True)
         if self._web_viz_server is not None:
             self._web_viz_server.stop()
             self._web_viz_server = None

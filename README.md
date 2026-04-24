@@ -140,6 +140,51 @@ MR1 decides per-turn whether to answer directly, delegate to Kami (complex), or 
 | `/test kill agents` | Kill all synthetic worker processes |
 | `exit`     | Save session state and quit                 |
 
+## Phase 1: Workflows
+
+Phase 1 adds a deterministic workflow scheduler that runs inside the MR1 process. Workflow control does not invoke MR1 reasoning: submission, discovery, scheduling, event logging, and inspection all go through the store, scheduler, and workflow CLI only.
+
+Supported commands in the plain loop, UI bridge, and web UI:
+
+| Command | Effect |
+|---------|--------|
+| `/workflows` | List all known workflows |
+| `/workflow <id>` | Show one workflow and its tasks |
+| `/workflow submit <path>` | Load a JSON spec from disk and submit it |
+| `/task <id>` | Show one task's detail |
+| `/jobs` | List live workflow tasks |
+| `/events <workflow_id>` | Show recent workflow events |
+| `/scheduler tick` | Force one deterministic scheduler pass |
+
+Phase 1 only supports DAGs of Kazi agent tasks. A minimal spec looks like:
+
+```json
+{
+  "title": "Example workflow",
+  "tasks": [
+    {
+      "label": "a",
+      "title": "First task",
+      "prompt": "Inspect the repository state"
+    },
+    {
+      "label": "b",
+      "title": "Second task",
+      "prompt": "Summarize the findings from task a",
+      "depends_on": ["a"]
+    }
+  ]
+}
+```
+
+You can submit the same spec without entering MR1 by using the deterministic CLI:
+
+```bash
+python -m mr1.workflow_cli submit path/to/workflow.json
+python -m mr1.workflow_cli workflows
+python -m mr1.workflow_cli workflow <workflow_id>
+```
+
 ## Running mem_dltr manually
 
 Distils old decisions and completed tasks out of active memory into `memory/dumps/` and the RAG store:

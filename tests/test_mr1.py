@@ -13,6 +13,8 @@ from mr1.mr1 import (
     _load_agent_config,
     _generate_task_id,
 )
+from mr1.kazi_runner import MockRunner
+from mr1.workflow_store import WorkflowStore
 
 
 class TestStateManager:
@@ -212,6 +214,102 @@ class TestBuiltinCommands:
     def test_vizualize_handles_missing_npm(self, mr1_instance):
         result = mr1_instance._handle_builtin("/vizualize")
         assert "legacy loop" in result
+
+
+class TestWorkflowBuiltinCommands:
+    @pytest.fixture
+    def mr1_instance(self, tmp_path):
+        store = WorkflowStore(root=tmp_path / "workflows")
+        instance = MR1(
+            workflow_store=store,
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+        )
+        instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        return instance
+
+    def _write_spec(self, tmp_path: Path) -> Path:
+        path = tmp_path / "workflow.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "title": "Example workflow",
+                    "tasks": [
+                        {
+                            "label": "a",
+                            "title": "Task A",
+                            "prompt": "Do A",
+                        },
+                        {
+                            "label": "b",
+                            "title": "Task B",
+                            "prompt": "Do B",
+                            "depends_on": ["a"],
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_workflow_submit_and_listing_commands(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        assert submit_result is not None
+        assert submit_result.startswith("submitted: wf-")
+
+        workflows_result = mr1_instance._handle_builtin("/workflows")
+        assert workflows_result is not None
+        assert "Example workflow" in workflows_result
+
+    def test_workflow_and_task_detail_commands(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        assert wf is not None
+
+        workflow_result = mr1_instance._handle_builtin(f"/workflow {wf_id}")
+        assert workflow_result is not None
+        assert f"workflow: {wf_id}" in workflow_result
+        assert "tasks:" in workflow_result
+
+        task_id = wf.label_to_task_id["a"]
+        task_result = mr1_instance._handle_builtin(f"/task {task_id}")
+        assert task_result is not None
+        assert f"task:       {task_id}" in task_result
+        assert "label:      a" in task_result
+
+    def test_jobs_events_and_scheduler_tick_commands(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+
+        tick_result = mr1_instance._handle_builtin("/scheduler tick")
+        assert tick_result == "scheduler ticked."
+
+        jobs_result = mr1_instance._handle_builtin("/jobs")
+        assert jobs_result is not None
+        assert "WORKFLOW_ID" in jobs_result
+        assert wf_id in jobs_result
+
+        events_result = mr1_instance._handle_builtin(f"/events {wf_id}")
+        assert events_result is not None
+        assert "workflow_submitted" in events_result
+
+    def test_shutdown_stops_scheduler(self, mr1_instance):
+        mr1_instance._process = MagicMock(spec=MR1Process)
+
+        with patch.object(mr1_instance._spawner, "kill_all", return_value=0):
+            with patch.object(mr1_instance, "kill_test_agents", return_value="No synthetic test agents running."):
+                with patch.object(mr1_instance._scheduler, "shutdown") as mock_shutdown:
+                    mr1_instance.shutdown("test")
+
+        mock_shutdown.assert_called_once_with(cancel_running=True)
 
 
 class TestMR1Process:
