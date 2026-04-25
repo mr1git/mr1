@@ -18,7 +18,6 @@ Three implementations are provided:
 
 from __future__ import annotations
 
-import json
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -27,8 +26,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import yaml
-
+from mr1.agents import (
+    AgentRuntimeError,
+    build_agent_command,
+    is_auth_error_text,
+    load_agent_runtime_config,
+    parse_agent_json_envelope,
+)
 from mr1.core import Dispatcher, PermissionDenied, Logger
 from mr1.workflow_models import Task
 from mr1.workflow_store import WorkflowStore
@@ -53,6 +57,7 @@ class RunResult:
     exit_code: Optional[int] = None
     summary: Optional[str] = None
     error: Optional[str] = None
+    error_type: Optional[str] = None
     stdout_path: Optional[Path] = None
     stderr_path: Optional[Path] = None
     result_payload: dict[str, Any] = field(default_factory=dict)
@@ -88,30 +93,30 @@ class Runner(ABC):
 # ---------------------------------------------------------------------------
 
 
-_PKG_ROOT = Path(__file__).resolve().parent
-_KAZI_CONFIG_PATH = _PKG_ROOT / "agents" / "kazi.yml"
 _DEFAULT_KAZI_TIMEOUT_S = 300
 
 
-def _load_kazi_config() -> dict:
-    with open(_KAZI_CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+def _result_payload_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": parsed["text"],
+        "text": parsed["text"],
+        "data": {
+            "raw": parsed["raw"],
+            "is_error": parsed["is_error"],
+            "metadata": parsed["metadata"],
+        },
+        "metrics": {
+            "usage": parsed["usage"],
+        },
+    }
 
 
-def _parse_claude_json_envelope(raw: str) -> str:
-    """Extract the `result` field from the Claude CLI JSON envelope."""
-    raw = raw.strip()
-    if not raw:
-        return ""
-    try:
-        envelope = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-    if isinstance(envelope, dict) and "result" in envelope:
-        if envelope.get("is_error"):
-            return f"[KAZI ERROR] {envelope['result']}"
-        return envelope["result"]
-    return raw
+def _parse_claude_json_envelope(raw: str) -> dict[str, Any]:
+    return parse_agent_json_envelope(raw)
+
+
+def _classify_envelope_error(parsed: dict[str, Any]) -> str:
+    return "auth_error" if is_auth_error_text(parsed.get("text")) else "cli_error"
 
 
 class KaziAsyncRunner(Runner):
@@ -135,22 +140,18 @@ class KaziAsyncRunner(Runner):
         self._dispatcher = dispatcher or Dispatcher()
         self._logger = logger or Logger()
         self._claude_binary = claude_binary
-        self._config = _load_kazi_config()
+        self._config = load_agent_runtime_config("kazi")
 
     def start(self, task: Task) -> RunHandle:
         prompt = task.prompt or task.title
-        tools = self._config.get("allowed_tools", [])
-        model = self._config.get("model")
-        timeout_s = task.timeout_s or _DEFAULT_KAZI_TIMEOUT_S
-
-        cmd: list[str] = [self._claude_binary, "-p", prompt]
-        if model:
-            cmd.extend(["--model", model])
-        if tools:
-            cmd.extend(["--allowedTools", ",".join(tools)])
-        cmd.extend([
-            "--output-format", "json",
-        ])
+        tools = list(self._config.get("allowed_tools", []))
+        timeout_s = task.timeout_s or self._config.get("timeout_s") or _DEFAULT_KAZI_TIMEOUT_S
+        cmd = build_agent_command(
+            "kazi",
+            prompt,
+            config=self._config,
+            binary_override=self._claude_binary,
+        )
 
         cli_flags = [tok for tok in cmd[1:] if tok.startswith("-")]
         try:
@@ -165,11 +166,28 @@ class KaziAsyncRunner(Runner):
         stdout_fh = open(stdout_path, "wb")
         stderr_fh = open(stderr_path, "wb")
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=stdout_fh,
-            stderr=stderr_fh,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=stdout_fh,
+                stderr=stderr_fh,
+            )
+        except OSError as exc:
+            stdout_fh.close()
+            stderr_fh.close()
+            stderr_path.write_text(str(exc), encoding="utf-8")
+            return RunHandle(
+                task_id=task.task_id,
+                workflow_id=task.workflow_id,
+                pid=None,
+                timeout_s=timeout_s,
+                payload={
+                    "stdout_path": stdout_path,
+                    "stderr_path": stderr_path,
+                    "startup_error": str(exc),
+                    "cmd": cmd,
+                },
+            )
         self._logger.log_spawn(task.task_id, "kazi", proc.pid, cmd)
 
         return RunHandle(
@@ -188,6 +206,15 @@ class KaziAsyncRunner(Runner):
         )
 
     def poll(self, handle: RunHandle) -> Optional[RunResult]:
+        if handle.payload.get("startup_error") is not None:
+            return self._build_result(
+                handle,
+                RunStatus.FAILED,
+                exit_code=None,
+                error=str(handle.payload["startup_error"]),
+                error_type="cli_error",
+            )
+
         proc: subprocess.Popen = handle.payload["process"]
         returncode = proc.poll()
 
@@ -205,29 +232,56 @@ class KaziAsyncRunner(Runner):
                     RunStatus.TIMED_OUT,
                     exit_code=proc.returncode,
                     error=f"exceeded {handle.timeout_s}s timeout",
+                    error_type="timeout",
                 )
             return None
 
         self._close_handles(handle)
         self._logger.log_exit(handle.task_id, "kazi", proc.pid, returncode)
         stdout_text = self._read_log(handle.payload["stdout_path"])
-        summary = _parse_claude_json_envelope(stdout_text)
+        stderr_text = self._read_log(handle.payload["stderr_path"])
+
+        try:
+            parsed = parse_agent_json_envelope(stdout_text)
+        except AgentRuntimeError as exc:
+            return self._build_result(
+                handle,
+                RunStatus.FAILED,
+                exit_code=returncode,
+                error=str(exc),
+                error_type="parse_error",
+            )
+
+        payload = _result_payload_from_parsed(parsed)
+        if parsed["is_error"]:
+            error_type = _classify_envelope_error(parsed)
+            return self._build_result(
+                handle,
+                RunStatus.FAILED,
+                exit_code=returncode,
+                summary=parsed["text"],
+                error=parsed["text"] or "agent returned is_error=true",
+                error_type=error_type,
+                result_payload=payload,
+            )
 
         if returncode == 0:
             return self._build_result(
                 handle,
                 RunStatus.SUCCEEDED,
                 exit_code=0,
-                summary=summary,
+                summary=parsed["text"],
+                result_payload=payload,
             )
 
-        stderr_text = self._read_log(handle.payload["stderr_path"])
         return self._build_result(
             handle,
             RunStatus.FAILED,
             exit_code=returncode,
-            summary=summary,
+            summary=parsed["text"],
             error=f"exit {returncode}: {stderr_text[:300]}",
+            error_type="cli_error",
+            result_payload=payload,
         )
 
     def cancel(self, handle: RunHandle) -> None:
@@ -276,21 +330,26 @@ class KaziAsyncRunner(Runner):
         exit_code: Optional[int] = None,
         summary: Optional[str] = None,
         error: Optional[str] = None,
+        error_type: Optional[str] = None,
+        result_payload: Optional[dict[str, Any]] = None,
     ) -> RunResult:
+        payload = dict(result_payload or {})
+        payload.setdefault("status", status.value)
+        payload.setdefault("exit_code", exit_code)
+        payload.setdefault("summary", summary)
+        payload.setdefault("error", error)
+        payload.setdefault("pid", handle.pid)
+        if error_type is not None:
+            payload["error_type"] = error_type
         return RunResult(
             status=status,
             exit_code=exit_code,
             summary=summary,
             error=error,
+            error_type=error_type,
             stdout_path=handle.payload.get("stdout_path"),
             stderr_path=handle.payload.get("stderr_path"),
-            result_payload={
-                "status": status.value,
-                "exit_code": exit_code,
-                "summary": summary,
-                "error": error,
-                "pid": handle.pid,
-            },
+            result_payload=payload,
         )
 
 
@@ -352,15 +411,16 @@ class KaziBlockingRunner(Runner):
             exit_code=0 if status is RunStatus.SUCCEEDED else 1,
             summary=result.output,
             error=result.error,
+            error_type=getattr(result, "error_type", None),
             stdout_path=stdout_path,
             stderr_path=stderr_path,
-            result_payload={
+            result_payload=dict(getattr(result, "payload", {}) or {
                 "status": status.value,
                 "kazi_status": result.status,
                 "summary": result.output,
                 "error": result.error,
                 "pid": result.pid,
-            },
+            }),
         )
         return RunHandle(
             task_id=task.task_id,
@@ -447,6 +507,7 @@ class MockRunner(Runner):
         *,
         summary: Optional[str] = None,
         error: Optional[str] = None,
+        error_type: Optional[str] = None,
         exit_code: Optional[int] = None,
         result_payload: Optional[dict[str, Any]] = None,
     ) -> None:
@@ -456,9 +517,11 @@ class MockRunner(Runner):
             exit_code=exit_code if exit_code is not None else (0 if status is RunStatus.SUCCEEDED else 1),
             summary=summary,
             error=error,
+            error_type=error_type,
             result_payload=result_payload or {
                 "status": status.value,
                 "summary": summary,
                 "error": error,
+                "error_type": error_type,
             },
         )

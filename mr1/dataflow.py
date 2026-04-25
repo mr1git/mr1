@@ -284,7 +284,7 @@ def build_agent_task_output(task: Any, result_payload: Optional[dict[str, Any]])
         "agent_type": getattr(task, "agent_type", None),
         "exit_code": getattr(task, "exit_code", None),
     }
-    for key in ("error", "kazi_status", "pid"):
+    for key in ("error", "error_type", "kazi_status", "pid"):
         if key in payload:
             metadata[key] = payload.get(key)
     return TaskOutput(

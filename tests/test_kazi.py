@@ -41,7 +41,7 @@ class TestExtractOutput:
 
     def test_json_error(self):
         raw = json.dumps({"result": "oops", "is_error": True})
-        assert "[KAZI ERROR]" in _extract_output(raw)
+        assert _extract_output(raw) == "oops"
 
     def test_plain_text_fallback(self):
         assert _extract_output("just text") == "just text"
@@ -86,12 +86,20 @@ class TestRun:
         assert result.ok is True
         assert result.output == "task done"
         assert result.pid == 200
+        assert result.payload["text"] == "task done"
+        spawned_cmd = mock_popen.call_args[0][0]
+        assert "--output-format" in spawned_cmd
+        assert "--bare" not in spawned_cmd
+        assert "--dangerously-skip-permissions" not in spawned_cmd
 
     @patch("mr1.core.spawner.subprocess.Popen")
     def test_failed_run(self, mock_popen, spawner, tmp_logger):
         mock_proc = MagicMock()
         mock_proc.pid = 201
-        mock_proc.communicate.return_value = (b"", b"something went wrong")
+        mock_proc.communicate.return_value = (
+            json.dumps({"result": "cli failed", "is_error": False}).encode(),
+            b"something went wrong",
+        )
         mock_proc.returncode = 1
         mock_popen.return_value = mock_proc
 
@@ -102,6 +110,44 @@ class TestRun:
         )
         assert result.status == "failed"
         assert result.error is not None
+        assert result.error_type == "cli_error"
+
+    @patch("mr1.core.spawner.subprocess.Popen")
+    def test_auth_error_run(self, mock_popen, spawner, tmp_logger):
+        mock_proc = MagicMock()
+        mock_proc.pid = 202
+        mock_proc.communicate.return_value = (
+            json.dumps({"result": "Not logged in. Run claude login.", "is_error": True}).encode(),
+            b"",
+        )
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        result = run(
+            {"task_id": "t1", "instructions": "fail auth"},
+            spawner=spawner,
+            logger=tmp_logger,
+        )
+
+        assert result.status == "failed"
+        assert result.error_type == "auth_error"
+
+    @patch("mr1.core.spawner.subprocess.Popen")
+    def test_parse_error_run(self, mock_popen, spawner, tmp_logger):
+        mock_proc = MagicMock()
+        mock_proc.pid = 203
+        mock_proc.communicate.return_value = (b"not json", b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        result = run(
+            {"task_id": "t1", "instructions": "bad output"},
+            spawner=spawner,
+            logger=tmp_logger,
+        )
+
+        assert result.status == "failed"
+        assert result.error_type == "parse_error"
 
     def test_denied_by_dispatcher(self, spawner, tmp_logger):
         # Kazi can't use Agent tool — dispatcher should reject.
@@ -111,3 +157,4 @@ class TestRun:
             logger=tmp_logger,
         )
         assert result.status == "denied"
+        assert result.error_type == "cli_error"

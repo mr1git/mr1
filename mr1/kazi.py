@@ -16,22 +16,26 @@ A Kazi receives a context package (dict) and nothing else. It:
 
 The subprocess command is:
   claude -p "{instructions}" --allowedTools "{tools}" \
-         --model {model} --output-format json \
-         --bare --dangerously-skip-permissions
+         --model {model} --output-format json
 
 The dispatcher has already validated that kazi is permitted to use
 these flags before the process is created.
 """
 
-import json
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
 
+from mr1.agents import (
+    AgentRuntimeError,
+    is_auth_error_text,
+    parse_agent_json_envelope,
+    validate_agent_runtime_config,
+)
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 
 
@@ -92,6 +96,8 @@ class KaziResult:
     error: Optional[str]
     duration_s: float
     pid: Optional[int]
+    error_type: Optional[str] = None
+    payload: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +107,8 @@ class KaziResult:
             "error": self.error,
             "duration_s": round(self.duration_s, 2),
             "pid": self.pid,
+            "error_type": self.error_type,
+            "payload": dict(self.payload),
         }
 
     @property
@@ -128,25 +136,28 @@ def _extract_output(raw_stdout: str) -> str:
     """
     Parse the claude CLI JSON output envelope.
 
-    With --output-format json the CLI returns:
-        {"result": "<text>", "is_error": false}
-
-    Falls back to raw text if the envelope isn't present.
+    With --output-format json the CLI returns a JSON envelope.
+    Falls back to raw text only for non-JSON callers and tests.
     """
-    raw_stdout = raw_stdout.strip()
-    if not raw_stdout:
-        return ""
-
     try:
-        envelope = json.loads(raw_stdout)
-        if isinstance(envelope, dict) and "result" in envelope:
-            if envelope.get("is_error"):
-                return f"[KAZI ERROR] {envelope['result']}"
-            return envelope["result"]
-    except json.JSONDecodeError:
-        pass
+        return parse_agent_json_envelope(raw_stdout)["text"]
+    except AgentRuntimeError:
+        return raw_stdout.strip()
 
-    return raw_stdout
+
+def _payload_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": parsed["text"],
+        "text": parsed["text"],
+        "data": {
+            "raw": parsed["raw"],
+            "is_error": parsed["is_error"],
+            "metadata": parsed["metadata"],
+        },
+        "metrics": {
+            "usage": parsed["usage"],
+        },
+    }
 
 
 def _build_prompt(instructions: str, file_paths: list[str]) -> str:
@@ -172,6 +183,7 @@ def _fail(task_id: str, error: str) -> KaziResult:
         error=error,
         duration_s=0.0,
         pid=None,
+        error_type="cli_error",
     )
 
 
@@ -231,10 +243,18 @@ def run(
     # ----- Load agent config -----
 
     config = _load_config()
-    model = config["model"]
+    runtime_config = validate_agent_runtime_config(
+        "kazi",
+        {
+            "model": config.get("model"),
+            "allowed_tools": config.get("allowed_tools"),
+            "timeout_s": config.get("timeout_s"),
+        },
+    )
+    model = runtime_config.get("model")
 
     # If the caller didn't specify tools, use the config defaults.
-    tools = allowed_tools if allowed_tools else config.get("allowed_tools", [])
+    tools = allowed_tools if allowed_tools else runtime_config.get("allowed_tools", [])
 
     # ----- Infrastructure -----
 
@@ -263,8 +283,6 @@ def run(
             tools=tools,
             extra_flags=[
                 "--output-format", "json",
-                "--bare",
-                "--dangerously-skip-permissions",
             ],
             cwd=working_dir,
         )
@@ -298,6 +316,7 @@ def run(
             error=str(e),
             duration_s=elapsed,
             pid=None,
+            error_type="cli_error",
         )
 
     pid = record.pid
@@ -376,6 +395,7 @@ def run(
             error=f"exceeded {job_timeout}s timeout",
             duration_s=elapsed,
             pid=pid,
+            error_type="timeout",
         )
 
     elapsed = time.monotonic() - start
@@ -385,11 +405,114 @@ def run(
     stdout = stdout_raw.decode("utf-8", errors="replace")
     stderr = stderr_raw.decode("utf-8", errors="replace")
     returncode = record.process.returncode
+    parsed: Optional[dict[str, Any]] = None
+    parse_error: Optional[str] = None
+
+    try:
+        parsed = parse_agent_json_envelope(stdout)
+    except AgentRuntimeError as exc:
+        parse_error = str(exc)
 
     # ----- Classify and log result -----
 
+    if parse_error is not None:
+        logger.log(
+            task_id, "kazi", "complete", "error",
+            metadata={
+                "pid": pid,
+                "returncode": returncode,
+                "stderr": stderr[:500],
+                "duration_s": round(elapsed, 2),
+                "error_type": "parse_error",
+            },
+        )
+        _emit_event(
+            event_callback,
+            "task_failed",
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            agent_type="kazi",
+            status="failed",
+            pid=pid,
+            lane=lane,
+            description=description,
+        )
+        _emit_event(
+            event_callback,
+            "task_detached",
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            agent_type="kazi",
+            status="failed",
+            pid=pid,
+            lane=lane,
+            description=description,
+        )
+        return KaziResult(
+            task_id=task_id,
+            status="failed",
+            output="",
+            error=parse_error,
+            duration_s=elapsed,
+            pid=pid,
+            error_type="parse_error",
+        )
+
+    assert parsed is not None
+    payload = _payload_from_parsed(parsed)
+
+    if parsed["is_error"]:
+        error_type = "auth_error" if is_auth_error_text(parsed["text"]) else "cli_error"
+        logger.log(
+            task_id, "kazi", "complete", "error",
+            metadata={
+                "pid": pid,
+                "returncode": returncode,
+                "stderr": stderr[:500],
+                "duration_s": round(elapsed, 2),
+                "error_type": error_type,
+            },
+        )
+        _emit_event(
+            event_callback,
+            "task_failed",
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            agent_type="kazi",
+            status="failed",
+            pid=pid,
+            lane=lane,
+            description=description,
+        )
+        _emit_event(
+            event_callback,
+            "task_detached",
+            task_id=task_id,
+            parent_task_id=parent_task_id,
+            agent_type="kazi",
+            status="failed",
+            pid=pid,
+            lane=lane,
+            description=description,
+        )
+        payload.update({
+            "status": "failed",
+            "error": parsed["text"] or "agent returned is_error=true",
+            "pid": pid,
+            "error_type": error_type,
+        })
+        return KaziResult(
+            task_id=task_id,
+            status="failed",
+            output=parsed["text"],
+            error=parsed["text"] or "agent returned is_error=true",
+            duration_s=elapsed,
+            pid=pid,
+            error_type=error_type,
+            payload=payload,
+        )
+
     if returncode == 0:
-        output = _extract_output(stdout)
         logger.log(
             task_id, "kazi", "complete", "ok",
             metadata={
@@ -423,10 +546,15 @@ def run(
         return KaziResult(
             task_id=task_id,
             status="completed",
-            output=output,
+            output=parsed["text"],
             error=None,
             duration_s=elapsed,
             pid=pid,
+            payload={
+                **payload,
+                "status": "succeeded",
+                "pid": pid,
+            },
         )
 
     # Non-zero exit — check for context window exhaustion.
@@ -438,6 +566,7 @@ def run(
                 "returncode": returncode,
                 "stderr": stderr[:500],
                 "duration_s": round(elapsed, 2),
+                "error_type": "cli_error",
             },
         )
         _emit_event(
@@ -465,10 +594,18 @@ def run(
         return KaziResult(
             task_id=task_id,
             status="context_exceeded",
-            output=_extract_output(stdout),
+            output=parsed["text"],
             error=f"context window exceeded (exit {returncode})",
             duration_s=elapsed,
             pid=pid,
+            error_type="cli_error",
+            payload={
+                **payload,
+                "status": "failed",
+                "error": f"context window exceeded (exit {returncode})",
+                "pid": pid,
+                "error_type": "cli_error",
+            },
         )
 
     # Generic failure.
@@ -479,6 +616,7 @@ def run(
             "returncode": returncode,
             "stderr": stderr[:500],
             "duration_s": round(elapsed, 2),
+            "error_type": "cli_error",
         },
     )
     _emit_event(
@@ -506,8 +644,16 @@ def run(
     return KaziResult(
         task_id=task_id,
         status="failed",
-        output=_extract_output(stdout),
+        output=parsed["text"],
         error=f"exit {returncode}: {stderr[:300]}",
         duration_s=elapsed,
         pid=pid,
+        error_type="cli_error",
+        payload={
+            **payload,
+            "status": "failed",
+            "error": f"exit {returncode}: {stderr[:300]}",
+            "pid": pid,
+            "error_type": "cli_error",
+        },
     )

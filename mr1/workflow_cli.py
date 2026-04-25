@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.agents import AgentRegistry, default_agent_registry, run_agent_health
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.scheduler import (
@@ -418,6 +419,74 @@ def _format_tools(
     return _render_table(rows)
 
 
+def _format_agents(
+    registry: Optional[AgentRegistry] = None,
+    *,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    active_registry = registry or default_agent_registry()
+    descriptions = active_registry.describe_all()
+    if not descriptions:
+        return "No agents registered."
+    view = [_brief_description(item) for item in descriptions] if brief else descriptions
+    if json_output:
+        return json.dumps(view, indent=2, sort_keys=True)
+    if brief:
+        rows = [("AGENT", "DESCRIPTION")]
+        for item in descriptions:
+            rows.append((item["name"], item["description"]))
+        return _render_table(rows)
+    rows = [("AGENT", "DESCRIPTION", "BINARY")]
+    for item in descriptions:
+        rows.append((item["name"], item["description"], str(item.get("runtime", {}).get("binary", "-"))))
+    return _render_table(rows)
+
+
+def _format_agent(
+    agent_name: str,
+    registry: Optional[AgentRegistry] = None,
+    *,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    active_registry = registry or default_agent_registry()
+    description = active_registry.describe_agent(agent_name)
+    view = _brief_description(description) if brief else description
+    if json_output:
+        return json.dumps(view, indent=2, sort_keys=True)
+    if brief:
+        return "\n".join([
+            f"name:        {view['name']}",
+            f"type:        {view['type']}",
+            f"description: {view['description']}",
+        ])
+    return _format_description_text(description)
+
+
+def _format_agent_health(
+    agent_name: str,
+    registry: Optional[AgentRegistry] = None,
+    *,
+    json_output: bool = False,
+) -> str:
+    active_registry = registry or default_agent_registry()
+    active_registry.get_definition(agent_name)
+    result = run_agent_health(agent_name, registry=active_registry)
+    if json_output:
+        return json.dumps(result, indent=2, sort_keys=True)
+    lines = [
+        f"agent:       {agent_name}",
+        f"status:      {result['status']}",
+        "checks:",
+    ]
+    for key, value in result.get("checks", {}).items():
+        lines.append(f"  {key}: {value}")
+    if result.get("error"):
+        lines.append(f"error:       {result['error']}")
+    return "\n".join(lines)
+
+
 def _format_tool(
     tool_type: str,
     registry: Optional[ToolRegistry] = None,
@@ -481,9 +550,16 @@ def _format_description_text(description: dict[str, Any]) -> str:
         json.dumps(description.get("outputs", {}), indent=2, sort_keys=True),
         "config_schema:",
         json.dumps(description.get("config_schema", {}), indent=2, sort_keys=True),
+    ]
+    if "runtime" in description:
+        lines.extend([
+            "runtime:",
+            json.dumps(description.get("runtime", {}), indent=2, sort_keys=True),
+        ])
+    lines.extend([
         "examples:",
         json.dumps(description.get("examples", []), indent=2, sort_keys=True),
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -649,6 +725,15 @@ def _cmd_tools(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
+def _cmd_agents(args: argparse.Namespace, store: WorkflowStore) -> int:
+    del store
+    rc = _reject_invalid_flag_combination(args)
+    if rc is not None:
+        return rc
+    print(_format_agents(json_output=args.json, brief=args.brief))
+    return 0
+
+
 def _cmd_schema(args: argparse.Namespace, store: WorkflowStore) -> int:
     del store
     try:
@@ -677,6 +762,29 @@ def _cmd_tool(args: argparse.Namespace, store: WorkflowStore) -> int:
         ))
     except ValueError:
         print(f"error: tool not found: {args.tool_type}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _cmd_agent(args: argparse.Namespace, store: WorkflowStore) -> int:
+    del store
+    rc = _reject_invalid_flag_combination(args)
+    if rc is not None:
+        return rc
+    try:
+        if args.action == "health":
+            print(_format_agent_health(
+                args.agent_name,
+                json_output=args.json,
+            ))
+        else:
+            print(_format_agent(
+                args.agent_name,
+                json_output=args.json,
+                brief=args.brief,
+            ))
+    except ValueError:
+        print(f"error: agent not found: {args.agent_name}", file=sys.stderr)
         return 2
     return 0
 
@@ -792,6 +900,10 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_tools, include_example=False)
     p_tools.set_defaults(func=_cmd_tools)
 
+    p_agents = subs.add_parser("agents", help="List registered workflow agents.")
+    add_common_flags(p_agents, include_example=False)
+    p_agents.set_defaults(func=_cmd_agents)
+
     p_schema = subs.add_parser("schema", help="Show workflow schema metadata.")
     p_schema.add_argument("section", nargs="?")
     add_common_flags(p_schema, include_example=False)
@@ -801,6 +913,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tool.add_argument("tool_type")
     add_common_flags(p_tool, include_example=True)
     p_tool.set_defaults(func=_cmd_tool)
+
+    p_agent = subs.add_parser("agent", help="Show one agent description or health status.")
+    p_agent.add_argument("agent_name")
+    p_agent.add_argument("action", nargs="?", choices=["health"])
+    add_common_flags(p_agent, include_example=False)
+    p_agent.set_defaults(func=_cmd_agent)
 
     p_result = subs.add_parser("result", help="Show normalized task output.")
     p_result.add_argument("task_id")

@@ -39,7 +39,7 @@ class TestCapabilityRegistry:
 
         assert "shell_command" in names
         assert "manual_event" in names
-        assert "kazi_agent" in names
+        assert "kazi" in names
         assert names == sorted(names)
 
     def test_duplicate_capability_name_rejected(self):
@@ -85,6 +85,7 @@ class TestCapabilityRegistry:
                 assert (
                     key == "result.text"
                     or key.startswith("result.data.")
+                    or key.startswith("result.metrics.")
                     or key.startswith("artifact.")
                 )
 
@@ -123,7 +124,7 @@ class TestCapabilityCli:
         out = capsys.readouterr().out
         assert "shell_command" in out
         assert "manual_event" in out
-        assert "kazi_agent" in out
+        assert "kazi" in out
 
     def test_cli_unknown_tool_error_is_deterministic(self, store, capsys):
         rc = workflow_cli.main(["tool", "missing_tool"], store=store)
@@ -149,7 +150,7 @@ class TestCapabilityBuiltins:
 
         assert "shell_command" in output
         assert "manual_event" in output
-        assert "kazi_agent" in output
+        assert "kazi" in output
 
     def test_mr1_capability_json_builtin(self, tmp_path):
         mr1 = _build_mr1(tmp_path)

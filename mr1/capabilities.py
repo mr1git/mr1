@@ -10,38 +10,9 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Optional
 
+from mr1.agents import AgentRegistry, default_agent_registry
 from mr1.tools import ToolRegistry, default_tool_registry
 from mr1.watchers import WatcherRegistry, default_watcher_registry
-
-
-def _default_agent_capabilities() -> list[dict[str, Any]]:
-    return [
-        {
-            "name": "kazi_agent",
-            "type": "agent",
-            "description": "LLM-based reasoning and generation task.",
-            "inputs": {
-                "prompt": "string",
-                "inputs": "dataflow inputs",
-            },
-            "outputs": {
-                "result.text": "generated output",
-            },
-            "examples": [
-                {
-                    "label": "summarize",
-                    "title": "Summarize",
-                    "task_kind": "agent",
-                    "agent_type": "kazi",
-                    "prompt": "Summarize the provided inputs.",
-                }
-            ],
-            "config_schema": {
-                "prompt": {"type": "string", "required": True},
-                "inputs": {"type": "list[input_ref]", "required": False, "default": []},
-            },
-        }
-    ]
 
 
 class CapabilityRegistry:
@@ -49,16 +20,22 @@ class CapabilityRegistry:
         self,
         tool_registry: Optional[ToolRegistry] = None,
         watcher_registry: Optional[WatcherRegistry] = None,
+        agent_registry: Optional[AgentRegistry] = None,
         agent_capabilities: Optional[list[dict[str, Any]]] = None,
     ):
         self._tool_registry = tool_registry or default_tool_registry()
         self._watcher_registry = watcher_registry or default_watcher_registry()
+        self._agent_registry = agent_registry or default_agent_registry()
         self._capabilities: dict[str, dict[str, Any]] = {}
 
         descriptions = []
         descriptions.extend(self._tool_registry.describe_all_tools())
         descriptions.extend(self._watcher_registry.describe_all_watchers())
-        descriptions.extend(deepcopy(agent_capabilities or _default_agent_capabilities()))
+        descriptions.extend(
+            deepcopy(agent_capabilities)
+            if agent_capabilities is not None else
+            self._agent_registry.describe_all()
+        )
 
         for capability in descriptions:
             self._register(capability)

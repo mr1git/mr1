@@ -87,8 +87,6 @@ agents:
       - "--allowedTools"
       - "--model"
       - "--output-format"
-      - "--bare"
-      - "--dangerously-skip-permissions"
     shell_commands:
       - "ls"
       - "cat"

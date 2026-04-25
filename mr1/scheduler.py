@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.agents import AgentRegistry, default_agent_registry
 from mr1 import workflow_events as ev
 from mr1.dataflow import (
     DataflowError,
@@ -102,6 +103,7 @@ def validate_spec(
     spec: dict[str, Any],
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
+    agent_registry: Optional[AgentRegistry] = None,
 ) -> None:
     """
     Validate a user-submitted workflow spec without mutating it.
@@ -117,6 +119,7 @@ def validate_spec(
     """
     registry = watcher_registry or default_watcher_registry()
     tools = tool_registry or default_tool_registry()
+    agents = agent_registry or default_agent_registry()
     if not isinstance(spec, dict):
         raise WorkflowSpecError("workflow spec must be a JSON object")
 
@@ -140,9 +143,10 @@ def validate_spec(
         task_kind = raw.get("task_kind", "agent")
         if task_kind == "agent":
             agent_type = raw.get("agent_type", "kazi")
-            if agent_type != "kazi":
+            if not agents.is_registered(agent_type):
+                supported_agents = ", ".join(repr(name) for name in agents.list_agents()) or "'kazi'"
                 raise WorkflowSpecError(
-                    f"task '{label}': agent_type '{agent_type}' not supported (only 'kazi')"
+                    f"task '{label}': agent_type '{agent_type}' not supported (only {supported_agents})"
                 )
         elif task_kind == "watcher":
             try:
@@ -240,6 +244,7 @@ def build_workflow_from_spec(
     created_by: Provenance,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
+    agent_registry: Optional[AgentRegistry] = None,
 ) -> Workflow:
     """
     Convert a validated spec into a `Workflow` with generated IDs and
@@ -249,6 +254,7 @@ def build_workflow_from_spec(
         spec,
         watcher_registry=watcher_registry,
         tool_registry=tool_registry,
+        agent_registry=agent_registry,
     )
 
     workflow_id = new_workflow_id()
@@ -310,6 +316,7 @@ def submit_spec_to_disk(
     store: WorkflowStore,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
+    agent_registry: Optional[AgentRegistry] = None,
 ) -> str:
     """
     Persist a submitted workflow so the MR1-owned scheduler will pick
@@ -323,6 +330,7 @@ def submit_spec_to_disk(
         created_by,
         watcher_registry=watcher_registry,
         tool_registry=tool_registry,
+        agent_registry=agent_registry,
     )
     log = WorkflowEventLog(store, default_agent_id=created_by.id)
     with store.locked():
@@ -904,6 +912,7 @@ class Scheduler:
                 exit_code=result.exit_code if result.exit_code is not None else 1,
                 summary=result.summary,
                 error=str(exc),
+                error_type=result.error_type,
                 stdout_path=result.stdout_path,
                 stderr_path=result.stderr_path,
                 result_payload=result.result_payload,

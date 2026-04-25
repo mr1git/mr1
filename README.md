@@ -158,6 +158,8 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/artifacts <workflow_id>` | List registered artifacts for a workflow |
 | `/jobs` | List live workflow tasks |
 | `/watchers` | List active watcher tasks |
+| `/agents` | List registered workflow agents |
+| `/agent <name>` | Show one agent runtime profile |
 | `/capabilities` | List all registered capabilities across tools, watchers, and agents |
 | `/capability <name>` | Show one capability contract |
 | `/schema [section]` | Show workflow schema metadata (`workflow`, `task`, `inputs`, `refs`, `task-kinds`) |
@@ -201,6 +203,9 @@ python -m mr1.workflow_cli schema
 python -m mr1.workflow_cli schema inputs --json
 python -m mr1.workflow_cli tools
 python -m mr1.workflow_cli tool shell_command --example
+python -m mr1.workflow_cli agents
+python -m mr1.workflow_cli agent kazi
+python -m mr1.workflow_cli agent kazi health
 python -m mr1.workflow_cli result <task_id>
 python -m mr1.workflow_cli inputs <task_id>
 python -m mr1.workflow_cli artifacts <workflow_id>
@@ -372,6 +377,38 @@ The distinction matters during workflow authoring:
 - `capabilities` = what MR1 can do
 - `workflow schema` = how to express workflows
 
+## Agent Runtime
+
+Agent profiles describe the runtime contract for an agent: config schema, CLI binary, invocation shape, supported JSON output, and example workflow usage.
+
+Agent runs are actual executions of that profile. They are runtime-managed workers with validated config, controlled invocation, health checks, structured output parsing, and classified failures.
+
+The distinction from the other capability types is:
+
+- tools are deterministic functions
+- watchers are event gates
+- agents are runtime workers
+
+You can inspect the registered agent profiles directly:
+
+```text
+/agents
+/agent kazi
+/agent kazi --json
+/agent kazi health
+```
+
+And through the deterministic CLI:
+
+```bash
+python -m mr1.workflow_cli agents
+python -m mr1.workflow_cli agent kazi
+python -m mr1.workflow_cli agent kazi --json
+python -m mr1.workflow_cli agent kazi health
+```
+
+`/agent kazi health` validates the binary path, version response, runtime config, dispatcher-approved flags, non-interactive prompt execution, auth state, and JSON envelope parsing.
+
 Tool tasks write the same normalized `output.json` schema as agent and watcher tasks, so downstream references work without new syntax:
 
 ```text
@@ -391,6 +428,9 @@ You can inspect those contracts directly:
 /schema inputs --json
 /tools
 /tool shell_command --example
+/agents
+/agent kazi
+/agent kazi health
 ```
 
 Example tool to agent handoff:
