@@ -7,6 +7,8 @@ from unittest.mock import patch, MagicMock, PropertyMock
 
 import pytest
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.kazi_runner import RunStatus
+from mr1.workflow_models import TaskStatus
 from mr1.mr1 import (
     MR1,
     MR1Process,
@@ -375,6 +377,46 @@ class TestWorkflowBuiltinCommands:
 
         artifacts_output = mr1_instance._handle_builtin(f"/artifacts {wf_id}")
         assert "report" in artifacts_output
+
+    def test_workflow_replace_flag_controls_autorun(self, mr1_instance, tmp_path):
+        replace_path = tmp_path / "replace.json"
+        replace_path.write_text(json.dumps({
+            "tasks": [{
+                "label": "a",
+                "title": "A2",
+                "task_kind": "agent",
+                "agent_type": "kazi",
+                "prompt": "replacement",
+            }]
+        }), encoding="utf-8")
+
+        path = self._write_spec(tmp_path)
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+        mr1_instance._handle_builtin("/scheduler tick")
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        a_id = wf.label_to_task_id["a"]
+        mr1_instance._scheduler._runner.complete(a_id, RunStatus.FAILED, error="boom")
+        mr1_instance._handle_builtin("/scheduler tick")
+
+        result = mr1_instance._handle_builtin(f"/workflow replace {wf_id} a {replace_path}")
+        assert result == f"workflow updated: {wf_id}"
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        assert wf.task_by_label("a").status is TaskStatus.READY
+
+        path2 = self._write_spec(tmp_path)
+        submit_result2 = mr1_instance._handle_builtin(f"/workflow submit {path2}")
+        wf_id2 = submit_result2.split(": ", 1)[1]
+        mr1_instance._handle_builtin("/scheduler tick")
+        wf2 = mr1_instance._workflow_store.load_workflow(wf_id2)
+        a_id2 = wf2.label_to_task_id["a"]
+        mr1_instance._scheduler._runner.complete(a_id2, RunStatus.FAILED, error="boom")
+        mr1_instance._handle_builtin("/scheduler tick")
+
+        result = mr1_instance._handle_builtin(f"/workflow replace -r {wf_id2} a {replace_path}")
+        assert result == f"workflow updated and rerun: {wf_id2}"
+        wf = mr1_instance._workflow_store.load_workflow(wf_id2)
+        assert wf.task_by_label("a").status is TaskStatus.RUNNING
 
     def test_shutdown_stops_scheduler(self, mr1_instance):
         mr1_instance._process = MagicMock(spec=MR1Process)

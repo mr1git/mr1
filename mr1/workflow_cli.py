@@ -765,6 +765,14 @@ def _cmd_replace_workflow(args: argparse.Namespace, store: WorkflowStore) -> int
     except WorkflowSpecError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if args.rerun:
+        from mr1.scheduler import Scheduler
+
+        scheduler = Scheduler(store, auto_tick=False, agent_id="cli")
+        try:
+            scheduler.tick()
+        finally:
+            scheduler.shutdown()
     print(workflow_id)
     return 0
 
@@ -1098,6 +1106,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_insert_workflow.set_defaults(func=_cmd_insert_workflow)
 
     p_replace_workflow = subs.add_parser("replace-workflow", help="Replace one task in a workflow.")
+    p_replace_workflow.add_argument("-r", "--rerun", action="store_true")
     p_replace_workflow.add_argument("workflow_id")
     p_replace_workflow.add_argument("task_label_or_id")
     p_replace_workflow.add_argument("path")

@@ -138,7 +138,7 @@ class TestWorkflowMutation:
         assert task.prompt == "new"
         assert task.attempt_count == 1
         assert len(task.attempts) == 1
-        assert task.status is TaskStatus.CREATED
+        assert task.status is TaskStatus.READY
 
     def test_replace_rejects_succeeded_task(self, scheduler, store, runner):
         spec = {

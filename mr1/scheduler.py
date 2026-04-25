@@ -502,6 +502,15 @@ def _reopen_workflow(workflow: Workflow) -> None:
         workflow.status = WorkflowStatus.PENDING
 
 
+def _status_for_dependencies(workflow: Workflow, task: Task) -> TaskStatus:
+    parents_ok = all(
+        (parent := workflow.tasks.get(parent_id)) is not None
+        and parent.status is TaskStatus.SUCCEEDED
+        for parent_id in task.depends_on
+    )
+    return TaskStatus.READY if parents_ok else TaskStatus.WAITING
+
+
 def _attempt_result_payload(
     task: Task,
     *,
@@ -991,7 +1000,7 @@ def replace_workflow_on_disk(
             workflow.label_to_task_id[label]
             for label in (raw.get("depends_on") or [])
         ]
-        task.status = TaskStatus.CREATED
+        task.status = _status_for_dependencies(workflow, task)
         task.started_at = None
         task.finished_at = None
         task.pid = None
@@ -1022,6 +1031,7 @@ def replace_workflow_on_disk(
             metadata={
                 "operation": "replace",
                 "task_ids": [task.task_id],
+                "status": task.status.value,
             },
         )
     return workflow.workflow_id

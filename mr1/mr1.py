@@ -1614,9 +1614,16 @@ class MR1:
                 self._scheduler.tick()
                 return f"workflow updated: {workflow_id}"
             if rest.startswith("replace "):
-                parts = rest.split(maxsplit=3)
+                try:
+                    parts = shlex.split(rest)
+                except ValueError:
+                    return "Usage: /workflow replace [-r] <workflow_id> <task> <path>"
+                rerun_after_replace = False
+                if len(parts) > 1 and parts[1] == "-r":
+                    rerun_after_replace = True
+                    parts = [parts[0], *parts[2:]]
                 if len(parts) != 4:
-                    return "Usage: /workflow replace <workflow_id> <task> <path>"
+                    return "Usage: /workflow replace [-r] <workflow_id> <task> <path>"
                 spec, error = workflow_cli._load_json_file(parts[3])
                 if error:
                     return error
@@ -1624,7 +1631,9 @@ class MR1:
                     workflow_id = self._scheduler.replace_workflow(parts[1], parts[2], spec)
                 except WorkflowSpecError as exc:
                     return str(exc)
-                self._scheduler.tick()
+                if rerun_after_replace:
+                    self._scheduler.tick()
+                    return f"workflow updated and rerun: {workflow_id}"
                 return f"workflow updated: {workflow_id}"
             if rest.startswith("trigger "):
                 parts = rest.split(maxsplit=3)

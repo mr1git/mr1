@@ -155,7 +155,7 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/workflow cancel <id>` | Cancel one workflow |
 | `/workflow append <id> <path>` | Append task(s) from a JSON fragment |
 | `/workflow insert <id> <after_task> <path>` | Insert one task after an existing task |
-| `/workflow replace <id> <task> <path>` | Replace one unstarted or failed task |
+| `/workflow replace [-r] <id> <task> <path>` | Replace one unstarted or failed task, optionally rerunning immediately |
 | `/workflow trigger <id> <label-or-task-id> [event_name]` | Trigger a manual watcher |
 | `/task cancel <task_id>` | Cancel one task |
 | `/task <id>` | Show one task's detail |
@@ -206,7 +206,7 @@ python -m mr1.workflow_cli cancel-task <task_id>
 python -m mr1.workflow_cli cancel-workflow <workflow_id>
 python -m mr1.workflow_cli append-workflow <workflow_id> path/to/fragment.json
 python -m mr1.workflow_cli insert-workflow <workflow_id> <after_task> path/to/task.json
-python -m mr1.workflow_cli replace-workflow <workflow_id> <task_label_or_id> path/to/task.json
+python -m mr1.workflow_cli replace-workflow [-r] <workflow_id> <task_label_or_id> path/to/task.json
 python -m mr1.workflow_cli workflows
 python -m mr1.workflow_cli workflow <workflow_id>
 python -m mr1.workflow_cli capabilities
@@ -253,6 +253,7 @@ Workflow mutation semantics:
 - `append` adds new task nodes without changing existing task definitions.
 - `insert` adds one task after an existing task and rewires that task's direct children through the inserted node.
 - `replace` keeps the same `task_id` and label, but swaps the task definition for an unstarted task or a failed/timed-out/cancelled task.
+- plain `replace` stops with the replaced task in `ready` or `waiting`; `replace -r` immediately ticks once so execution resumes.
 
 Output semantics:
 

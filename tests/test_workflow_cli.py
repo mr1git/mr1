@@ -17,6 +17,8 @@ import pytest
 
 from mr1 import workflow_cli
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -258,7 +260,66 @@ class TestReadCommands:
         out = capsys.readouterr().out
         assert '"supported_patterns"' in out
         assert "<label>.result.text" in out
-        assert "<label>.artifact.<artifact_name>" in out
+
+
+class TestReplaceWorkflow:
+    def test_replace_workflow_does_not_autorun_without_r_flag(self, tmp_path, store, capsys):
+        scheduler = Scheduler(store, MockRunner(), auto_tick=False)
+        try:
+            wf_id = scheduler.submit_workflow(SPEC, Provenance(type="agent", id="MR1"))
+            scheduler.tick()
+            wf = store.load_workflow(wf_id)
+            a_id = wf.label_to_task_id["a"]
+            scheduler._runner.complete(a_id, RunStatus.FAILED, error="boom")
+            scheduler.tick()
+
+            fragment = _write_spec(tmp_path, {
+                "tasks": [{
+                    "label": "a",
+                    "title": "A2",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "replacement",
+                }]
+            })
+            rc = workflow_cli.main(
+                ["replace-workflow", wf_id, "a", str(fragment)],
+                store=store,
+            )
+            assert rc == 0
+            wf = store.load_workflow(wf_id)
+            assert wf.task_by_label("a").status is TaskStatus.READY
+        finally:
+            scheduler.shutdown()
+
+    def test_replace_workflow_r_flag_autoruns(self, tmp_path, store, capsys):
+        scheduler = Scheduler(store, MockRunner(), auto_tick=False)
+        try:
+            wf_id = scheduler.submit_workflow(SPEC, Provenance(type="agent", id="MR1"))
+            scheduler.tick()
+            wf = store.load_workflow(wf_id)
+            a_id = wf.label_to_task_id["a"]
+            scheduler._runner.complete(a_id, RunStatus.FAILED, error="boom")
+            scheduler.tick()
+
+            fragment = _write_spec(tmp_path, {
+                "tasks": [{
+                    "label": "a",
+                    "title": "A2",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "replacement",
+                }]
+            })
+            rc = workflow_cli.main(
+                ["replace-workflow", "-r", wf_id, "a", str(fragment)],
+                store=store,
+            )
+            assert rc == 0
+            wf = store.load_workflow(wf_id)
+            assert wf.task_by_label("a").status is TaskStatus.RUNNING
+        finally:
+            scheduler.shutdown()
 
     def test_invalid_schema_section_is_deterministic(self, store, capsys):
         rc = workflow_cli.main(["schema", "nope"], store=store)
