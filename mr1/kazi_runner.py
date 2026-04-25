@@ -160,9 +160,16 @@ class KaziAsyncRunner(Runner):
             self._logger.log_denied(task.task_id, "kazi", str(e))
             raise
 
-        stdout_path, stderr_path = self._store.task_log_paths(
-            task.workflow_id, task.task_id,
-        )
+        if task.current_attempt > 0:
+            stdout_path, stderr_path = self._store.task_attempt_log_paths(
+                task.workflow_id,
+                task.task_id,
+                task.current_attempt,
+            )
+        else:
+            stdout_path, stderr_path = self._store.task_log_paths(
+                task.workflow_id, task.task_id,
+            )
         stdout_fh = open(stdout_path, "wb")
         stderr_fh = open(stderr_path, "wb")
 
@@ -383,9 +390,16 @@ class KaziBlockingRunner(Runner):
         self._kazi_run = kazi_run
 
     def start(self, task: Task) -> RunHandle:
-        stdout_path, stderr_path = self._store.task_log_paths(
-            task.workflow_id, task.task_id,
-        )
+        if task.current_attempt > 0:
+            stdout_path, stderr_path = self._store.task_attempt_log_paths(
+                task.workflow_id,
+                task.task_id,
+                task.current_attempt,
+            )
+        else:
+            stdout_path, stderr_path = self._store.task_log_paths(
+                task.workflow_id, task.task_id,
+            )
         context = {
             "task_id": task.task_id,
             "instructions": task.prompt or task.title,

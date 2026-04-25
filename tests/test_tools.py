@@ -98,9 +98,8 @@ class TestToolValidation:
         task = _task_by_label(wf, "read_notes")
         assert task.status is TaskStatus.FAILED
         output = store.load_task_output(wf_id, task.task_id)
-        assert output is not None
-        assert output.status == "failed"
-        assert "does not exist" in output.metadata["error"]
+        assert output is None
+        assert "does not exist" in (task.tool_error or "")
 
 
 class TestReadWriteTools:
@@ -259,7 +258,7 @@ class TestShellCommandTool:
         names = {artifact.name for artifact in task.artifacts}
         assert "stdout" in names or "stderr" in names
 
-    def test_shell_command_nonzero_preserves_output_json(self, scheduler, store):
+    def test_shell_command_nonzero_does_not_publish_output_json(self, scheduler, store):
         wf_id = scheduler.submit_workflow(
             _tool_workflow({
                 "label": "bad_cmd",
@@ -281,11 +280,11 @@ class TestShellCommandTool:
         task = _task_by_label(wf, "bad_cmd")
         output = store.load_task_output(wf_id, task.task_id)
         assert task.status is TaskStatus.FAILED
-        assert output is not None
-        assert output.status == "failed"
-        assert output.data["exit_code"] == 5
-        assert "bad" in output.data["stdout"]
-        assert "err" in output.data["stderr"]
+        assert output is None
+        assert task.result_path is not None
+        payload = store.read_result(wf_id, task.task_id)
+        assert payload["status"] == "failed"
+        assert payload["error_type"] == "unknown"
 
     def test_shell_command_timeout(self, scheduler, store):
         wf_id = scheduler.submit_workflow(
@@ -310,10 +309,10 @@ class TestShellCommandTool:
         task = _task_by_label(wf, "slow_cmd")
         output = store.load_task_output(wf_id, task.task_id)
         assert task.status is TaskStatus.TIMED_OUT
-        assert output is not None
-        assert output.status == "timed_out"
-        assert "slow" in output.data["stdout"]
-        assert "wait" in output.data["stderr"]
+        assert output is None
+        payload = store.read_result(wf_id, task.task_id)
+        assert payload["status"] == "timed_out"
+        assert payload["error_type"] == "timeout"
 
     def test_shell_command_truncation_and_artifacts(self, scheduler, store):
         wf_id = scheduler.submit_workflow(

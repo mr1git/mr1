@@ -20,6 +20,7 @@ WORKFLOW_SUBMITTED = "workflow_submitted"
 WORKFLOW_SUCCEEDED = "workflow_succeeded"
 WORKFLOW_FAILED = "workflow_failed"
 WORKFLOW_CANCELLED = "workflow_cancelled"
+WORKFLOW_UPDATED = "workflow_updated"
 
 TASK_CREATED = "task_created"
 TASK_READY = "task_ready"
@@ -30,6 +31,9 @@ TASK_TIMED_OUT = "task_timed_out"
 TASK_CANCELLED = "task_cancelled"
 TASK_BLOCKED = "task_blocked"
 TASK_UNBLOCKED = "task_unblocked"
+TASK_RERUN = "task_rerun"
+TASK_ATTEMPT_STARTED = "task_attempt_started"
+TASK_ATTEMPT_FINISHED = "task_attempt_finished"
 
 WATCHER_STARTED = "watcher_started"
 WATCHER_CHECKED = "watcher_checked"
@@ -66,17 +70,22 @@ class WorkflowEventLog:
         workflow_id: str,
         *,
         task_id: Optional[str] = None,
+        attempt_id: Optional[int] = None,
         agent_id: Optional[str] = None,
         message: str = "",
         metadata: Optional[dict[str, Any]] = None,
     ) -> WorkflowEvent:
+        event_metadata = dict(metadata or {})
+        if attempt_id is not None:
+            event_metadata.setdefault("attempt_id", attempt_id)
         event = WorkflowEvent.new(
             event_type=event_type,
             workflow_id=workflow_id,
             task_id=task_id,
+            attempt_id=attempt_id,
             agent_id=agent_id or self._default_agent_id,
             message=message,
-            metadata=metadata,
+            metadata=event_metadata,
         )
         self._store.append_event(event)
         return event
@@ -93,6 +102,12 @@ class WorkflowEventLog:
 
     def workflow_failed(self, workflow_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(WORKFLOW_FAILED, workflow_id, **kw)
+
+    def workflow_cancelled(self, workflow_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(WORKFLOW_CANCELLED, workflow_id, **kw)
+
+    def workflow_updated(self, workflow_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(WORKFLOW_UPDATED, workflow_id, **kw)
 
     def task_created(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(TASK_CREATED, workflow_id, task_id=task_id, **kw)
@@ -120,6 +135,15 @@ class WorkflowEventLog:
 
     def task_unblocked(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(TASK_UNBLOCKED, workflow_id, task_id=task_id, **kw)
+
+    def task_rerun(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TASK_RERUN, workflow_id, task_id=task_id, **kw)
+
+    def task_attempt_started(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TASK_ATTEMPT_STARTED, workflow_id, task_id=task_id, **kw)
+
+    def task_attempt_finished(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TASK_ATTEMPT_FINISHED, workflow_id, task_id=task_id, **kw)
 
     def watcher_started(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(WATCHER_STARTED, workflow_id, task_id=task_id, **kw)

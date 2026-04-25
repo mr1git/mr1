@@ -14,6 +14,9 @@ Layout::
     <root>/<wf_id>/tasks/<task_id>/stdout.log
     <root>/<wf_id>/tasks/<task_id>/stderr.log
     <root>/<wf_id>/tasks/<task_id>/result.json
+    <root>/<wf_id>/tasks/<task_id>/attempts/<attempt_id>/stdout.log
+    <root>/<wf_id>/tasks/<task_id>/attempts/<attempt_id>/stderr.log
+    <root>/<wf_id>/tasks/<task_id>/attempts/<attempt_id>/result.json
 
 All state mutation uses an atomic tmp → rename. A single store-level
 `RLock` serialises mutation across the workflow.json and events.jsonl
@@ -76,9 +79,27 @@ class WorkflowStore:
         base.mkdir(parents=True, exist_ok=True)
         return base / "stdout.log", base / "stderr.log"
 
+    def task_attempt_dir(self, workflow_id: str, task_id: str, attempt_id: int) -> Path:
+        base = self.workflow_dir(workflow_id) / "tasks" / task_id / "attempts" / str(attempt_id)
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def task_attempt_log_paths(
+        self,
+        workflow_id: str,
+        task_id: str,
+        attempt_id: int,
+    ) -> tuple[Path, Path]:
+        base = self.task_attempt_dir(workflow_id, task_id, attempt_id)
+        return base / "stdout.log", base / "stderr.log"
+
     def task_result_path(self, workflow_id: str, task_id: str) -> Path:
         base = self.workflow_dir(workflow_id) / "tasks" / task_id
         base.mkdir(parents=True, exist_ok=True)
+        return base / "result.json"
+
+    def task_attempt_result_path(self, workflow_id: str, task_id: str, attempt_id: int) -> Path:
+        base = self.task_attempt_dir(workflow_id, task_id, attempt_id)
         return base / "result.json"
 
     def task_output_path(self, workflow_id: str, task_id: str) -> Path:
@@ -235,6 +256,18 @@ class WorkflowStore:
             payload,
         )
 
+    def write_attempt_result(
+        self,
+        workflow_id: str,
+        task_id: str,
+        attempt_id: int,
+        payload: dict[str, Any],
+    ) -> Path:
+        return self._write_json_file(
+            self.task_attempt_result_path(workflow_id, task_id, attempt_id),
+            payload,
+        )
+
     def write_task_output(
         self,
         workflow_id: str,
@@ -292,7 +325,16 @@ class WorkflowStore:
         return resolved
 
     def read_result(self, workflow_id: str, task_id: str) -> Optional[dict[str, Any]]:
-        return self._read_json_file(self.task_result_path(workflow_id, task_id))
+        payload = self._read_json_file(self.task_result_path(workflow_id, task_id))
+        if payload is not None:
+            return payload
+        workflow = self.load_workflow(workflow_id)
+        if workflow is None:
+            return None
+        task = workflow.tasks.get(task_id)
+        if task is None or not task.result_path:
+            return None
+        return self._read_json_file(Path(task.result_path))
 
     def _write_json_file(self, target: Path, payload: Any) -> Path:
         with self._lock:

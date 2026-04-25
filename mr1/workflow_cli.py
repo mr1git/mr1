@@ -34,6 +34,12 @@ from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.scheduler import (
     WatcherTriggerError,
     WorkflowSpecError,
+    append_workflow_on_disk,
+    cancel_task_on_disk,
+    cancel_workflow_on_disk,
+    insert_workflow_on_disk,
+    replace_workflow_on_disk,
+    rerun_task_on_disk,
     submit_spec_to_disk,
     trigger_watcher_on_disk,
 )
@@ -124,7 +130,13 @@ def _format_task_detail(wf: Workflow, task: Task) -> str:
         f"finished:   {_short_ts(task.finished_at)}",
         f"pid:        {task.pid if task.pid is not None else '-'}",
         f"exit_code:  {task.exit_code if task.exit_code is not None else '-'}",
+        f"attempts:   {task.attempt_count}",
+        f"current:    {task.current_attempt or '-'}",
     ]
+    if task.last_error:
+        lines.append(f"last_error: {task.last_error}")
+    if task.last_error_type:
+        lines.append(f"error_type: {task.last_error_type}")
     if task.result_summary:
         lines.append(f"summary:    {task.result_summary[:200]}")
     if task.log_stdout_path:
@@ -165,6 +177,18 @@ def _format_task_detail(wf: Workflow, task: Task) -> str:
             f"tool_done:    {_short_ts(task.tool_finished_at)}",
             f"tool_error:   {task.tool_error or '-'}",
         ])
+    if task.attempts:
+        lines.append("attempt_history:")
+        rows = [("ATTEMPT", "STATUS", "STARTED", "FINISHED", "ERROR_TYPE")]
+        for attempt in task.attempts:
+            rows.append((
+                str(attempt.attempt_id),
+                attempt.status.value,
+                _short_ts(attempt.started_at),
+                _short_ts(attempt.finished_at),
+                attempt.error_type or "-",
+            ))
+        lines.append(_render_table(rows, indent="  "))
     return "\n".join(lines)
 
 
@@ -190,12 +214,13 @@ def _format_jobs(workflows: list[Workflow]) -> str:
 def _format_events(events: list) -> str:
     if not events:
         return "No events."
-    rows = [("TIMESTAMP", "EVENT", "TASK_ID", "MESSAGE")]
+    rows = [("TIMESTAMP", "EVENT", "TASK_ID", "ATTEMPT", "MESSAGE")]
     for ev in events:
         rows.append((
             _short_ts(ev.timestamp),
             ev.event_type,
             ev.task_id or "-",
+            str(ev.attempt_id) if ev.attempt_id is not None else "-",
             (ev.message or "")[:60],
         ))
     return _render_table(rows)
@@ -604,21 +629,29 @@ def _find_workflow_for_task(
     return None, None
 
 
+def _load_json_file(path_str: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    path = Path(path_str)
+    if not path.exists():
+        return None, f"spec file not found: {path}"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return None, "workflow JSON must be an object"
+    return payload, None
+
+
 # ---------------------------------------------------------------------------
 # Sub-command implementations
 # ---------------------------------------------------------------------------
 
 
 def _cmd_submit(args: argparse.Namespace, store: WorkflowStore) -> int:
-    path = Path(args.path)
-    if not path.exists():
-        print(f"error: spec file not found: {path}", file=sys.stderr)
-        return 2
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            spec = json.load(f)
-    except json.JSONDecodeError as exc:
-        print(f"error: invalid JSON: {exc}", file=sys.stderr)
+    spec, error = _load_json_file(args.path)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
         return 2
     try:
         wf_id = submit_spec_to_disk(
@@ -631,6 +664,108 @@ def _cmd_submit(args: argparse.Namespace, store: WorkflowStore) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(wf_id)
+    return 0
+
+
+def _cmd_rerun(args: argparse.Namespace, store: WorkflowStore) -> int:
+    try:
+        task_id = rerun_task_on_disk(
+            store,
+            args.workflow_id,
+            args.task_label_or_id,
+            agent_id="cli",
+        )
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(task_id)
+    return 0
+
+
+def _cmd_cancel_task(args: argparse.Namespace, store: WorkflowStore) -> int:
+    try:
+        task_id = cancel_task_on_disk(
+            store,
+            args.task_id,
+            agent_id="cli",
+        )
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(task_id)
+    return 0
+
+
+def _cmd_cancel_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+    try:
+        workflow_id = cancel_workflow_on_disk(
+            store,
+            args.workflow_id,
+            agent_id="cli",
+        )
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(workflow_id)
+    return 0
+
+
+def _cmd_append_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+    spec, error = _load_json_file(args.path)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    try:
+        workflow_id = append_workflow_on_disk(
+            store,
+            args.workflow_id,
+            spec,
+            agent_id="cli",
+        )
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(workflow_id)
+    return 0
+
+
+def _cmd_insert_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+    spec, error = _load_json_file(args.path)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    try:
+        workflow_id = insert_workflow_on_disk(
+            store,
+            args.workflow_id,
+            args.after_task,
+            spec,
+            agent_id="cli",
+        )
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(workflow_id)
+    return 0
+
+
+def _cmd_replace_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+    spec, error = _load_json_file(args.path)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    try:
+        workflow_id = replace_workflow_on_disk(
+            store,
+            args.workflow_id,
+            args.task_label_or_id,
+            spec,
+            agent_id="cli",
+        )
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(workflow_id)
     return 0
 
 
@@ -862,6 +997,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit.add_argument("path", help="Path to a workflow JSON spec.")
     p_submit.set_defaults(func=_cmd_submit)
 
+    p_rerun = subs.add_parser("rerun", help="Rerun one task in a workflow.")
+    p_rerun.add_argument("workflow_id")
+    p_rerun.add_argument("task_label_or_id")
+    p_rerun.set_defaults(func=_cmd_rerun)
+
     p_list = subs.add_parser("workflows", help="List all workflows.")
     p_list.set_defaults(func=_cmd_workflows)
 
@@ -872,6 +1012,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_task = subs.add_parser("task", help="Show one task's detail.")
     p_task.add_argument("task_id")
     p_task.set_defaults(func=_cmd_task)
+
+    p_cancel_task = subs.add_parser("cancel-task", help="Cancel one task.")
+    p_cancel_task.add_argument("task_id")
+    p_cancel_task.set_defaults(func=_cmd_cancel_task)
+
+    p_cancel_workflow = subs.add_parser("cancel-workflow", help="Cancel one workflow.")
+    p_cancel_workflow.add_argument("workflow_id")
+    p_cancel_workflow.set_defaults(func=_cmd_cancel_workflow)
 
     p_jobs = subs.add_parser("jobs", help="List live tasks across all workflows.")
     p_jobs.set_defaults(func=_cmd_jobs)
@@ -937,6 +1085,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_trigger.add_argument("label_or_task_id")
     p_trigger.add_argument("event_name", nargs="?")
     p_trigger.set_defaults(func=_cmd_trigger)
+
+    p_append_workflow = subs.add_parser("append-workflow", help="Append task(s) to a workflow.")
+    p_append_workflow.add_argument("workflow_id")
+    p_append_workflow.add_argument("path")
+    p_append_workflow.set_defaults(func=_cmd_append_workflow)
+
+    p_insert_workflow = subs.add_parser("insert-workflow", help="Insert one task after an existing task.")
+    p_insert_workflow.add_argument("workflow_id")
+    p_insert_workflow.add_argument("after_task")
+    p_insert_workflow.add_argument("path")
+    p_insert_workflow.set_defaults(func=_cmd_insert_workflow)
+
+    p_replace_workflow = subs.add_parser("replace-workflow", help="Replace one task in a workflow.")
+    p_replace_workflow.add_argument("workflow_id")
+    p_replace_workflow.add_argument("task_label_or_id")
+    p_replace_workflow.add_argument("path")
+    p_replace_workflow.set_defaults(func=_cmd_replace_workflow)
 
     return parser
 

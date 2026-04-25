@@ -151,7 +151,13 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/workflows` | List all known workflows |
 | `/workflow <id>` | Show one workflow and its tasks |
 | `/workflow submit <path>` | Load a JSON spec from disk and submit it |
+| `/workflow rerun <id> <task>` | Reset one task for another execution attempt |
+| `/workflow cancel <id>` | Cancel one workflow |
+| `/workflow append <id> <path>` | Append task(s) from a JSON fragment |
+| `/workflow insert <id> <after_task> <path>` | Insert one task after an existing task |
+| `/workflow replace <id> <task> <path>` | Replace one unstarted or failed task |
 | `/workflow trigger <id> <label-or-task-id> [event_name]` | Trigger a manual watcher |
+| `/task cancel <task_id>` | Cancel one task |
 | `/task <id>` | Show one task's detail |
 | `/result <task_id>` | Show one task's normalized output |
 | `/inputs <task_id>` | Show one task's resolved workflow inputs |
@@ -195,6 +201,12 @@ You can submit the same spec without entering MR1 by using the deterministic CLI
 
 ```bash
 python -m mr1.workflow_cli submit path/to/workflow.json
+python -m mr1.workflow_cli rerun <workflow_id> <task_label_or_id>
+python -m mr1.workflow_cli cancel-task <task_id>
+python -m mr1.workflow_cli cancel-workflow <workflow_id>
+python -m mr1.workflow_cli append-workflow <workflow_id> path/to/fragment.json
+python -m mr1.workflow_cli insert-workflow <workflow_id> <after_task> path/to/task.json
+python -m mr1.workflow_cli replace-workflow <workflow_id> <task_label_or_id> path/to/task.json
 python -m mr1.workflow_cli workflows
 python -m mr1.workflow_cli workflow <workflow_id>
 python -m mr1.workflow_cli capabilities
@@ -210,6 +222,42 @@ python -m mr1.workflow_cli result <task_id>
 python -m mr1.workflow_cli inputs <task_id>
 python -m mr1.workflow_cli artifacts <workflow_id>
 ```
+
+## Workflow Control
+
+MR1 now distinguishes between a logical task and an execution attempt:
+
+- `Task` = the logical node in the workflow DAG.
+- `Attempt` = one concrete execution of that task.
+
+Attempt history is stored per task under:
+
+```text
+mr1/memory/workflows/<wf_id>/tasks/<task_id>/attempts/<attempt_id>/
+  stdout.log
+  stderr.log
+  result.json
+```
+
+`attempt_id` starts at `1`, increases strictly by `1`, is never reused, and always matches the directory name under `attempts/`.
+
+Task control semantics:
+
+- `rerun` resets a task in `failed`, `timed_out`, `cancelled`, or `succeeded` state back to `waiting` or `ready` without deleting prior attempts.
+- the next real launch allocates the next `attempt_id`; rerun itself does not consume an attempt number.
+- `cancel-task` cancels a running task or marks a queued task as cancelled.
+- `cancel-workflow` cancels every non-terminal task in the workflow.
+
+Workflow mutation semantics:
+
+- `append` adds new task nodes without changing existing task definitions.
+- `insert` adds one task after an existing task and rewires that task's direct children through the inserted node.
+- `replace` keeps the same `task_id` and label, but swaps the task definition for an unstarted task or a failed/timed-out/cancelled task.
+
+Output semantics:
+
+- `output.json` remains the canonical normalized output for the latest successful attempt only.
+- failed, timed-out, and cancelled attempts keep their own `result.json` under the attempt directory and do not overwrite `output.json`.
 
 Phase 2 watcher tasks use `task_kind: "watcher"` plus a watcher-specific `watcher_type` and `watch_config`:
 

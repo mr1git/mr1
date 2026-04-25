@@ -122,6 +122,40 @@ class Provenance:
 
 
 @dataclass
+class TaskAttempt:
+    attempt_id: int
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    status: TaskStatus = TaskStatus.CREATED
+    exit_code: Optional[int] = None
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+    stdout_path: Optional[str] = None
+    stderr_path: Optional[str] = None
+    result_path: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["status"] = self.status.value
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskAttempt":
+        return cls(
+            attempt_id=int(data["attempt_id"]),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            status=TaskStatus(data.get("status", "created")),
+            exit_code=data.get("exit_code"),
+            error=data.get("error"),
+            error_type=data.get("error_type"),
+            stdout_path=data.get("stdout_path"),
+            stderr_path=data.get("stderr_path"),
+            result_path=data.get("result_path"),
+        )
+
+
+@dataclass
 class Task:
     """
     One unit of work within a workflow.
@@ -150,6 +184,9 @@ class Task:
     condition: Optional[dict[str, Any]] = None
     depends_on: list[str] = field(default_factory=list)
     inputs: list[TaskInputSpec] = field(default_factory=list)
+    attempt_count: int = 0
+    current_attempt: int = 0
+    attempts: list[TaskAttempt] = field(default_factory=list)
     status: TaskStatus = TaskStatus.CREATED
     created_by: Optional[Provenance] = None
     created_at: str = field(default_factory=_now_iso)
@@ -157,6 +194,8 @@ class Task:
     finished_at: Optional[str] = None
     pid: Optional[int] = None
     exit_code: Optional[int] = None
+    last_error: Optional[str] = None
+    last_error_type: Optional[str] = None
     result_summary: Optional[str] = None
     log_stdout_path: Optional[str] = None
     log_stderr_path: Optional[str] = None
@@ -179,6 +218,7 @@ class Task:
         d["status"] = self.status.value
         d["created_by"] = self.created_by.to_dict() if self.created_by else None
         d["inputs"] = [item.to_dict() for item in self.inputs]
+        d["attempts"] = [attempt.to_dict() for attempt in self.attempts]
         d["artifacts"] = [artifact.to_dict() for artifact in self.artifacts]
         return d
 
@@ -212,6 +252,12 @@ class Task:
                 TaskInputSpec.from_dict(item)
                 for item in data.get("inputs", [])
             ],
+            attempt_count=data.get("attempt_count", 0),
+            current_attempt=data.get("current_attempt", 0),
+            attempts=[
+                TaskAttempt.from_dict(item)
+                for item in data.get("attempts", [])
+            ],
             status=TaskStatus(data.get("status", "created")),
             created_by=(
                 Provenance.from_dict(raw_created_by)
@@ -222,6 +268,8 @@ class Task:
             finished_at=data.get("finished_at"),
             pid=data.get("pid"),
             exit_code=data.get("exit_code"),
+            last_error=data.get("last_error"),
+            last_error_type=data.get("last_error_type"),
             result_summary=data.get("result_summary"),
             log_stdout_path=data.get("log_stdout_path"),
             log_stderr_path=data.get("log_stderr_path"),
@@ -316,6 +364,7 @@ class WorkflowEvent:
     event_type: str
     workflow_id: str
     task_id: Optional[str] = None
+    attempt_id: Optional[int] = None
     agent_id: Optional[str] = None
     message: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -326,6 +375,7 @@ class WorkflowEvent:
         event_type: str,
         workflow_id: str,
         task_id: Optional[str] = None,
+        attempt_id: Optional[int] = None,
         agent_id: Optional[str] = None,
         message: str = "",
         metadata: Optional[dict[str, Any]] = None,
@@ -335,6 +385,7 @@ class WorkflowEvent:
             event_type=event_type,
             workflow_id=workflow_id,
             task_id=task_id,
+            attempt_id=attempt_id,
             agent_id=agent_id,
             message=message,
             metadata=dict(metadata or {}),
@@ -350,6 +401,7 @@ class WorkflowEvent:
             event_type=data["event_type"],
             workflow_id=data["workflow_id"],
             task_id=data.get("task_id"),
+            attempt_id=data.get("attempt_id"),
             agent_id=data.get("agent_id"),
             message=data.get("message", ""),
             metadata=dict(data.get("metadata", {})),

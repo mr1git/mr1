@@ -1564,6 +1564,68 @@ class MR1:
             if rest.startswith("submit "):
                 path_str = rest[len("submit "):].strip()
                 return self._submit_workflow_from_path(path_str)
+            if rest.startswith("rerun "):
+                parts = rest.split(maxsplit=2)
+                if len(parts) != 3:
+                    return "Usage: /workflow rerun <workflow_id> <task>"
+                try:
+                    task_id = self._scheduler.rerun_task(parts[1], parts[2])
+                except WorkflowSpecError as exc:
+                    return str(exc)
+                self._scheduler.tick()
+                return f"rerun scheduled: {task_id}"
+            if rest.startswith("cancel "):
+                parts = rest.split(maxsplit=1)
+                if len(parts) != 2:
+                    return "Usage: /workflow cancel <workflow_id>"
+                try:
+                    cancelled = self._scheduler.cancel_workflow(parts[1])
+                except WorkflowSpecError as exc:
+                    return str(exc)
+                self._scheduler.tick()
+                return (
+                    f"workflow cancelled: {parts[1]}"
+                    if cancelled else f"workflow not found: {parts[1]}"
+                )
+            if rest.startswith("append "):
+                parts = rest.split(maxsplit=2)
+                if len(parts) != 3:
+                    return "Usage: /workflow append <workflow_id> <path>"
+                spec, error = workflow_cli._load_json_file(parts[2])
+                if error:
+                    return error
+                try:
+                    workflow_id = self._scheduler.append_workflow(parts[1], spec)
+                except WorkflowSpecError as exc:
+                    return str(exc)
+                self._scheduler.tick()
+                return f"workflow updated: {workflow_id}"
+            if rest.startswith("insert "):
+                parts = rest.split(maxsplit=3)
+                if len(parts) != 4:
+                    return "Usage: /workflow insert <workflow_id> <after_task> <path>"
+                spec, error = workflow_cli._load_json_file(parts[3])
+                if error:
+                    return error
+                try:
+                    workflow_id = self._scheduler.insert_workflow(parts[1], parts[2], spec)
+                except WorkflowSpecError as exc:
+                    return str(exc)
+                self._scheduler.tick()
+                return f"workflow updated: {workflow_id}"
+            if rest.startswith("replace "):
+                parts = rest.split(maxsplit=3)
+                if len(parts) != 4:
+                    return "Usage: /workflow replace <workflow_id> <task> <path>"
+                spec, error = workflow_cli._load_json_file(parts[3])
+                if error:
+                    return error
+                try:
+                    workflow_id = self._scheduler.replace_workflow(parts[1], parts[2], spec)
+                except WorkflowSpecError as exc:
+                    return str(exc)
+                self._scheduler.tick()
+                return f"workflow updated: {workflow_id}"
             if rest.startswith("trigger "):
                 parts = rest.split(maxsplit=3)
                 if len(parts) < 3:
@@ -1587,7 +1649,18 @@ class MR1:
                 return f"workflow not found: {wf_id}"
             return workflow_cli._format_workflow_detail(wf)
         if cmd.startswith("/task "):
-            task_id = cmd[len("/task "):].strip()
+            rest = cmd[len("/task "):].strip()
+            if rest.startswith("cancel "):
+                task_id = rest[len("cancel "):].strip()
+                if not task_id:
+                    return "Usage: /task cancel <task_id>"
+                try:
+                    cancelled = self._scheduler.cancel_task(task_id)
+                except WorkflowSpecError as exc:
+                    return str(exc)
+                self._scheduler.tick()
+                return f"task cancelled: {cancelled}"
+            task_id = rest
             wf, task = workflow_cli._find_workflow_for_task(
                 self._workflow_store, task_id
             )
