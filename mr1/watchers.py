@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,16 @@ class WatchEvaluation:
     state: str  # satisfied | not_satisfied | failed | timed_out
     message: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class WatcherDefinition:
+    watcher_type: str
+    description: str
+    config_schema: dict[str, Any]
+    outputs: dict[str, str]
+    examples: list[dict[str, Any]]
+    evaluator: WatcherEvaluator
 
 
 class WatcherEvaluator(Protocol):
@@ -192,13 +203,29 @@ class ConditionScriptWatcher:
 
 class WatcherRegistry:
     def __init__(self):
-        self._evaluators: dict[str, WatcherEvaluator] = {}
+        self._definitions: dict[str, WatcherDefinition] = {}
 
-    def register(self, watcher_type: str, evaluator: WatcherEvaluator) -> None:
-        self._evaluators[watcher_type] = evaluator
+    def register(
+        self,
+        watcher_type: str,
+        evaluator: WatcherEvaluator,
+        *,
+        description: str,
+        config_schema: dict[str, Any],
+        outputs: dict[str, str],
+        examples: list[dict[str, Any]],
+    ) -> None:
+        self._definitions[watcher_type] = WatcherDefinition(
+            watcher_type=watcher_type,
+            description=description,
+            config_schema=deepcopy(config_schema),
+            outputs=deepcopy(outputs),
+            examples=deepcopy(examples),
+            evaluator=evaluator,
+        )
 
     def is_registered(self, watcher_type: Optional[str]) -> bool:
-        return bool(watcher_type) and watcher_type in self._evaluators
+        return bool(watcher_type) and watcher_type in self._definitions
 
     def validate_spec(
         self,
@@ -207,20 +234,40 @@ class WatcherRegistry:
     ) -> None:
         if not isinstance(watcher_type, str) or not watcher_type:
             raise WatcherConfigError("watcher task requires watcher_type")
-        evaluator = self._evaluators.get(watcher_type)
-        if evaluator is None:
+        definition = self._definitions.get(watcher_type)
+        if definition is None:
             raise WatcherConfigError(f"unknown watcher_type '{watcher_type}'")
         if watch_config is None:
             watch_config = {}
         if not isinstance(watch_config, dict):
             raise WatcherConfigError("watch_config must be a JSON object")
-        evaluator.validate_config(watch_config)
+        definition.evaluator.validate_config(watch_config)
 
     def evaluate(self, task: Task, now: datetime) -> WatchEvaluation:
-        evaluator = self._evaluators.get(task.watcher_type or "")
-        if evaluator is None:
+        definition = self._definitions.get(task.watcher_type or "")
+        if definition is None:
             raise WatcherConfigError(f"unknown watcher_type '{task.watcher_type}'")
-        return evaluator.evaluate(task, now)
+        return definition.evaluator.evaluate(task, now)
+
+    def describe_watcher(self, watcher_type: str) -> dict[str, Any]:
+        definition = self._definitions.get(watcher_type)
+        if definition is None:
+            raise ValueError(f"watcher not found: {watcher_type}")
+        return {
+            "name": definition.watcher_type,
+            "type": "watcher",
+            "description": definition.description,
+            "inputs": {
+                field: details.get("type", "unknown")
+                for field, details in definition.config_schema.items()
+            },
+            "outputs": deepcopy(definition.outputs),
+            "examples": deepcopy(definition.examples),
+            "config_schema": deepcopy(definition.config_schema),
+        }
+
+    def describe_all_watchers(self) -> list[dict[str, Any]]:
+        return [self.describe_watcher(name) for name in sorted(self._definitions)]
 
 
 _DEFAULT_REGISTRY: Optional[WatcherRegistry] = None
@@ -230,9 +277,88 @@ def default_watcher_registry() -> WatcherRegistry:
     global _DEFAULT_REGISTRY
     if _DEFAULT_REGISTRY is None:
         registry = WatcherRegistry()
-        registry.register("file_exists", FileExistsWatcher())
-        registry.register("time_reached", TimeReachedWatcher())
-        registry.register("manual_event", ManualEventWatcher())
-        registry.register("condition_script", ConditionScriptWatcher())
+        outputs = {
+            "result.text": "latest watcher message",
+            "result.data.state": "watcher evaluation state",
+            "result.data.message": "watcher evaluation message",
+            "result.data.watcher_type": "watcher type name",
+        }
+        registry.register(
+            "file_exists",
+            FileExistsWatcher(),
+            description="Wait until a filesystem path exists.",
+            config_schema={
+                "path": {"type": "string", "required": True},
+                "poll_interval_s": {"type": "int", "required": False},
+            },
+            outputs=outputs,
+            examples=[
+                {
+                    "label": "wait_file",
+                    "title": "Wait for file",
+                    "task_kind": "watcher",
+                    "watcher_type": "file_exists",
+                    "watch_config": {"path": "/tmp/ready.txt"},
+                }
+            ],
+        )
+        registry.register(
+            "time_reached",
+            TimeReachedWatcher(),
+            description="Wait until the current time reaches an ISO timestamp.",
+            config_schema={
+                "at": {"type": "string", "required": True},
+                "poll_interval_s": {"type": "int", "required": False},
+            },
+            outputs=outputs,
+            examples=[
+                {
+                    "label": "wait_until",
+                    "title": "Wait until time",
+                    "task_kind": "watcher",
+                    "watcher_type": "time_reached",
+                    "watch_config": {"at": "2099-01-01T00:00:00"},
+                }
+            ],
+        )
+        registry.register(
+            "manual_event",
+            ManualEventWatcher(),
+            description="Wait until MR1 or the CLI triggers a named manual event.",
+            config_schema={
+                "event": {"type": "string", "required": True},
+                "poll_interval_s": {"type": "int", "required": False},
+            },
+            outputs=outputs,
+            examples=[
+                {
+                    "label": "approve",
+                    "title": "Approve",
+                    "task_kind": "watcher",
+                    "watcher_type": "manual_event",
+                    "watch_config": {"event": "approved"},
+                }
+            ],
+        )
+        registry.register(
+            "condition_script",
+            ConditionScriptWatcher(),
+            description="Run a local script until it reports satisfied, not_satisfied, failed, or timed_out.",
+            config_schema={
+                "path": {"type": "string", "required": True},
+                "timeout_s": {"type": "int", "required": False, "default": 10},
+                "poll_interval_s": {"type": "int", "required": False},
+            },
+            outputs=outputs,
+            examples=[
+                {
+                    "label": "wait_condition",
+                    "title": "Wait for condition",
+                    "task_kind": "watcher",
+                    "watcher_type": "condition_script",
+                    "watch_config": {"path": str(Path(__file__).resolve())},
+                }
+            ],
+        )
         _DEFAULT_REGISTRY = registry
     return _DEFAULT_REGISTRY

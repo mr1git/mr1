@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.scheduler import (
     WatcherTriggerError,
@@ -36,6 +37,10 @@ from mr1.scheduler import (
     trigger_watcher_on_disk,
 )
 from mr1.tools import ToolRegistry, default_tool_registry
+from mr1.workflow_schema import (
+    WorkflowSchemaRegistry,
+    default_workflow_schema_registry,
+)
 from mr1.workflow_models import (
     Provenance,
     Task,
@@ -280,15 +285,213 @@ def _format_artifacts(workflow: Workflow) -> str:
     return _render_table(rows)
 
 
-def _format_tools(registry: Optional[ToolRegistry] = None) -> str:
-    active_registry = registry or default_tool_registry()
-    tools = active_registry.list_tools()
-    if not tools:
-        return "No tools registered."
-    rows = [("TOOL", "DESCRIPTION", "CONFIG_SHAPE")]
-    for tool in tools:
-        rows.append((tool.tool_type, tool.description, tool.config_shape))
+def _format_capabilities(
+    registry: Optional[CapabilityRegistry] = None,
+    *,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    active_registry = registry or default_capability_registry()
+    capabilities = active_registry.describe_all()
+    view = [_brief_description(item) for item in capabilities] if brief else capabilities
+    if json_output:
+        return json.dumps(view, indent=2, sort_keys=True)
+    rows = [("NAME", "TYPE", "DESCRIPTION")]
+    for item in capabilities:
+        rows.append((item["name"], item["type"], item["description"]))
     return _render_table(rows)
+
+
+def _format_capability(
+    name: str,
+    registry: Optional[CapabilityRegistry] = None,
+    *,
+    json_output: bool = False,
+    example_only: bool = False,
+    brief: bool = False,
+) -> str:
+    active_registry = registry or default_capability_registry()
+    description = active_registry.describe_capability(name)
+    view = _select_description_view(
+        description,
+        example_only=example_only,
+        brief=brief,
+    )
+    if json_output:
+        return json.dumps(view, indent=2, sort_keys=True)
+    if example_only:
+        return json.dumps(view, indent=2, sort_keys=True)
+    if brief:
+        return "\n".join([
+            f"name:        {view['name']}",
+            f"type:        {view['type']}",
+            f"description: {view['description']}",
+        ])
+    return _format_description_text(description)
+
+
+def _describe_schema_section(
+    section: Optional[str],
+    registry: Optional[WorkflowSchemaRegistry] = None,
+) -> dict[str, Any]:
+    active_registry = registry or default_workflow_schema_registry()
+    if section is None:
+        return active_registry.describe_all()
+    if section == "workflow":
+        return active_registry.describe_workflow()
+    if section == "task":
+        return active_registry.describe_task()
+    if section == "inputs":
+        return active_registry.describe_inputs()
+    if section == "refs":
+        return active_registry.describe_references()
+    if section == "task-kinds":
+        return active_registry.describe_task_kinds()
+    raise ValueError(f"schema section not found: {section}")
+
+
+def _brief_schema_view(section: Optional[str], description: dict[str, Any]) -> dict[str, Any]:
+    if section is None:
+        return {
+            "workflow": description["workflow"]["summary"],
+            "task": description["task"]["summary"],
+            "inputs": {
+                "summary": description["inputs"]["summary"],
+                "item_shape": description["inputs"]["item_shape"],
+                "rules": [
+                    "inputs must be a list of objects",
+                    "each input object must include non-empty name and from",
+                    "inputs must NEVER be strings",
+                ],
+            },
+            "refs": description["refs"]["summary"],
+            "task-kinds": description["task-kinds"]["summary"],
+        }
+    if section == "inputs":
+        return {
+            "summary": description["summary"],
+            "item_shape": description["item_shape"],
+            "rules": [
+                "inputs must be a list of objects",
+                "each input object must include non-empty name and from",
+                "inputs must NEVER be strings",
+                "inputs must reference upstream dependencies or ancestors",
+            ],
+        }
+    keys = ("summary", "required", "shape", "fields", "supported_patterns", "agent", "tool", "watcher")
+    return {key: description[key] for key in keys if key in description}
+
+
+def _format_schema(
+    section: Optional[str] = None,
+    registry: Optional[WorkflowSchemaRegistry] = None,
+    *,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    description = _describe_schema_section(section, registry=registry)
+    view = _brief_schema_view(section, description) if brief else description
+    return json.dumps(view, indent=2, sort_keys=True)
+
+
+def _format_tools(
+    registry: Optional[ToolRegistry] = None,
+    *,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    active_registry = registry or default_tool_registry()
+    descriptions = active_registry.describe_all_tools()
+    if not descriptions:
+        return "No tools registered."
+    view = [_brief_description(item) for item in descriptions] if brief else descriptions
+    if json_output:
+        return json.dumps(view, indent=2, sort_keys=True)
+    if brief:
+        rows = [("TOOL", "DESCRIPTION")]
+        for item in descriptions:
+            rows.append((item["name"], item["description"]))
+        return _render_table(rows)
+    rows = [("TOOL", "DESCRIPTION", "CONFIG_SHAPE")]
+    for item in descriptions:
+        rows.append((item["name"], item["description"], _config_shape_for_tool(active_registry, item["name"])))
+    return _render_table(rows)
+
+
+def _format_tool(
+    tool_type: str,
+    registry: Optional[ToolRegistry] = None,
+    *,
+    json_output: bool = False,
+    example_only: bool = False,
+    brief: bool = False,
+) -> str:
+    active_registry = registry or default_tool_registry()
+    description = active_registry.describe_tool(tool_type)
+    view = _select_description_view(
+        description,
+        example_only=example_only,
+        brief=brief,
+    )
+    if json_output:
+        return json.dumps(view, indent=2, sort_keys=True)
+    if example_only:
+        return json.dumps(view, indent=2, sort_keys=True)
+    if brief:
+        return "\n".join([
+            f"name:        {view['name']}",
+            f"type:        {view['type']}",
+            f"description: {view['description']}",
+        ])
+    return _format_description_text(description)
+
+
+def _brief_description(description: dict[str, Any]) -> dict[str, str]:
+    return {
+        "name": description["name"],
+        "type": description["type"],
+        "description": description["description"],
+    }
+
+
+def _select_description_view(
+    description: dict[str, Any],
+    *,
+    example_only: bool,
+    brief: bool,
+) -> dict[str, Any]:
+    if example_only and brief:
+        raise ValueError("invalid flag combination")
+    if example_only:
+        examples = list(description.get("examples") or [])
+        return examples[0] if examples else {}
+    if brief:
+        return _brief_description(description)
+    return description
+
+
+def _format_description_text(description: dict[str, Any]) -> str:
+    lines = [
+        f"name:         {description['name']}",
+        f"type:         {description['type']}",
+        f"description:  {description['description']}",
+        "inputs:",
+        json.dumps(description.get("inputs", {}), indent=2, sort_keys=True),
+        "outputs:",
+        json.dumps(description.get("outputs", {}), indent=2, sort_keys=True),
+        "config_schema:",
+        json.dumps(description.get("config_schema", {}), indent=2, sort_keys=True),
+        "examples:",
+        json.dumps(description.get("examples", []), indent=2, sort_keys=True),
+    ]
+    return "\n".join(lines)
+
+
+def _config_shape_for_tool(registry: ToolRegistry, tool_type: str) -> str:
+    for tool in registry.list_tools():
+        if tool.tool_type == tool_type:
+            return tool.config_shape
+    return "-"
 
 
 def _render_table(rows: list[tuple[str, ...]], indent: str = "") -> str:
@@ -403,9 +606,78 @@ def _cmd_watchers(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
+def _reject_invalid_flag_combination(args: argparse.Namespace) -> Optional[int]:
+    if getattr(args, "example", False) and getattr(args, "brief", False):
+        print("error: invalid flag combination", file=sys.stderr)
+        return 2
+    return None
+
+
+def _cmd_capabilities(args: argparse.Namespace, store: WorkflowStore) -> int:
+    del store
+    rc = _reject_invalid_flag_combination(args)
+    if rc is not None:
+        return rc
+    print(_format_capabilities(json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_capability(args: argparse.Namespace, store: WorkflowStore) -> int:
+    del store
+    rc = _reject_invalid_flag_combination(args)
+    if rc is not None:
+        return rc
+    try:
+        print(_format_capability(
+            args.name,
+            json_output=args.json,
+            example_only=args.example,
+            brief=args.brief,
+        ))
+    except ValueError:
+        print(f"error: capability not found: {args.name}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _cmd_tools(args: argparse.Namespace, store: WorkflowStore) -> int:
-    del args, store
-    print(_format_tools())
+    del store
+    rc = _reject_invalid_flag_combination(args)
+    if rc is not None:
+        return rc
+    print(_format_tools(json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_schema(args: argparse.Namespace, store: WorkflowStore) -> int:
+    del store
+    try:
+        print(_format_schema(
+            args.section,
+            json_output=args.json,
+            brief=args.brief,
+        ))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _cmd_tool(args: argparse.Namespace, store: WorkflowStore) -> int:
+    del store
+    rc = _reject_invalid_flag_combination(args)
+    if rc is not None:
+        return rc
+    try:
+        print(_format_tool(
+            args.tool_type,
+            json_output=args.json,
+            example_only=args.example,
+            brief=args.brief,
+        ))
+    except ValueError:
+        print(f"error: tool not found: {args.tool_type}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -470,6 +742,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subs = parser.add_subparsers(dest="command", required=True)
 
+    def add_common_flags(subparser: argparse.ArgumentParser, *, include_example: bool) -> None:
+        subparser.add_argument("--json", action="store_true", dest="json")
+        subparser.add_argument("--brief", action="store_true", dest="brief")
+        if include_example:
+            subparser.add_argument("--example", action="store_true", dest="example")
+        else:
+            subparser.set_defaults(example=False)
+
     p_submit = subs.add_parser("submit", help="Write a workflow spec to the store.")
     p_submit.add_argument("path", help="Path to a workflow JSON spec.")
     p_submit.set_defaults(func=_cmd_submit)
@@ -499,8 +779,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p_watchers = subs.add_parser("watchers", help="List active watcher tasks.")
     p_watchers.set_defaults(func=_cmd_watchers)
 
+    p_capabilities = subs.add_parser("capabilities", help="List registered capabilities.")
+    add_common_flags(p_capabilities, include_example=False)
+    p_capabilities.set_defaults(func=_cmd_capabilities)
+
+    p_capability = subs.add_parser("capability", help="Show one capability description.")
+    p_capability.add_argument("name")
+    add_common_flags(p_capability, include_example=True)
+    p_capability.set_defaults(func=_cmd_capability)
+
     p_tools = subs.add_parser("tools", help="List registered deterministic workflow tools.")
+    add_common_flags(p_tools, include_example=False)
     p_tools.set_defaults(func=_cmd_tools)
+
+    p_schema = subs.add_parser("schema", help="Show workflow schema metadata.")
+    p_schema.add_argument("section", nargs="?")
+    add_common_flags(p_schema, include_example=False)
+    p_schema.set_defaults(func=_cmd_schema)
+
+    p_tool = subs.add_parser("tool", help="Show one tool description.")
+    p_tool.add_argument("tool_type")
+    add_common_flags(p_tool, include_example=True)
+    p_tool.set_defaults(func=_cmd_tool)
 
     p_result = subs.add_parser("result", help="Show normalized task output.")
     p_result.add_argument("task_id")

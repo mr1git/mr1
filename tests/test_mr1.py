@@ -18,6 +18,18 @@ from mr1.kazi_runner import MockRunner
 from mr1.workflow_store import WorkflowStore
 
 
+class FakeCompiler:
+    def __init__(self, *responses: str):
+        self.responses = list(responses)
+        self.prompts: list[tuple[str, str]] = []
+
+    def __call__(self, system_prompt: str, prompt: str) -> str:
+        self.prompts.append((system_prompt, prompt))
+        if not self.responses:
+            raise AssertionError("no compiler responses configured")
+        return self.responses.pop(0)
+
+
 class TestStateManager:
     @pytest.fixture
     def state_mgr(self, tmp_path):
@@ -417,8 +429,14 @@ class TestMR1Process:
 
 class TestStep:
     @pytest.fixture
-    def mr1_with_mock_process(self):
-        mr1_instance = MR1()
+    def mr1_with_mock_process(self, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
         mock_process = MagicMock(spec=MR1Process)
         mock_process.alive = True
         mr1_instance._process = mock_process
@@ -430,4 +448,248 @@ class TestStep:
 
         result = mr1_instance.step("what is 2+2?")
         assert result == "Here is the answer."
-        mock_process.send.assert_called_once_with("what is 2+2?")
+        sent = mock_process.send.call_args.args[0]
+        assert "Answer this request directly" in sent
+        assert "what is 2+2?" in sent
+
+    def test_workflow_request_uses_compiler_first_not_brain(self, tmp_path):
+        compiler = FakeCompiler(
+            json.dumps(
+                {
+                    "title": "Read and summarize",
+                    "tasks": [
+                        {
+                            "label": "read_notes",
+                            "title": "Read notes",
+                            "task_kind": "tool",
+                            "tool_type": "read_file",
+                            "tool_config": {"path": str(tmp_path / "notes.txt")},
+                        },
+                        {
+                            "label": "python_version",
+                            "title": "Python version",
+                            "task_kind": "tool",
+                            "tool_type": "shell_command",
+                            "tool_config": {"argv": ["python3", "--version"]},
+                        },
+                        {
+                            "label": "summarize",
+                            "title": "Summarize",
+                            "task_kind": "agent",
+                            "agent_type": "kazi",
+                            "depends_on": ["read_notes", "python_version"],
+                            "inputs": [
+                                {"name": "notes", "from": "read_notes.result.text"},
+                                {"name": "version", "from": "python_version.result.data.stdout"},
+                            ],
+                            "prompt": "Summarize the notes and version.",
+                        },
+                    ],
+                }
+            )
+        )
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+
+        response = mr1_instance.step("Read a file, check Python version, and summarize")
+
+        assert response.startswith("submitted workflow: wf-")
+        assert "/workflow wf-" in response
+        assert mr1_instance._process.send.call_count == 0
+
+    def test_preview_persistence_json_and_confirmation(self, tmp_path):
+        compiler = FakeCompiler(
+            json.dumps(
+                {
+                    "title": "Complex",
+                    "tasks": [
+                        {
+                            "label": "read_notes",
+                            "title": "Read notes",
+                            "task_kind": "tool",
+                            "tool_type": "read_file",
+                            "tool_config": {"path": str(tmp_path / "notes.txt")},
+                        },
+                        {
+                            "label": "python_version",
+                            "title": "Python version",
+                            "task_kind": "tool",
+                            "tool_type": "shell_command",
+                            "tool_config": {"argv": ["python3", "--version"]},
+                        },
+                        {
+                            "label": "summarize",
+                            "title": "Summarize",
+                            "task_kind": "agent",
+                            "agent_type": "kazi",
+                            "depends_on": ["read_notes", "python_version"],
+                            "inputs": [
+                                {"name": "notes", "from": "read_notes.result.text"},
+                                {"name": "version", "from": "python_version.result.data.stdout"},
+                            ],
+                            "prompt": "Summarize.",
+                        },
+                        {
+                            "label": "write_report",
+                            "title": "Write report",
+                            "task_kind": "tool",
+                            "tool_type": "write_file",
+                            "depends_on": ["summarize"],
+                            "inputs": [{"name": "summary", "from": "summarize.result.text"}],
+                            "tool_config": {
+                                "path": str(tmp_path / "report.txt"),
+                                "content": "placeholder",
+                                "overwrite": True,
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+
+        preview = mr1_instance.step("Read a file, check Python version, summarize, and write a report")
+        assert "This workflow will:" in preview
+        assert mr1_instance._state.pending_workflow is not None
+
+        raw_json = mr1_instance.step("show json")
+        assert raw_json == json.dumps(mr1_instance._state.pending_workflow["spec"], indent=2)
+
+        submit = mr1_instance.step("execute")
+        assert submit.startswith("submitted workflow: wf-")
+        assert mr1_instance._state.pending_workflow is None
+
+    def test_cancel_pending_preview(self, tmp_path):
+        compiler = FakeCompiler(
+            json.dumps(
+                {
+                    "title": "Complex",
+                    "tasks": [
+                        {
+                            "label": "read_notes",
+                            "title": "Read notes",
+                            "task_kind": "tool",
+                            "tool_type": "read_file",
+                            "tool_config": {"path": str(tmp_path / "notes.txt")},
+                        },
+                        {
+                            "label": "python_version",
+                            "title": "Python version",
+                            "task_kind": "tool",
+                            "tool_type": "shell_command",
+                            "tool_config": {"argv": ["python3", "--version"]},
+                        },
+                        {
+                            "label": "summarize",
+                            "title": "Summarize",
+                            "task_kind": "agent",
+                            "agent_type": "kazi",
+                            "depends_on": ["read_notes", "python_version"],
+                            "inputs": [
+                                {"name": "notes", "from": "read_notes.result.text"},
+                                {"name": "version", "from": "python_version.result.data.stdout"},
+                            ],
+                            "prompt": "Summarize.",
+                        },
+                        {
+                            "label": "write_report",
+                            "title": "Write report",
+                            "task_kind": "tool",
+                            "tool_type": "write_file",
+                            "depends_on": ["summarize"],
+                            "inputs": [{"name": "summary", "from": "summarize.result.text"}],
+                            "tool_config": {
+                                "path": str(tmp_path / "report.txt"),
+                                "content": "placeholder",
+                                "overwrite": True,
+                            },
+                        },
+                    ],
+                }
+            )
+        )
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+
+        mr1_instance.step("Read a file, check Python version, summarize, and write a report")
+        cancelled = mr1_instance.step("cancel")
+
+        assert cancelled == "Cancelled pending workflow draft."
+        assert mr1_instance._state.pending_workflow is None
+
+    def test_submission_receipt_contains_inspection_commands(self, tmp_path):
+        compiler = FakeCompiler(
+            json.dumps(
+                {
+                    "title": "Read and summarize",
+                    "tasks": [
+                        {
+                            "label": "read_notes",
+                            "title": "Read notes",
+                            "task_kind": "tool",
+                            "tool_type": "read_file",
+                            "tool_config": {"path": str(tmp_path / "notes.txt")},
+                        },
+                        {
+                            "label": "python_version",
+                            "title": "Python version",
+                            "task_kind": "tool",
+                            "tool_type": "shell_command",
+                            "tool_config": {"argv": ["python3", "--version"]},
+                        },
+                        {
+                            "label": "summarize",
+                            "title": "Summarize",
+                            "task_kind": "agent",
+                            "agent_type": "kazi",
+                            "depends_on": ["read_notes", "python_version"],
+                            "inputs": [
+                                {"name": "notes", "from": "read_notes.result.text"},
+                                {"name": "version", "from": "python_version.result.data.stdout"},
+                            ],
+                            "prompt": "Summarize the notes and version.",
+                        },
+                    ],
+                }
+            )
+        )
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+
+        response = mr1_instance.step("Read a file, check Python version, and summarize")
+
+        assert "/workflow wf-" in response
+        assert "/jobs" in response
+        assert "/events wf-" in response
+        assert "/artifacts wf-" in response
+        assert "/result tk-" in response
+        assert "/inputs tk-" in response

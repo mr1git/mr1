@@ -30,6 +30,10 @@ _EXPORTS = {
     "ResolvedTaskInput": ("mr1.dataflow", "ResolvedTaskInput"),
     "TaskInputSpec": ("mr1.dataflow", "TaskInputSpec"),
     "TaskOutput": ("mr1.dataflow", "TaskOutput"),
+    "CapabilityRegistry": ("mr1.capabilities", "CapabilityRegistry"),
+    "default_capability_registry": ("mr1.capabilities", "default_capability_registry"),
+    "WorkflowSchemaRegistry": ("mr1.workflow_schema", "WorkflowSchemaRegistry"),
+    "default_workflow_schema_registry": ("mr1.workflow_schema", "default_workflow_schema_registry"),
     "FAILED_TASK_STATUSES": ("mr1.workflow_models", "FAILED_TASK_STATUSES"),
     "TERMINAL_TASK_STATUSES": ("mr1.workflow_models", "TERMINAL_TASK_STATUSES"),
     "TERMINAL_WORKFLOW_STATUSES": ("mr1.workflow_models", "TERMINAL_WORKFLOW_STATUSES"),
@@ -42,6 +46,9 @@ _EXPORTS = {
     "new_task_id": ("mr1.workflow_models", "new_task_id"),
     "new_workflow_id": ("mr1.workflow_models", "new_workflow_id"),
     "WorkflowStore": ("mr1.workflow_store", "WorkflowStore"),
+    "PendingWorkflowDraft": ("mr1.workflow_authoring", "PendingWorkflowDraft"),
+    "WorkflowAuthoringService": ("mr1.workflow_authoring", "WorkflowAuthoringService"),
+    "workflow_to_spec": ("mr1.workflow_authoring", "workflow_to_spec"),
 }
 
 __all__ = sorted(_EXPORTS)

@@ -234,6 +234,38 @@ class TestReadCommands:
         out = capsys.readouterr().out
         assert "report" in out
 
+    def test_schema_json_output(self, store, capsys):
+        rc = workflow_cli.main(["schema", "--json"], store=store)
+
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload) == {"workflow", "task", "inputs", "refs", "task-kinds"}
+
+    def test_schema_inputs_json_output(self, store, capsys):
+        rc = workflow_cli.main(["schema", "inputs", "--json"], store=store)
+
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["item_shape"] == {
+            "name": "string",
+            "from": "<label>.<reference>",
+        }
+
+    def test_schema_refs_text_output(self, store, capsys):
+        rc = workflow_cli.main(["schema", "refs"], store=store)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert '"supported_patterns"' in out
+        assert "<label>.result.text" in out
+        assert "<label>.artifact.<artifact_name>" in out
+
+    def test_invalid_schema_section_is_deterministic(self, store, capsys):
+        rc = workflow_cli.main(["schema", "nope"], store=store)
+
+        assert rc == 2
+        assert capsys.readouterr().err.strip() == "error: schema section not found: nope"
+
 
 class TestSubmitDoesNotStartScheduler:
     """

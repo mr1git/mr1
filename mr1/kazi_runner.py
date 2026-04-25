@@ -150,8 +150,6 @@ class KaziAsyncRunner(Runner):
             cmd.extend(["--allowedTools", ",".join(tools)])
         cmd.extend([
             "--output-format", "json",
-            "--bare",
-            "--dangerously-skip-permissions",
         ])
 
         cli_flags = [tok for tok in cmd[1:] if tok.startswith("-")]

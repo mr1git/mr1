@@ -20,6 +20,7 @@ resume context after restarts.
 import json
 import re
 import signal
+import shlex
 import subprocess
 import sys
 import threading
@@ -47,6 +48,11 @@ from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 from mr1 import workflow_cli
+from mr1.workflow_authoring import (
+    PendingWorkflowDraft,
+    WorkflowAuthoringService,
+    workflow_to_spec,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +383,7 @@ class StateManager:
             "decisions": [],
             "agent_pids": [],
             "conversation": [],
+            "pending_workflow": None,
         }
 
     def save(self) -> None:
@@ -494,6 +501,13 @@ class StateManager:
         self.save()
         return entry
 
+    def set_pending_workflow(self, draft: Optional[dict[str, Any]]) -> None:
+        self._state["pending_workflow"] = draft
+        self.save()
+
+    def clear_pending_workflow(self) -> None:
+        self.set_pending_workflow(None)
+
     # -- Agent PIDs --------------------------------------------------------
 
     def add_agent_pid(self, pid: int) -> None:
@@ -520,6 +534,11 @@ class StateManager:
     @property
     def claude_session_id(self) -> Optional[str]:
         return self._state.get("claude_session_id")
+
+    @property
+    def pending_workflow(self) -> Optional[dict[str, Any]]:
+        value = self._state.get("pending_workflow")
+        return dict(value) if isinstance(value, dict) else None
 
     def format_status(self) -> str:
         """Human-readable status block."""
@@ -604,6 +623,8 @@ class MR1:
         workflow_runner: Optional[Runner] = None,
         workflow_concurrency: int = 4,
         workflow_auto_tick: bool = True,
+        workflow_compiler: Optional[Callable[[str, str], str]] = None,
+        workflow_authoring_service: Optional[WorkflowAuthoringService] = None,
     ):
         self._dispatcher = Dispatcher()
         self._logger = Logger()
@@ -637,6 +658,11 @@ class MR1:
             concurrency=workflow_concurrency,
             auto_tick=workflow_auto_tick,
             agent_id="MR1",
+        )
+        self._workflow_authoring = workflow_authoring_service or WorkflowAuthoringService(
+            self._scheduler,
+            self._workflow_store,
+            compiler=workflow_compiler or self._run_workflow_compiler,
         )
 
     # ------------------------------------------------------------------
@@ -851,6 +877,29 @@ class MR1:
         self._state.set_claude_session_id(session_id if isinstance(session_id, str) else None)
         return response
 
+    def _run_workflow_compiler(self, system_prompt: str, message: str) -> str:
+        proc = MR1Process(system_prompt, self._mr1_config["model"], [])
+        proc.start()
+        return proc.send(message)
+
+    def _answer_directly(self, user_input: str) -> str:
+        raw = self._send_to_brain(
+            "Answer this request directly. Do not delegate to MR2 or Kazi.\n\n"
+            f"User request:\n{user_input}"
+        )
+        text, _ = self._parse_response(raw)
+        return text
+
+    def _record_local_response(
+        self,
+        text: str,
+        *,
+        kind: str = "message",
+    ) -> str:
+        if text:
+            self._record_conversation("mr1", text, kind=kind)
+        return text
+
     def _handle_task_event(self, event: dict[str, Any]) -> None:
         task_id = event.get("task_id")
         if task_id:
@@ -1025,55 +1074,133 @@ class MR1:
 
     def step(self, user_input: str, announce: bool = False) -> str:
         """
-        Process one turn of conversation:
-          1. Send user input to the persistent MR1 process
-          2. Parse response for delegation directives
-          3. If delegating, spawn the agent, collect result, feed back to MR1
-          4. Return the final text to display
+        Process one turn of conversation.
+
+        Phase 5 is compiler-first for normal turns:
+          1. Decide direct answer vs workflow authoring
+          2. For workflow turns: compile, validate, preview, submit
+          3. For direct answers: ask MR1 to answer without delegation
         """
         self._record_conversation("user", user_input)
-        raw_response = self._send_to_brain(user_input)
+        pending = self._workflow_authoring.coerce_pending_draft(
+            self._state.pending_workflow
+        )
+        action = self._workflow_authoring.classify_request(
+            user_input,
+            pending_draft=pending,
+        )
 
-        for _ in range(_MAX_DELEGATION_ROUNDS):
-            display_text, directive = self._parse_response(raw_response)
+        if action == "direct_answer":
+            self._state.add_decision(user_input, "direct_answer")
+            return self._record_local_response(self._answer_directly(user_input))
 
-            if directive is None:
-                # Direct answer — no delegation.
-                self._state.add_decision(user_input, "direct_answer")
-                if display_text:
-                    self._record_conversation("mr1", display_text)
-                return display_text
+        if action == "show_json_preview":
+            if pending is None:
+                return self._record_local_response("No pending workflow draft.")
+            return self._record_local_response(
+                json.dumps(pending.spec, indent=2),
+                kind="workflow_json",
+            )
 
-            # Show delegation notice to user.
-            if display_text:
-                self._record_conversation(
-                    "mr1",
-                    display_text,
-                    kind="delegate_notice",
+        if action == "cancel_preview":
+            self._state.clear_pending_workflow()
+            self._state.add_decision(user_input, "cancel_workflow_preview")
+            return self._record_local_response("Cancelled pending workflow draft.")
+
+        if action == "confirm_preview":
+            if pending is None:
+                return self._record_local_response("No pending workflow draft.")
+            result = self._workflow_authoring.submit(
+                pending.spec,
+                created_by=Provenance(type="agent", id="MR1"),
+                target_workflow_id=pending.target_workflow_id,
+            )
+            self._state.clear_pending_workflow()
+            self._state.add_decision(
+                user_input,
+                "submit_pending_workflow",
+                result.workflow_id,
+            )
+            return self._record_local_response(result.message)
+
+        mode = "modify" if action == "modify_workflow" else "create"
+        target_workflow_id = self._workflow_authoring.extract_workflow_id(user_input)
+        baseline_spec: Optional[dict[str, Any]] = None
+        if pending is not None:
+            baseline_spec = pending.spec
+            target_workflow_id = pending.target_workflow_id or target_workflow_id
+        elif target_workflow_id:
+            workflow = self._workflow_store.load_workflow(target_workflow_id)
+            if workflow is None:
+                return self._record_local_response(
+                    f"workflow not found: {target_workflow_id}"
                 )
-                if announce:
-                    print(f"\nmr1 > {display_text}")
-            self._emit_event(
-                "system_event",
-                lane="conversation",
-                summary=f"delegating to {directive['agent']}",
-                agent_type="mr1",
-            )
-            if announce:
-                print(f"  [delegating to {directive['agent']}...]")
+            baseline_spec = workflow_to_spec(workflow)
 
-            # Execute delegation.
-            agent_result = self._execute_delegation(directive, user_input)
-
-            # Feed the agent result back to MR1 for synthesis.
-            safe_result = agent_result.replace("\n", "\\n")
-            raw_response = self._send_to_brain(
-                f"[AGENT RESULT from {directive['agent']}] {safe_result}"
+        if mode == "modify" and baseline_spec is None:
+            return self._record_local_response(
+                self._workflow_authoring.clarify_message(
+                    "missing workflow target",
+                    mode=mode,
+                    target_workflow_id=target_workflow_id,
+                )
             )
 
-        # Exhausted delegation rounds — return whatever we have.
-        text, _ = self._parse_response(raw_response)
-        return text
+        try:
+            spec = self._workflow_authoring.generate_spec(
+                user_input,
+                mode=mode,
+                baseline_spec=baseline_spec,
+            )
+        except (RuntimeError, json.JSONDecodeError, WorkflowSpecError, ValueError) as exc:
+            return self._record_local_response(
+                self._workflow_authoring.clarify_message(
+                    str(exc),
+                    mode=mode,
+                    target_workflow_id=target_workflow_id,
+                )
+            )
+
+        validation = self._workflow_authoring.validate_and_maybe_fix(spec)
+        if not validation.ok or validation.spec is None:
+            return self._record_local_response(
+                self._workflow_authoring.clarify_message(
+                    validation.error or "workflow validation failed",
+                    mode=mode,
+                    target_workflow_id=target_workflow_id,
+                )
+            )
+
+        preview_text, complexity = self._workflow_authoring.preview(validation.spec)
+        if complexity == "simple":
+            result = self._workflow_authoring.submit(
+                validation.spec,
+                created_by=Provenance(type="agent", id="MR1"),
+                target_workflow_id=target_workflow_id,
+            )
+            self._state.clear_pending_workflow()
+            self._state.add_decision(
+                user_input,
+                "modify_workflow" if mode == "modify" else "submit_workflow",
+                result.workflow_id,
+            )
+            return self._record_local_response(result.message)
+
+        draft = PendingWorkflowDraft(
+            original_request=user_input,
+            mode=mode,
+            spec=validation.spec,
+            target_workflow_id=target_workflow_id,
+            preview_text=preview_text,
+            complexity=complexity,
+        )
+        self._state.set_pending_workflow(draft.to_dict())
+        self._state.add_decision(
+            user_input,
+            "preview_workflow_modification" if mode == "modify" else "preview_workflow",
+            target_workflow_id,
+        )
+        return self._record_local_response(preview_text, kind="workflow_preview")
 
     # ------------------------------------------------------------------
     # Memory dump + restart (/memdltr)
@@ -1312,8 +1439,16 @@ class MR1:
             )
         if cmd == "/watchers":
             return workflow_cli._format_watchers(self._scheduler.list_workflows())
-        if cmd == "/tools":
-            return workflow_cli._format_tools()
+        if cmd == "/tools" or cmd.startswith("/tools "):
+            return self._handle_capability_builtin(cmd)
+        if cmd == "/capabilities" or cmd.startswith("/capabilities "):
+            return self._handle_capability_builtin(cmd)
+        if cmd.startswith("/capability"):
+            return self._handle_capability_builtin(cmd)
+        if cmd.startswith("/tool"):
+            return self._handle_capability_builtin(cmd)
+        if cmd == "/schema" or cmd.startswith("/schema "):
+            return self._handle_schema_builtin(cmd)
         if cmd.startswith("/workflow "):
             rest = cmd[len("/workflow "):].strip()
             if rest.startswith("submit "):
@@ -1386,6 +1521,96 @@ class MR1:
             return "scheduler ticked."
         return None
 
+    def _handle_capability_builtin(self, cmd: str) -> str:
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            if cmd.startswith("/capability"):
+                return "usage: /capability <name> [--json] [--example] [--brief]"
+            if cmd.startswith("/tool"):
+                return "usage: /tool <tool_type> [--json] [--example] [--brief]"
+            if cmd.startswith("/capabilities"):
+                return "usage: /capabilities [--json] [--brief]"
+            return "usage: /tools [--json] [--brief]"
+
+        command = parts[0]
+        flags = {part for part in parts[1:] if part.startswith("--")}
+        positionals = [part for part in parts[1:] if not part.startswith("--")]
+        allowed_flags = {"--json", "--brief"}
+        if command in {"/capability", "/tool"}:
+            allowed_flags.add("--example")
+        if any(flag not in allowed_flags for flag in flags):
+            if command == "/capability":
+                return "usage: /capability <name> [--json] [--example] [--brief]"
+            if command == "/tool":
+                return "usage: /tool <tool_type> [--json] [--example] [--brief]"
+            if command == "/capabilities":
+                return "usage: /capabilities [--json] [--brief]"
+            return "usage: /tools [--json] [--brief]"
+        if "--example" in flags and "--brief" in flags:
+            return "invalid flag combination"
+
+        if command == "/capabilities":
+            if positionals:
+                return "usage: /capabilities [--json] [--brief]"
+            return workflow_cli._format_capabilities(
+                json_output="--json" in flags,
+                brief="--brief" in flags,
+            )
+        if command == "/capability":
+            if len(positionals) != 1:
+                return "usage: /capability <name> [--json] [--example] [--brief]"
+            try:
+                return workflow_cli._format_capability(
+                    positionals[0],
+                    json_output="--json" in flags,
+                    example_only="--example" in flags,
+                    brief="--brief" in flags,
+                )
+            except ValueError:
+                return f"capability not found: {positionals[0]}"
+        if command == "/tools":
+            if positionals:
+                return "usage: /tools [--json] [--brief]"
+            return workflow_cli._format_tools(
+                json_output="--json" in flags,
+                brief="--brief" in flags,
+            )
+        if len(positionals) != 1:
+            return "usage: /tool <tool_type> [--json] [--example] [--brief]"
+        try:
+            return workflow_cli._format_tool(
+                positionals[0],
+                json_output="--json" in flags,
+                example_only="--example" in flags,
+                brief="--brief" in flags,
+            )
+        except ValueError:
+            return f"tool not found: {positionals[0]}"
+
+    def _handle_schema_builtin(self, cmd: str) -> str:
+        usage = "usage: /schema [workflow|task|inputs|refs|task-kinds] [--json] [--brief]"
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            return usage
+
+        flags = {part for part in parts[1:] if part.startswith("--")}
+        positionals = [part for part in parts[1:] if not part.startswith("--")]
+        allowed_flags = {"--json", "--brief"}
+        if any(flag not in allowed_flags for flag in flags):
+            return usage
+        if len(positionals) > 1:
+            return usage
+        try:
+            return workflow_cli._format_schema(
+                positionals[0] if positionals else None,
+                json_output="--json" in flags,
+                brief="--brief" in flags,
+            )
+        except ValueError as exc:
+            return f"error: {exc}"
+
     def _submit_workflow_from_path(self, path_str: str) -> str:
         path = Path(path_str)
         if not path.exists():
@@ -1432,7 +1657,8 @@ class MR1:
         print(f"Session: {self._state.session_id}")
         print(
             "Commands: /status  /tasks  /kill  /history  /memdltr  "
-            "/workflows  /watchers  /tools  /vizualize  /visualize-web  "
+            "/workflows  /watchers  /capabilities  /capability <name>  "
+            "/tools  /tool <type>  /schema  /vizualize  /visualize-web  "
             "/test spawn agents <h>  /test kill agents"
         )
         print("Type 'exit' or Ctrl+C to quit.\n")

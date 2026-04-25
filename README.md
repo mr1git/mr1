@@ -158,7 +158,11 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/artifacts <workflow_id>` | List registered artifacts for a workflow |
 | `/jobs` | List live workflow tasks |
 | `/watchers` | List active watcher tasks |
+| `/capabilities` | List all registered capabilities across tools, watchers, and agents |
+| `/capability <name>` | Show one capability contract |
+| `/schema [section]` | Show workflow schema metadata (`workflow`, `task`, `inputs`, `refs`, `task-kinds`) |
 | `/tools` | List registered deterministic workflow tools |
+| `/tool <type>` | Show one tool contract |
 | `/events <workflow_id>` | Show recent workflow events |
 | `/scheduler tick` | Force one deterministic scheduler pass |
 
@@ -191,7 +195,12 @@ You can submit the same spec without entering MR1 by using the deterministic CLI
 python -m mr1.workflow_cli submit path/to/workflow.json
 python -m mr1.workflow_cli workflows
 python -m mr1.workflow_cli workflow <workflow_id>
+python -m mr1.workflow_cli capabilities
+python -m mr1.workflow_cli capability shell_command --json
+python -m mr1.workflow_cli schema
+python -m mr1.workflow_cli schema inputs --json
 python -m mr1.workflow_cli tools
+python -m mr1.workflow_cli tool shell_command --example
 python -m mr1.workflow_cli result <task_id>
 python -m mr1.workflow_cli inputs <task_id>
 python -m mr1.workflow_cli artifacts <workflow_id>
@@ -351,6 +360,18 @@ Supported built-in tools:
 | `write_file` | `path`, `content` | Write UTF-8 text to a file and register it as an artifact |
 | `shell_command` | `argv` | Run a bounded argv command with `shell=False` and structured captured output |
 
+MR1 now exposes a global capability layer:
+
+- Capabilities define what the system can do.
+- Workflow schema defines how a workflow must be expressed.
+- Tools, watchers, and agents define how each capability is implemented.
+- Capability contracts document config schema, minimal valid examples, and explicit downstream output references.
+
+The distinction matters during workflow authoring:
+
+- `capabilities` = what MR1 can do
+- `workflow schema` = how to express workflows
+
 Tool tasks write the same normalized `output.json` schema as agent and watcher tasks, so downstream references work without new syntax:
 
 ```text
@@ -359,6 +380,17 @@ shell.result.data.exit_code
 shell.result.data.stdout
 shell.artifact.stdout
 write_file.artifact.written_file
+```
+
+You can inspect those contracts directly:
+
+```text
+/capabilities
+/capability shell_command --json
+/schema
+/schema inputs --json
+/tools
+/tool shell_command --example
 ```
 
 Example tool to agent handoff:

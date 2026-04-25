@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -46,6 +47,9 @@ class ToolDefinition:
     tool_type: str
     description: str
     config_shape: str
+    config_schema: dict[str, Any]
+    outputs: dict[str, str]
+    examples: list[dict[str, Any]]
     runner: ToolRunner
 
 
@@ -370,11 +374,17 @@ class ToolRegistry:
         *,
         description: str,
         config_shape: str,
+        config_schema: dict[str, Any],
+        outputs: dict[str, str],
+        examples: list[dict[str, Any]],
     ) -> None:
         self._definitions[tool_type] = ToolDefinition(
             tool_type=tool_type,
             description=description,
             config_shape=config_shape,
+            config_schema=deepcopy(config_schema),
+            outputs=deepcopy(outputs),
+            examples=deepcopy(examples),
             runner=runner,
         )
 
@@ -409,6 +419,26 @@ class ToolRegistry:
             for key in sorted(self._definitions)
         ]
 
+    def describe_tool(self, tool_type: str) -> dict[str, Any]:
+        definition = self._definitions.get(tool_type)
+        if definition is None:
+            raise ValueError(f"tool not found: {tool_type}")
+        return {
+            "name": definition.tool_type,
+            "type": "tool",
+            "description": definition.description,
+            "inputs": {
+                field: details.get("type", "unknown")
+                for field, details in definition.config_schema.items()
+            },
+            "outputs": deepcopy(definition.outputs),
+            "examples": deepcopy(definition.examples),
+            "config_schema": deepcopy(definition.config_schema),
+        }
+
+    def describe_all_tools(self) -> list[dict[str, Any]]:
+        return [self.describe_tool(tool.tool_type) for tool in self.list_tools()]
+
 
 _DEFAULT_REGISTRY: Optional[ToolRegistry] = None
 
@@ -422,18 +452,93 @@ def default_tool_registry() -> ToolRegistry:
             ReadFileTool(),
             description="Read a file deterministically and expose contents as normalized output.",
             config_shape='{"path": "notes.txt", "max_bytes": 65536}',
+            config_schema={
+                "path": {"type": "string", "required": True},
+                "max_bytes": {"type": "int", "required": False, "default": 65536},
+            },
+            outputs={
+                "result.text": "file contents as UTF-8 text",
+                "result.data.path": "resolved file path",
+                "result.data.size_bytes": "file size in bytes",
+                "result.data.truncated": "true when content exceeded max_bytes",
+                "artifact.file": "artifact path for the source file",
+            },
+            examples=[
+                {
+                    "label": "read_notes",
+                    "title": "Read notes",
+                    "task_kind": "tool",
+                    "tool_type": "read_file",
+                    "tool_config": {"path": "notes.txt"},
+                }
+            ],
         )
         registry.register(
             "write_file",
             WriteFileTool(),
             description="Write UTF-8 text to a file deterministically.",
             config_shape='{"path": "outputs/summary.txt", "content": "hello", "create_dirs": true, "overwrite": false}',
+            config_schema={
+                "path": {"type": "string", "required": True},
+                "content": {"type": "string", "required": True},
+                "create_dirs": {"type": "bool", "required": False, "default": False},
+                "overwrite": {"type": "bool", "required": False, "default": False},
+            },
+            outputs={
+                "result.text": "written file path",
+                "result.data.path": "resolved written file path",
+                "result.data.bytes_written": "number of bytes written",
+                "artifact.written_file": "artifact path for the written file",
+            },
+            examples=[
+                {
+                    "label": "write_report",
+                    "title": "Write report",
+                    "task_kind": "tool",
+                    "tool_type": "write_file",
+                    "tool_config": {
+                        "path": "outputs/report.txt",
+                        "content": "hello",
+                    },
+                }
+            ],
         )
         registry.register(
             "shell_command",
             ShellCommandTool(),
             description="Run a bounded argv command with shell=False and structured captured output.",
             config_shape='{"argv": ["python", "--version"], "cwd": ".", "timeout_s": 10, "capture_max_bytes": 65536, "env": {}}',
+            config_schema={
+                "argv": {"type": "list[string]", "required": True},
+                "cwd": {"type": "string", "required": False, "default": "."},
+                "timeout_s": {"type": "int", "required": False, "default": 30},
+                "capture_max_bytes": {"type": "int", "required": False, "default": 65536},
+                "env": {"type": "object[string,string]", "required": False, "default": {}},
+            },
+            outputs={
+                "result.text": "stdout text",
+                "result.data.argv": "executed argv list",
+                "result.data.cwd": "resolved working directory",
+                "result.data.exit_code": "process exit code or null on timeout/start failure",
+                "result.data.stdout": "captured stdout text",
+                "result.data.stderr": "captured stderr text",
+                "result.data.stdout_truncated": "true when stdout exceeded capture_max_bytes",
+                "result.data.stderr_truncated": "true when stderr exceeded capture_max_bytes",
+                "result.data.duration_s": "command duration in seconds",
+                "artifact.stdout": "artifact path for stdout when present",
+                "artifact.stderr": "artifact path for stderr when present",
+            },
+            examples=[
+                {
+                    "label": "python_version",
+                    "title": "Python version",
+                    "task_kind": "tool",
+                    "tool_type": "shell_command",
+                    "tool_config": {
+                        "argv": ["python3", "--version"],
+                    },
+                }
+            ],
         )
         _DEFAULT_REGISTRY = registry
     return _DEFAULT_REGISTRY
