@@ -180,10 +180,10 @@ def parse_input_reference(source: str) -> ParsedTaskReference:
     label, root = parts[0], parts[1]
     if not label:
         raise DataflowError("input reference missing source task label")
-    if root not in {"result", "stdout", "stderr", "artifact"}:
+    if root not in {"result", "stdout", "stderr", "artifact", "status", "condition_result", "skip_reason"}:
         raise DataflowError(f"unsupported input reference root '{root}'")
     path = tuple(parts[2:])
-    if root in {"stdout", "stderr"} and path:
+    if root in {"stdout", "stderr", "status", "condition_result", "skip_reason"} and path:
         raise DataflowError(f"unsupported input reference path '{source}'")
     if root == "artifact":
         if len(path) != 1 or not path[0]:
@@ -376,6 +376,8 @@ def resolve_task_input(
             resolved_type="missing",
             metadata={"reason": "missing_task"},
         )
+    if parsed.root in {"status", "condition_result", "skip_reason"}:
+        return _resolve_from_task_field(source_task, input_spec, parsed.root)
     if parsed.root == "result":
         return _resolve_from_output(source_task, input_spec, parsed, store)
     if parsed.root in {"stdout", "stderr"}:
@@ -387,6 +389,35 @@ def resolve_task_input(
             log_limit=log_limit,
         )
     return _resolve_from_artifact(source_task, input_spec, parsed, store)
+
+
+def _resolve_from_task_field(
+    task: Any,
+    input_spec: TaskInputSpec,
+    field_name: str,
+) -> ResolvedTaskInput:
+    value = getattr(task, field_name, None)
+    if field_name == "status":
+        value = getattr(value, "value", value)
+    nullable_fields = {"condition_result", "skip_reason"}
+    if value is None and field_name not in nullable_fields:
+        return ResolvedTaskInput(
+            name=input_spec.name,
+            source=input_spec.from_ref,
+            resolved_task_id=task.task_id,
+            resolved_type="missing",
+            metadata={"reason": f"missing_{field_name}"},
+        )
+    resolved_type = "text" if isinstance(value, str) else "json"
+    if isinstance(value, dict):
+        value = dict(value)
+    return ResolvedTaskInput(
+        name=input_spec.name,
+        source=input_spec.from_ref,
+        resolved_task_id=task.task_id,
+        resolved_type=resolved_type,
+        value=value,
+    )
 
 
 def materialize_task_inputs(

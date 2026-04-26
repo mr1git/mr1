@@ -96,7 +96,7 @@ def _format_workflow_detail(wf: Workflow) -> str:
         lines.append(f"finished: {_short_ts(wf.finished_at)}")
     lines.append("")
     lines.append("tasks:")
-    rows = [("LABEL", "TASK_ID", "STATUS", "DEPENDS_ON")]
+    rows = [("LABEL", "TASK_ID", "STATUS", "POLICY", "DEPENDS_ON")]
     for label, tid in wf.label_to_task_id.items():
         task = wf.tasks.get(tid)
         if task is None:
@@ -109,6 +109,7 @@ def _format_workflow_detail(wf: Workflow) -> str:
             label,
             tid,
             task.status.value,
+            task.dependency_policy,
             ",".join(dep_labels) or "-",
         ))
     lines.append(_render_table(rows, indent="  "))
@@ -124,6 +125,7 @@ def _format_task_detail(wf: Workflow, task: Task) -> str:
         f"status:     {task.status.value}",
         f"kind:       {task.task_kind}",
         f"agent:      {task.agent_type or '-'}",
+        f"dependency_policy: {task.dependency_policy}",
         f"depends_on: {', '.join(task.depends_on) or '-'}",
         f"created:    {_short_ts(task.created_at)}",
         f"started:    {_short_ts(task.started_at)}",
@@ -153,6 +155,17 @@ def _format_task_detail(wf: Workflow, task: Task) -> str:
         lines.append(f"prompt:     {task.materialized_prompt_path}")
     if task.dataflow_error:
         lines.append(f"dataflow:   {task.dataflow_error}")
+    lines.append(
+        f"run_if:     {json.dumps(task.run_if, sort_keys=True) if task.run_if is not None else '-'}"
+    )
+    lines.append(
+        "condition_result: "
+        + (
+            json.dumps(task.condition_result, sort_keys=True)
+            if task.condition_result is not None else "-"
+        )
+    )
+    lines.append(f"skip_reason: {task.skip_reason or '-'}")
     if task.status is TaskStatus.BLOCKED:
         lines.append(f"blocked_by:     {', '.join(task.blocked_by) or '-'}")
         lines.append(f"blocked_reason: {task.blocked_reason or '-'}")

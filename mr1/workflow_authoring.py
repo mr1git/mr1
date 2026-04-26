@@ -9,6 +9,7 @@ without changing scheduler behavior.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from dataclasses import dataclass, field
@@ -65,6 +66,18 @@ JSON_PREVIEW_PATTERNS = (
 )
 
 WORKFLOW_ID_PATTERN = re.compile(r"\bwf-\d{8}T\d{6}-[0-9a-f]{6}\b")
+
+_BRANCH_REASONING_PROMPT = """\
+You are summarizing a conditional workflow.
+
+Each upstream task may represent a branch:
+- status will be one of: succeeded, skipped, failed
+- condition_result explains why a conditional branch ran or skipped
+
+Use this information to:
+- identify which branch executed
+- explain why other branches were skipped
+- summarize the final outcome clearly"""
 
 _DEFAULT_COMPILER_SYSTEM_PROMPT = """\
 You compile natural language requests into MR1 workflow JSON.
@@ -130,6 +143,11 @@ def _spec_task_dict(raw: dict[str, Any]) -> dict[str, Any]:
     depends_on = list(raw.get("depends_on") or [])
     if depends_on:
         task["depends_on"] = depends_on
+    dependency_policy = raw.get("dependency_policy", "all_succeeded")
+    if dependency_policy != "all_succeeded":
+        task["dependency_policy"] = dependency_policy
+    if raw.get("run_if") is not None:
+        task["run_if"] = dict(raw["run_if"])
     inputs = raw.get("inputs") or []
     if inputs:
         task["inputs"] = [
@@ -173,6 +191,10 @@ def workflow_to_spec(workflow: Workflow) -> dict[str, Any]:
         dep_labels = [label for label in dep_labels if label]
         if dep_labels:
             task_spec["depends_on"] = dep_labels
+        if task.dependency_policy != "all_succeeded":
+            task_spec["dependency_policy"] = task.dependency_policy
+        if task.run_if is not None:
+            task_spec["run_if"] = dict(task.run_if)
         if task.inputs:
             task_spec["inputs"] = [item.to_dict() for item in task.inputs]
         if task.timeout_s is not None:
@@ -253,6 +275,15 @@ class ValidationResult:
 
 
 @dataclass(frozen=True)
+class BranchAnalysis:
+    branch_aware: bool
+    labels_with_run_if: frozenset[str]
+    join_labels: frozenset[str]
+    branch_dependency_labels: frozenset[str]
+    input_name_by_label: dict[str, str]
+
+
+@dataclass(frozen=True)
 class SubmissionResult:
     workflow_id: str
     message: str
@@ -260,6 +291,173 @@ class SubmissionResult:
 
 
 CompilerFn = Callable[[str, str], str]
+
+
+def _snake_case_label(value: str) -> str:
+    normalized = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+    return normalized or "task"
+
+
+def _task_label_input_names(tasks: list[dict[str, Any]]) -> dict[str, str]:
+    used: set[str] = set()
+    counts: dict[str, int] = {}
+    mapping: dict[str, str] = {}
+    for task in tasks:
+        label = task.get("label")
+        if not isinstance(label, str) or not label:
+            continue
+        base = _snake_case_label(label)
+        counts[base] = counts.get(base, 0) + 1
+        candidate = base
+        if candidate in used:
+            candidate = f"{base}_{counts[base]}"
+        while candidate in used:
+            counts[base] += 1
+            candidate = f"{base}_{counts[base]}"
+        used.add(candidate)
+        mapping[label] = candidate
+    return mapping
+
+
+def _analyze_branching(tasks: list[dict[str, Any]]) -> BranchAnalysis:
+    labels_with_run_if = frozenset(
+        task["label"]
+        for task in tasks
+        if isinstance(task.get("label"), str) and task.get("run_if") is not None
+    )
+    join_labels = frozenset(
+        task["label"]
+        for task in tasks
+        if isinstance(task.get("label"), str)
+        and task.get("dependency_policy") == "any_succeeded"
+    )
+    dependents_by_dep: dict[str, list[str]] = {}
+    for task in tasks:
+        label = task.get("label")
+        if not isinstance(label, str) or not label:
+            continue
+        for dep in task.get("depends_on") or []:
+            if isinstance(dep, str) and dep:
+                dependents_by_dep.setdefault(dep, []).append(label)
+    branch_dependency_labels = frozenset(
+        dep
+        for dep, dependents in dependents_by_dep.items()
+        if len(dependents) > 1 and any(label in labels_with_run_if for label in dependents)
+    )
+    return BranchAnalysis(
+        branch_aware=bool(labels_with_run_if or join_labels or branch_dependency_labels),
+        labels_with_run_if=labels_with_run_if,
+        join_labels=join_labels,
+        branch_dependency_labels=branch_dependency_labels,
+        input_name_by_label=_task_label_input_names(tasks),
+    )
+
+
+def _task_requires_branch_context(
+    task: dict[str, Any],
+    tasks_by_label: dict[str, dict[str, Any]],
+    analysis: BranchAnalysis,
+) -> bool:
+    label = task.get("label")
+    if not isinstance(label, str) or not label:
+        return False
+    if label in analysis.join_labels:
+        return True
+    for dep in task.get("depends_on") or []:
+        dep_task = tasks_by_label.get(dep)
+        if dep_task is not None and dep_task.get("run_if") is not None:
+            return True
+    return False
+
+
+def _task_requires_branch_prompt(
+    task: dict[str, Any],
+    tasks_by_label: dict[str, dict[str, Any]],
+    analysis: BranchAnalysis,
+) -> bool:
+    if task.get("task_kind", "agent") != "agent":
+        return False
+    label = task.get("label")
+    if not isinstance(label, str) or not label:
+        return False
+    deps = [dep for dep in (task.get("depends_on") or []) if isinstance(dep, str) and dep]
+    if label in analysis.join_labels:
+        return True
+    if len(deps) <= 1:
+        return False
+    return any(tasks_by_label.get(dep, {}).get("run_if") is not None for dep in deps)
+
+
+def _branch_context_inputs_for_task(
+    task: dict[str, Any],
+    tasks_by_label: dict[str, dict[str, Any]],
+    analysis: BranchAnalysis,
+) -> list[dict[str, str]]:
+    generated: list[dict[str, str]] = []
+    for dep in task.get("depends_on") or []:
+        if not isinstance(dep, str) or not dep:
+            continue
+        dep_task = tasks_by_label.get(dep)
+        if dep_task is None:
+            continue
+        name_base = analysis.input_name_by_label.get(dep, _snake_case_label(dep))
+        generated.append({
+            "name": f"{name_base}_status",
+            "from": f"{dep}.status",
+        })
+        if dep_task.get("run_if") is not None:
+            generated.append({
+                "name": f"{name_base}_condition",
+                "from": f"{dep}.condition_result",
+            })
+            generated.append({
+                "name": f"{name_base}_skip_reason",
+                "from": f"{dep}.skip_reason",
+            })
+    return generated
+
+
+def _merge_branch_context_inputs(
+    task: dict[str, Any],
+    generated: list[dict[str, str]],
+) -> None:
+    existing = task.get("inputs")
+    if existing is None:
+        task["inputs"] = list(generated)
+        return
+    if not isinstance(existing, list):
+        return
+
+    generated_by_name = {item["name"]: item["from"] for item in generated}
+    preserved_generated: set[str] = set()
+    merged: list[Any] = []
+    for item in existing:
+        if not isinstance(item, dict):
+            merged.append(item)
+            continue
+        name = item.get("name")
+        from_ref = item.get("from")
+        if isinstance(name, str) and name in generated_by_name:
+            if name not in preserved_generated and from_ref == generated_by_name[name]:
+                merged.append(item)
+                preserved_generated.add(name)
+            continue
+        merged.append(item)
+    for item in generated:
+        if item["name"] not in preserved_generated:
+            merged.append(item)
+    task["inputs"] = merged
+
+
+def _append_branch_reasoning_prompt(prompt: str) -> str:
+    if _BRANCH_REASONING_PROMPT in prompt:
+        return prompt
+    stripped = prompt.rstrip()
+    if not stripped:
+        return _BRANCH_REASONING_PROMPT
+    return f"{stripped}\n\n{_BRANCH_REASONING_PROMPT}"
 
 
 class WorkflowAuthoringService:
@@ -366,9 +564,10 @@ class WorkflowAuthoringService:
             baseline_spec=baseline_spec,
         )
         raw = compiler(self._build_compiler_system_prompt(), prompt)
-        return _extract_json_object(raw)
+        return self._normalize_compiled_spec(_extract_json_object(raw))
 
     def validate_and_maybe_fix(self, spec: dict[str, Any]) -> ValidationResult:
+        spec = self._normalize_compiled_spec(spec)
         try:
             validate_spec(
                 spec,
@@ -382,9 +581,9 @@ class WorkflowAuthoringService:
         compiler = self._require_compiler()
         fix_prompt = self._build_fix_prompt(spec, first_error)
         try:
-            fixed = _extract_json_object(
+            fixed = self._normalize_compiled_spec(_extract_json_object(
                 compiler(self._build_compiler_system_prompt(), fix_prompt)
-            )
+            ))
         except (json.JSONDecodeError, WorkflowSpecError, ValueError) as exc:
             return ValidationResult(
                 ok=False,
@@ -409,6 +608,7 @@ class WorkflowAuthoringService:
         return ValidationResult(ok=True, spec=fixed, corrected=True)
 
     def preview(self, spec: dict[str, Any]) -> tuple[str, str]:
+        spec = self._normalize_compiled_spec(spec)
         tasks = list(spec.get("tasks") or [])
         complexity = "simple" if self._is_simple_workflow(spec) else "complex"
         lines = ["This workflow will:"]
@@ -437,6 +637,7 @@ class WorkflowAuthoringService:
         created_by: Provenance,
         target_workflow_id: Optional[str] = None,
     ) -> SubmissionResult:
+        spec = self._normalize_compiled_spec(spec)
         if target_workflow_id:
             workflow = self._store.load_workflow(target_workflow_id)
             if workflow is not None:
@@ -472,6 +673,33 @@ class WorkflowAuthoringService:
         if mode == "modify" and target_workflow_id is None:
             return "I need a workflow id to modify. Reference the workflow as `wf-...` or reply to a pending preview."
         return f"I couldn't produce a valid workflow yet: {error}"
+
+    def _normalize_compiled_spec(self, spec: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(spec, dict):
+            return spec
+        normalized = deepcopy(spec)
+        tasks = normalized.get("tasks")
+        if not isinstance(tasks, list):
+            return normalized
+        task_dicts = [task for task in tasks if isinstance(task, dict)]
+        analysis = _analyze_branching(task_dicts)
+        if not analysis.branch_aware:
+            return normalized
+
+        tasks_by_label = {
+            task["label"]: task
+            for task in task_dicts
+            if isinstance(task.get("label"), str) and task.get("label")
+        }
+        for task in task_dicts:
+            if _task_requires_branch_context(task, tasks_by_label, analysis):
+                _merge_branch_context_inputs(
+                    task,
+                    _branch_context_inputs_for_task(task, tasks_by_label, analysis),
+                )
+            if _task_requires_branch_prompt(task, tasks_by_label, analysis):
+                task["prompt"] = _append_branch_reasoning_prompt(task.get("prompt", ""))
+        return normalized
 
     def _require_compiler(self) -> CompilerFn:
         if self._compiler is None:
@@ -649,6 +877,8 @@ class WorkflowAuthoringService:
                     tool_type=raw.get("tool_type"),
                     tool_config=dict(raw.get("tool_config", {})),
                     condition=dict(raw["condition"]) if raw.get("condition") is not None else None,
+                    run_if=dict(raw["run_if"]) if raw.get("run_if") is not None else None,
+                    dependency_policy=raw.get("dependency_policy", "all_succeeded"),
                     created_by=created_by,
                     timeout_s=raw.get("timeout_s"),
                     inputs=[],
@@ -670,6 +900,8 @@ class WorkflowAuthoringService:
             task.tool_type = raw.get("tool_type")
             task.tool_config = dict(raw.get("tool_config", {}))
             task.condition = dict(raw["condition"]) if raw.get("condition") is not None else None
+            task.run_if = dict(raw["run_if"]) if raw.get("run_if") is not None else None
+            task.dependency_policy = raw.get("dependency_policy", "all_succeeded")
             task.timeout_s = raw.get("timeout_s")
             task.inputs = []
             for item in raw.get("inputs") or []:

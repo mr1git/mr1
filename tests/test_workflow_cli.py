@@ -140,6 +140,10 @@ class TestReadCommands:
         assert a_id in out
         assert "label:" in out
         assert "status:" in out
+        assert "dependency_policy:" in out
+        assert "run_if:" in out
+        assert "condition_result:" in out
+        assert "skip_reason:" in out
 
     def test_task_not_found(self, store, capsys):
         rc = workflow_cli.main(["task", "tk-nope"], store=store)
@@ -241,7 +245,7 @@ class TestReadCommands:
 
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
-        assert set(payload) == {"workflow", "task", "inputs", "refs", "task-kinds"}
+        assert set(payload) == {"workflow", "task", "inputs", "refs", "conditions", "task-kinds"}
 
     def test_schema_inputs_json_output(self, store, capsys):
         rc = workflow_cli.main(["schema", "inputs", "--json"], store=store)

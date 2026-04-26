@@ -5,11 +5,10 @@ The scheduler owns the lifecycle of every task in every workflow it
 discovers under its `WorkflowStore` root. It is intentionally dumb:
 
   * no LLM reasoning,
-  * no conditional branching (Phase 1),
+  * deterministic conditional branching,
   * no retry/backoff policies (Phase 1),
-  * dependency rule is "all parents succeeded",
-  * if a parent reaches a non-succeeded terminal status, all descendants
-    transition to `blocked`.
+  * dependency gates are explicit and deterministic,
+  * false conditions and non-winning branch paths transition to `skipped`.
 
 The scheduler runs inside the MR1 process only (Phase 1). The CLI writes
 a new workflow directory to disk and exits; the MR1-owned scheduler
@@ -26,7 +25,7 @@ Every state change follows the same atomic shape:
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 import threading
 import time
 from datetime import datetime, timezone
@@ -34,6 +33,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mr1.agents import AgentRegistry, default_agent_registry
+from mr1.conditions import (
+    ConditionEvaluation,
+    SUPPORTED_DEPENDENCY_POLICIES,
+    evaluate_condition,
+    validate_condition,
+    validate_dependency_policy,
+)
 from mr1 import workflow_events as ev
 from mr1.dataflow import (
     DataflowError,
@@ -85,6 +91,13 @@ def _now_iso() -> str:
 
 
 _UNSET = object()
+
+
+@dataclass(frozen=True)
+class DependencyGateDecision:
+    state: str
+    reason: str
+    blocked_by: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +182,14 @@ def validate_spec(
             raise WorkflowSpecError(
                 f"task '{label}': task_kind '{task_kind}' not supported"
             )
+        try:
+            validate_dependency_policy(
+                raw.get("dependency_policy", "all_succeeded"),
+                task_label=label,
+            )
+            validate_condition(raw.get("run_if"), spec, raw)
+        except ValueError as exc:
+            raise WorkflowSpecError(str(exc)) from exc
 
     # depends_on reference check.
     depends_on_by_label: dict[str, list[str]] = {}
@@ -289,6 +310,8 @@ def build_workflow_from_spec(
             tool_type=raw.get("tool_type"),
             tool_config=dict(raw.get("tool_config", {})),
             condition=dict(raw["condition"]) if raw.get("condition") is not None else None,
+            run_if=dict(raw["run_if"]) if raw.get("run_if") is not None else None,
+            dependency_policy=raw.get("dependency_policy", "all_succeeded"),
             status=TaskStatus.CREATED,
             created_by=created_by,
             timeout_s=raw.get("timeout_s"),
@@ -463,6 +486,10 @@ def _task_spec_for_workflow(workflow: Workflow, task: Task) -> dict[str, Any]:
     }
     if dep_labels:
         task_spec["depends_on"] = dep_labels
+    if task.dependency_policy != "all_succeeded":
+        task_spec["dependency_policy"] = task.dependency_policy
+    if task.run_if is not None:
+        task_spec["run_if"] = dict(task.run_if)
     if task.inputs:
         task_spec["inputs"] = [item.to_dict() for item in task.inputs]
     if task.timeout_s is not None:
@@ -502,13 +529,105 @@ def _reopen_workflow(workflow: Workflow) -> None:
         workflow.status = WorkflowStatus.PENDING
 
 
-def _status_for_dependencies(workflow: Workflow, task: Task) -> TaskStatus:
-    parents_ok = all(
+def _evaluate_dependency_gate(workflow: Workflow, task: Task) -> DependencyGateDecision:
+    if not task.depends_on:
+        return DependencyGateDecision("pass", "no dependencies; ready to run")
+
+    policy = task.dependency_policy
+    if policy not in SUPPORTED_DEPENDENCY_POLICIES:
+        policy = "all_succeeded"
+
+    if policy == "all_succeeded":
+        failed_parents = [
+            parent_id
+            for parent_id in task.depends_on
+            if (parent := workflow.tasks.get(parent_id)) is not None
+            and parent.status in FAILED_TASK_STATUSES
+        ]
+        if failed_parents:
+            parent_statuses = [
+                f"{workflow.tasks[parent_id].label}={workflow.tasks[parent_id].status.value}"
+                for parent_id in failed_parents
+            ]
+            return DependencyGateDecision(
+                "block",
+                ", ".join(parent_statuses),
+                blocked_by=failed_parents,
+            )
+        skipped_parents = [
+            parent_id
+            for parent_id in task.depends_on
+            if (parent := workflow.tasks.get(parent_id)) is not None
+            and parent.status is TaskStatus.SKIPPED
+        ]
+        if skipped_parents:
+            return DependencyGateDecision(
+                "skip",
+                "dependency branch skipped under all_succeeded",
+            )
+        parents_ok = all(
+            (parent := workflow.tasks.get(parent_id)) is not None
+            and parent.status is TaskStatus.SUCCEEDED
+            for parent_id in task.depends_on
+        )
+        if parents_ok:
+            return DependencyGateDecision("pass", "all dependencies succeeded")
+        return DependencyGateDecision(
+            "wait",
+            f"waiting on {len(task.depends_on)} dependency(ies)",
+        )
+
+    all_terminal = all(
+        (parent := workflow.tasks.get(parent_id)) is not None
+        and parent.is_terminal()
+        for parent_id in task.depends_on
+    )
+    if not all_terminal:
+        return DependencyGateDecision(
+            "wait",
+            f"waiting on {len(task.depends_on)} dependency(ies)",
+        )
+    if any(
         (parent := workflow.tasks.get(parent_id)) is not None
         and parent.status is TaskStatus.SUCCEEDED
         for parent_id in task.depends_on
+    ):
+        return DependencyGateDecision("pass", "dependency policy any_succeeded satisfied")
+    return DependencyGateDecision("skip", "no dependency succeeded under any_succeeded")
+
+
+def _status_for_reset(workflow: Workflow, task: Task) -> TaskStatus:
+    gate = _evaluate_dependency_gate(workflow, task)
+    return TaskStatus.READY if gate.state == "pass" else TaskStatus.WAITING
+
+
+def _condition_message(evaluation: ConditionEvaluation) -> str:
+    if evaluation.expected is None:
+        return f"{evaluation.ref} {evaluation.op} evaluated {'true' if evaluation.passed else 'false'}"
+    return (
+        f"{evaluation.ref} {evaluation.op} {evaluation.expected} "
+        f"evaluated {'true' if evaluation.passed else 'false'}"
     )
-    return TaskStatus.READY if parents_ok else TaskStatus.WAITING
+
+
+def _condition_event_payload(
+    task: Task,
+    evaluation: ConditionEvaluation,
+) -> tuple[str, str, dict[str, Any]]:
+    return (
+        ev.CONDITION_EVALUATED,
+        _condition_message(evaluation),
+        {
+            "task_id": task.task_id,
+            "ref": evaluation.ref,
+            "op": evaluation.op,
+            "expected": evaluation.expected,
+            "actual": evaluation.actual,
+            "passed": evaluation.passed,
+            "reason": evaluation.reason,
+            **dict(evaluation.metadata),
+        },
+    )
 
 
 def _attempt_result_payload(
@@ -600,16 +719,12 @@ def rerun_task_on_disk(
             TaskStatus.TIMED_OUT,
             TaskStatus.CANCELLED,
             TaskStatus.SUCCEEDED,
+            TaskStatus.SKIPPED,
         }:
             raise WorkflowSpecError(
                 f"task cannot be rerun from status '{task.status.value}': {task.label}"
             )
-        parents_ok = all(
-            (parent := workflow.tasks.get(parent_id)) is not None
-            and parent.status is TaskStatus.SUCCEEDED
-            for parent_id in task.depends_on
-        )
-        task.status = TaskStatus.READY if parents_ok else TaskStatus.WAITING
+        task.status = _status_for_reset(workflow, task)
         task.started_at = None
         task.finished_at = None
         task.pid = None
@@ -624,6 +739,8 @@ def rerun_task_on_disk(
         task.blocked_by = []
         task.blocked_reason = None
         task.blocked_at = None
+        task.skip_reason = None
+        task.condition_result = None
         task.watch_started_at = None
         task.watch_satisfied_at = None
         task.last_checked_at = None
@@ -808,6 +925,8 @@ def _new_task_from_spec(
         tool_type=raw.get("tool_type"),
         tool_config=dict(raw.get("tool_config", {})),
         condition=dict(raw["condition"]) if raw.get("condition") is not None else None,
+        run_if=dict(raw["run_if"]) if raw.get("run_if") is not None else None,
+        dependency_policy=raw.get("dependency_policy", "all_succeeded"),
         created_by=created_by,
         timeout_s=raw.get("timeout_s"),
         inputs=[
@@ -964,6 +1083,7 @@ def replace_workflow_on_disk(
             TaskStatus.FAILED,
             TaskStatus.TIMED_OUT,
             TaskStatus.CANCELLED,
+            TaskStatus.SKIPPED,
         }:
             raise WorkflowSpecError(
                 f"replace-workflow allowed only for unstarted or failed/cancelled tasks: {task.label}"
@@ -991,6 +1111,8 @@ def replace_workflow_on_disk(
         task.tool_type = raw.get("tool_type")
         task.tool_config = dict(raw.get("tool_config", {}))
         task.condition = dict(raw["condition"]) if raw.get("condition") is not None else None
+        task.run_if = dict(raw["run_if"]) if raw.get("run_if") is not None else None
+        task.dependency_policy = raw.get("dependency_policy", "all_succeeded")
         task.timeout_s = raw.get("timeout_s")
         task.inputs = [
             TaskInputSpec.from_dict(item)
@@ -1000,7 +1122,7 @@ def replace_workflow_on_disk(
             workflow.label_to_task_id[label]
             for label in (raw.get("depends_on") or [])
         ]
-        task.status = _status_for_dependencies(workflow, task)
+        task.status = _status_for_reset(workflow, task)
         task.started_at = None
         task.finished_at = None
         task.pid = None
@@ -1015,6 +1137,8 @@ def replace_workflow_on_disk(
         task.blocked_by = []
         task.blocked_reason = None
         task.blocked_at = None
+        task.skip_reason = None
+        task.condition_result = None
         task.watch_started_at = None
         task.watch_satisfied_at = None
         task.last_checked_at = None
@@ -1237,12 +1361,11 @@ class Scheduler:
         One deterministic pass over every on-disk workflow.
 
         Order per workflow:
-          1. Poll running tasks and persist terminal transitions.
-          2. Cascade failures → blocked.
-          3. Promote waiting → ready when all parents succeeded.
-          4. Promote created → waiting/ready on first sight.
+          1. Promote created tasks into queued states.
+          2. Poll running tasks and persist terminal transitions.
+          3. Reconcile non-running tasks against dependency policies and conditions.
+          4. Finalise the workflow when every task is terminal.
           5. Launch ready tasks up to the concurrency cap.
-          6. Finalise the workflow when every task is terminal.
         """
         for wf in self._store.list_workflows():
             self._reconcile_external_control(wf)
@@ -1269,25 +1392,19 @@ class Scheduler:
     def _tick_workflow(self, wf: Workflow) -> None:
         changed = False
 
-        # 0. Promote created → waiting/ready on first discovery.
+        # 0. Promote created tasks into queued states on first discovery.
         changed |= self._initialize_created_tasks(wf)
 
         # 1. Poll running tasks.
         changed |= self._poll_running_tasks(wf)
 
-        # 2. Cascade failures to dependents.
-        changed |= self._cascade_blocked(wf)
+        # 2. Reconcile dependency gates and task-level conditions.
+        changed |= self._reconcile_queued_tasks(wf)
 
-        # 3. Recover previously blocked tasks when dependencies recover.
-        changed |= self._recover_blocked(wf)
-
-        # 4. Promote waiting → ready.
-        changed |= self._promote_ready(wf)
-
-        # 5. Workflow-level transitions.
+        # 3. Workflow-level transitions.
         changed |= self._transition_workflow_status(wf)
 
-        # 6. Launch ready tasks (bounded by concurrency).
+        # 4. Launch ready tasks (bounded by concurrency).
         self._launch_ready(wf)
 
         # Nothing persists here — every mutation above went through
@@ -1298,17 +1415,33 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _initialize_created_tasks(self, wf: Workflow) -> bool:
-        """Move newly-seen `created` tasks to `waiting` or `ready`."""
+        """Move newly-seen `created` tasks into their initial queued state."""
         changed = False
         for task in wf.tasks.values():
             if task.status is not TaskStatus.CREATED:
                 continue
-            if not task.depends_on:
-                self._commit(wf, task, TaskStatus.READY, event=ev.TASK_READY,
-                             message="no dependencies; ready to run")
+            gate = _evaluate_dependency_gate(wf, task)
+            if gate.state == "wait":
+                self._commit(
+                    wf,
+                    task,
+                    TaskStatus.WAITING,
+                    event=ev.TASK_CREATED,
+                    message=gate.reason,
+                    pid=None,
+                    finished_at=None,
+                    blocked_by=[],
+                    blocked_reason=None,
+                    blocked_at=None,
+                    skip_reason=None,
+                    condition_result=None,
+                )
+            elif gate.state == "block":
+                self._commit_blocked(wf, task, gate)
+            elif gate.state == "skip":
+                self._commit_skipped(wf, task, gate.reason)
             else:
-                self._commit(wf, task, TaskStatus.WAITING, event=ev.TASK_CREATED,
-                             message=f"waiting on {len(task.depends_on)} dependency(ies)")
+                self._promote_task_ready(wf, task, gate.reason)
             changed = True
         return changed
 
@@ -1678,86 +1811,180 @@ class Scheduler:
         )
         return True
 
-    def _cascade_blocked(self, wf: Workflow) -> bool:
-        changed = False
-        for task in list(wf.tasks.values()):
-            if task.is_terminal() or task.status is TaskStatus.RUNNING:
-                continue
-            failed_parents = [
-                parent_id for parent_id in task.depends_on
-                if (p := wf.tasks.get(parent_id)) is not None
-                and p.status in FAILED_TASK_STATUSES
-            ]
-            if not failed_parents:
-                continue
-            parent_statuses = [
-                f"{wf.tasks[pid].label}={wf.tasks[pid].status.value}"
-                for pid in failed_parents
-            ]
-            self._commit(
-                wf, task, TaskStatus.BLOCKED, event=ev.TASK_BLOCKED,
-                message=f"blocked by {', '.join(parent_statuses)}",
-                finished=True,
-                blocked_by=failed_parents,
-                blocked_reason=", ".join(parent_statuses),
-                blocked_at=_now_iso(),
-            )
-            changed = True
-        return changed
-
-    def _promote_ready(self, wf: Workflow) -> bool:
+    def _reconcile_queued_tasks(self, wf: Workflow) -> bool:
         changed = False
         for task in wf.tasks.values():
-            if task.status is not TaskStatus.WAITING:
+            if task.status in {
+                TaskStatus.RUNNING,
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.TIMED_OUT,
+                TaskStatus.CANCELLED,
+            }:
                 continue
-            parents_ok = all(
-                (p := wf.tasks.get(pid)) is not None
-                and p.status is TaskStatus.SUCCEEDED
-                for pid in task.depends_on
-            )
-            if parents_ok:
-                self._commit(
-                    wf, task, TaskStatus.READY, event=ev.TASK_READY,
-                    message="all dependencies succeeded",
-                )
+            gate = _evaluate_dependency_gate(wf, task)
+            if task.status is TaskStatus.SKIPPED:
+                if gate.state == "skip":
+                    continue
+                if gate.state == "pass":
+                    continue
+                if gate.state == "wait":
+                    self._commit(
+                        wf,
+                        task,
+                        TaskStatus.WAITING,
+                        event=None,
+                        message=gate.reason,
+                        pid=None,
+                        finished_at=None,
+                        blocked_by=[],
+                        blocked_reason=None,
+                        blocked_at=None,
+                        skip_reason=None,
+                        condition_result=None,
+                    )
+                else:
+                    self._commit_blocked(wf, task, gate)
                 changed = True
+                continue
+            if gate.state == "block":
+                if task.status is not TaskStatus.BLOCKED or task.blocked_by != gate.blocked_by:
+                    self._commit_blocked(wf, task, gate)
+                    changed = True
+                continue
+            if gate.state == "skip":
+                if task.status is not TaskStatus.SKIPPED or task.skip_reason != gate.reason:
+                    self._commit_skipped(wf, task, gate.reason)
+                    changed = True
+                continue
+            if gate.state == "wait":
+                if task.status is TaskStatus.BLOCKED:
+                    self._commit(
+                        wf,
+                        task,
+                        TaskStatus.WAITING,
+                        event=ev.TASK_UNBLOCKED,
+                        message="dependencies recovered",
+                        pid=None,
+                        finished_at=None,
+                        blocked_by=[],
+                        blocked_reason=None,
+                        blocked_at=None,
+                        skip_reason=None,
+                        condition_result=None,
+                    )
+                    changed = True
+                elif task.status in {TaskStatus.READY, TaskStatus.WAITING}:
+                    if task.status is not TaskStatus.WAITING:
+                        self._commit(
+                            wf,
+                            task,
+                            TaskStatus.WAITING,
+                            event=None,
+                            message=gate.reason,
+                            pid=None,
+                            finished_at=None,
+                            blocked_by=[],
+                            blocked_reason=None,
+                            blocked_at=None,
+                            skip_reason=None,
+                            condition_result=None,
+                        )
+                        changed = True
+                continue
+            if task.status is TaskStatus.READY and (
+                task.run_if is None or task.condition_result is not None
+            ):
+                continue
+            changed |= self._promote_task_ready(wf, task, gate.reason)
         return changed
 
-    def _recover_blocked(self, wf: Workflow) -> bool:
-        changed = False
-        for task in wf.tasks.values():
-            if task.status is not TaskStatus.BLOCKED:
-                continue
-            if task.last_error_type == "cancelled":
-                continue
-            failed_parents = [
-                parent_id for parent_id in task.depends_on
-                if (parent := wf.tasks.get(parent_id)) is not None
-                and parent.status in FAILED_TASK_STATUSES
-            ]
-            if failed_parents:
-                continue
-            parents_ok = all(
-                (parent := wf.tasks.get(parent_id)) is not None
-                and parent.status is TaskStatus.SUCCEEDED
-                for parent_id in task.depends_on
-            )
-            with self._store.locked():
-                task.status = TaskStatus.READY if parents_ok else TaskStatus.WAITING
-                task.finished_at = None
-                task.blocked_by = []
-                task.blocked_reason = None
-                task.blocked_at = None
-                self._store.save_workflow(wf)
-                self._events.task_unblocked(
-                    wf.workflow_id,
-                    task.task_id,
-                    agent_id=self._agent_id,
-                    message="dependencies recovered",
-                    metadata={"status": task.status.value},
+    def _promote_task_ready(
+        self,
+        wf: Workflow,
+        task: Task,
+        dependency_reason: str,
+    ) -> bool:
+        extra_events: list[tuple[str, str, dict[str, Any]]] = []
+        ready_condition_result: Optional[dict[str, Any]] = None
+        if task.run_if is not None:
+            evaluation = evaluate_condition(task.run_if, wf, task, self._store)
+            extra_events.append(_condition_event_payload(task, evaluation))
+            if not evaluation.passed:
+                self._commit_skipped(
+                    wf,
+                    task,
+                    _condition_message(evaluation),
+                    condition_result=evaluation,
+                    extra_events=extra_events,
                 )
-            changed = True
-        return changed
+                return True
+            dependency_reason = _condition_message(evaluation)
+            ready_condition_result = evaluation.to_dict()
+        if task.status is TaskStatus.READY and task.condition_result == ready_condition_result:
+            return False
+        self._commit(
+            wf,
+            task,
+            TaskStatus.READY,
+            event=ev.TASK_READY,
+            message=dependency_reason,
+            pid=None,
+            finished_at=None,
+            blocked_by=[],
+            blocked_reason=None,
+            blocked_at=None,
+            skip_reason=None,
+            condition_result=ready_condition_result,
+            extra_events=extra_events,
+        )
+        return True
+
+    def _commit_blocked(
+        self,
+        wf: Workflow,
+        task: Task,
+        gate: DependencyGateDecision,
+    ) -> None:
+        self._commit(
+            wf,
+            task,
+            TaskStatus.BLOCKED,
+            event=ev.TASK_BLOCKED,
+            message=f"blocked by {gate.reason}",
+            finished=True,
+            pid=None,
+            blocked_by=gate.blocked_by,
+            blocked_reason=gate.reason,
+            blocked_at=_now_iso(),
+            skip_reason=None,
+            condition_result=None,
+        )
+
+    def _commit_skipped(
+        self,
+        wf: Workflow,
+        task: Task,
+        skip_reason: str,
+        *,
+        condition_result: Optional[ConditionEvaluation] = None,
+        extra_events: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
+    ) -> None:
+        self._commit(
+            wf,
+            task,
+            TaskStatus.SKIPPED,
+            event=ev.TASK_SKIPPED,
+            message=skip_reason,
+            finished=True,
+            pid=None,
+            blocked_by=[],
+            blocked_reason=None,
+            blocked_at=None,
+            skip_reason=skip_reason,
+            condition_result=condition_result.to_dict() if condition_result is not None else None,
+            extra_events=extra_events,
+        )
 
     def _transition_workflow_status(self, wf: Workflow) -> bool:
         """Flip `pending → running → succeeded/failed` based on tasks."""
@@ -1786,7 +2013,7 @@ class Scheduler:
             else:
                 target = WorkflowStatus.SUCCEEDED
                 event_type = ev.WORKFLOW_SUCCEEDED
-                message = "all tasks succeeded"
+                message = "all tasks completed without failure"
 
         if target is None or target is wf.status:
             return False
@@ -1839,6 +2066,8 @@ class Scheduler:
             task.blocked_by = []
             task.blocked_reason = None
             task.blocked_at = None
+            task.skip_reason = None
+            task.condition_result = None
             task.watch_satisfied_at = None
             task.last_checked_at = None
             task.last_check_result = None
@@ -1910,8 +2139,8 @@ class Scheduler:
         artifacts: Optional[list[Any]] = None,
         dataflow_error: Any = _UNSET,
         blocked_by: Optional[list[str]] = None,
-        blocked_reason: Optional[str] = None,
-        blocked_at: Optional[str] = None,
+        blocked_reason: Any = _UNSET,
+        blocked_at: Any = _UNSET,
         watch_satisfied_at: Any = _UNSET,
         last_checked_at: Any = _UNSET,
         last_check_result: Any = _UNSET,
@@ -1949,9 +2178,9 @@ class Scheduler:
                 task.dataflow_error = dataflow_error
             if blocked_by is not None:
                 task.blocked_by = list(blocked_by)
-            if blocked_reason is not None:
+            if blocked_reason is not _UNSET:
                 task.blocked_reason = blocked_reason
-            if blocked_at is not None:
+            if blocked_at is not _UNSET:
                 task.blocked_at = blocked_at
             if watch_satisfied_at is not _UNSET:
                 task.watch_satisfied_at = watch_satisfied_at
@@ -2286,11 +2515,13 @@ class Scheduler:
         task: Task,
         new_status: TaskStatus,
         *,
-        event: str,
+        event: Optional[str],
         message: str = "",
         started: bool = False,
         finished: bool = False,
         attempt_id: Optional[int] = None,
+        started_at: Any = _UNSET,
+        finished_at: Any = _UNSET,
         pid: Any = _UNSET,
         exit_code: Any = _UNSET,
         last_error: Any = _UNSET,
@@ -2307,6 +2538,8 @@ class Scheduler:
         blocked_by: Optional[list[str]] = None,
         blocked_reason: Optional[str] = None,
         blocked_at: Optional[str] = None,
+        skip_reason: Any = _UNSET,
+        condition_result: Any = _UNSET,
         watch_started: bool = False,
         watch_satisfied_at: Any = _UNSET,
         last_checked_at: Any = _UNSET,
@@ -2328,8 +2561,12 @@ class Scheduler:
             task.status = new_status
             if started:
                 task.started_at = _now_iso()
+            elif started_at is not _UNSET:
+                task.started_at = started_at
             if finished:
                 task.finished_at = _now_iso()
+            elif finished_at is not _UNSET:
+                task.finished_at = finished_at
             if pid is not _UNSET:
                 task.pid = pid
             if exit_code is not _UNSET:
@@ -2362,6 +2599,13 @@ class Scheduler:
                 task.blocked_reason = blocked_reason
             if blocked_at is not None:
                 task.blocked_at = blocked_at
+            if skip_reason is not _UNSET:
+                task.skip_reason = skip_reason
+            if condition_result is not _UNSET:
+                task.condition_result = (
+                    dict(condition_result)
+                    if condition_result is not None else None
+                )
             if watch_started and task.watch_started_at is None:
                 task.watch_started_at = _now_iso()
             if watch_satisfied_at is not _UNSET:
@@ -2402,14 +2646,19 @@ class Scheduler:
                 metadata["error"] = task.last_error
             if task.last_error_type:
                 metadata["error_type"] = task.last_error_type
-            self._events.emit(
-                event, wf.workflow_id,
-                task_id=task.task_id,
-                attempt_id=active_attempt_id,
-                agent_id=self._agent_id,
-                message=message,
-                metadata=metadata,
-            )
+            if task.skip_reason:
+                metadata["skip_reason"] = task.skip_reason
+            if task.condition_result:
+                metadata["condition_result"] = dict(task.condition_result)
+            if event is not None:
+                self._events.emit(
+                    event, wf.workflow_id,
+                    task_id=task.task_id,
+                    attempt_id=active_attempt_id,
+                    agent_id=self._agent_id,
+                    message=message,
+                    metadata=metadata,
+                )
             for event_type, event_message, event_metadata in extra_events or []:
                 self._events.emit(
                     event_type,

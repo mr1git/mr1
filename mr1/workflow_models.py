@@ -11,6 +11,7 @@ Status meaning:
   ready       — all dependencies satisfied, scheduler may launch
   running     — runner has an active process/handle for this task
   succeeded   — terminal, clean exit
+  skipped     — terminal, intentionally not executed
   failed      — terminal, non-zero exit for a reason other than timeout
   timed_out   — terminal, killed after exceeding timeout
   cancelled   — terminal, cancelled by user or shutdown
@@ -39,6 +40,7 @@ class TaskStatus(str, Enum):
     READY = "ready"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
+    SKIPPED = "skipped"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"
@@ -55,6 +57,7 @@ class WorkflowStatus(str, Enum):
 
 TERMINAL_TASK_STATUSES = frozenset({
     TaskStatus.SUCCEEDED,
+    TaskStatus.SKIPPED,
     TaskStatus.FAILED,
     TaskStatus.TIMED_OUT,
     TaskStatus.CANCELLED,
@@ -182,6 +185,8 @@ class Task:
     last_checked_at: Optional[str] = None
     last_check_result: Optional[dict[str, Any]] = None
     condition: Optional[dict[str, Any]] = None
+    run_if: Optional[dict[str, Any]] = None
+    dependency_policy: str = "all_succeeded"
     depends_on: list[str] = field(default_factory=list)
     inputs: list[TaskInputSpec] = field(default_factory=list)
     attempt_count: int = 0
@@ -208,6 +213,8 @@ class Task:
     blocked_reason: Optional[str] = None
     blocked_by: list[str] = field(default_factory=list)
     blocked_at: Optional[str] = None
+    skip_reason: Optional[str] = None
+    condition_result: Optional[dict[str, Any]] = None
     timeout_s: Optional[int] = None
 
     def is_terminal(self) -> bool:
@@ -247,6 +254,9 @@ class Task:
             if data.get("last_check_result") is not None else None,
             condition=dict(data["condition"])
             if data.get("condition") is not None else None,
+            run_if=dict(data["run_if"])
+            if data.get("run_if") is not None else None,
+            dependency_policy=data.get("dependency_policy", "all_succeeded"),
             depends_on=list(data.get("depends_on", [])),
             inputs=[
                 TaskInputSpec.from_dict(item)
@@ -285,6 +295,9 @@ class Task:
             blocked_reason=data.get("blocked_reason"),
             blocked_by=list(data.get("blocked_by", [])),
             blocked_at=data.get("blocked_at"),
+            skip_reason=data.get("skip_reason"),
+            condition_result=dict(data["condition_result"])
+            if data.get("condition_result") is not None else None,
             timeout_s=data.get("timeout_s"),
         )
 

@@ -155,7 +155,7 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/workflow cancel <id>` | Cancel one workflow |
 | `/workflow append <id> <path>` | Append task(s) from a JSON fragment |
 | `/workflow insert <id> <after_task> <path>` | Insert one task after an existing task |
-| `/workflow replace [-r] <id> <task> <path>` | Replace one unstarted or failed task, optionally rerunning immediately |
+| `/workflow replace [-r] <id> <task> <path>` | Replace one unstarted, failed, cancelled, or skipped task, optionally rerunning immediately |
 | `/workflow trigger <id> <label-or-task-id> [event_name]` | Trigger a manual watcher |
 | `/task cancel <task_id>` | Cancel one task |
 | `/task <id>` | Show one task's detail |
@@ -243,7 +243,7 @@ mr1/memory/workflows/<wf_id>/tasks/<task_id>/attempts/<attempt_id>/
 
 Task control semantics:
 
-- `rerun` resets a task in `failed`, `timed_out`, `cancelled`, or `succeeded` state back to `waiting` or `ready` without deleting prior attempts.
+- `rerun` resets a task in `failed`, `timed_out`, `cancelled`, `succeeded`, or `skipped` state back to `waiting` or `ready` without deleting prior attempts.
 - the next real launch allocates the next `attempt_id`; rerun itself does not consume an attempt number.
 - `cancel-task` cancels a running task or marks a queued task as cancelled.
 - `cancel-workflow` cancels every non-terminal task in the workflow.
@@ -252,13 +252,94 @@ Workflow mutation semantics:
 
 - `append` adds new task nodes without changing existing task definitions.
 - `insert` adds one task after an existing task and rewires that task's direct children through the inserted node.
-- `replace` keeps the same `task_id` and label, but swaps the task definition for an unstarted task or a failed/timed-out/cancelled task.
+- `replace` keeps the same `task_id` and label, but swaps the task definition for an unstarted task or a failed/timed-out/cancelled/skipped task.
 - plain `replace` stops with the replaced task in `ready` or `waiting`; `replace -r` immediately ticks once so execution resumes.
 
 Output semantics:
 
 - `output.json` remains the canonical normalized output for the latest successful attempt only.
 - failed, timed-out, and cancelled attempts keep their own `result.json` under the attempt directory and do not overwrite `output.json`.
+
+## Phase 8: Conditional Branching
+
+Phase 8 adds deterministic branching to workflow tasks.
+
+- `run_if` is an optional task-level condition evaluated only after the dependency gate passes.
+- if `run_if` evaluates true, the task becomes `ready` and may run.
+- if `run_if` evaluates false, the task becomes `skipped`.
+- `skipped` is terminal but non-failing. It does not count as `succeeded` and it does not create an execution attempt.
+- `dependency_policy` controls how joins interpret upstream branch outcomes.
+
+Supported `run_if` operators:
+
+- `eq`
+- `ne`
+- `contains`
+- `exists`
+- `missing`
+- `gt`
+- `gte`
+- `lt`
+- `lte`
+- `truthy`
+- `falsy`
+
+Supported dependency policies:
+
+- `all_succeeded` (default): every dependency must succeed; a skipped dependency skips the task and a failed dependency blocks it.
+- `any_succeeded`: wait for all dependencies to become terminal, then continue if at least one succeeded; otherwise skip.
+
+Branch example:
+
+```json
+{
+  "title": "Conditional branch",
+  "tasks": [
+    {
+      "label": "check",
+      "title": "Check exit code",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "prompt": "Run the check."
+    },
+    {
+      "label": "success_path",
+      "title": "Success path",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": ["check"],
+      "run_if": {
+        "ref": "check.result.data.exit_code",
+        "op": "eq",
+        "value": 0
+      },
+      "prompt": "Handle the success case."
+    },
+    {
+      "label": "failure_path",
+      "title": "Failure path",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": ["check"],
+      "run_if": {
+        "ref": "check.result.data.exit_code",
+        "op": "ne",
+        "value": 0
+      },
+      "prompt": "Handle the failure case."
+    },
+    {
+      "label": "final",
+      "title": "Join",
+      "task_kind": "agent",
+      "agent_type": "kazi",
+      "depends_on": ["success_path", "failure_path"],
+      "dependency_policy": "any_succeeded",
+      "prompt": "Summarize the branch result."
+    }
+  ]
+}
+```
 
 Phase 2 watcher tasks use `task_kind: "watcher"` plus a watcher-specific `watcher_type` and `watch_config`:
 

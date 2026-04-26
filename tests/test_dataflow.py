@@ -16,7 +16,7 @@ from mr1.dataflow import (
     parse_input_reference,
 )
 from mr1.scheduler import build_workflow_from_spec
-from mr1.workflow_models import Provenance
+from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 
 
@@ -105,6 +105,12 @@ class TestReferenceResolution:
         assert parsed.label == "train"
         assert parsed.root == "result"
         assert parsed.path == ("metrics", "accuracy")
+
+    def test_parse_branch_context_reference(self):
+        parsed = parse_input_reference("branch.status")
+        assert parsed.label == "branch"
+        assert parsed.root == "status"
+        assert parsed.path == ()
 
     def test_resolves_result_fields_and_nested_mappings(self, store):
         wf = _workflow()
@@ -208,6 +214,86 @@ class TestReferenceResolution:
         assert resolved[0].resolved_type == "artifact"
         assert resolved[0].artifact_path == str(artifact_path)
         assert resolved[1].resolved_type == "missing"
+
+    def test_resolves_status_for_succeeded_and_skipped_tasks(self, store):
+        wf = _workflow()
+        producer = wf.task_by_label("produce")
+        consumer = wf.task_by_label("consume")
+        consumer.inputs = [
+            TaskInputSpec(name="producer_status", from_ref="produce.status"),
+        ]
+
+        producer.status = TaskStatus.SUCCEEDED
+        resolved = materialize_task_inputs(wf, consumer, store)
+        assert resolved[0].resolved_type == "text"
+        assert resolved[0].value == "succeeded"
+
+        producer.status = TaskStatus.SKIPPED
+        resolved = materialize_task_inputs(wf, consumer, store)
+        assert resolved[0].resolved_type == "text"
+        assert resolved[0].value == "skipped"
+
+    def test_resolves_branch_context_task_fields(self, store):
+        wf = _workflow()
+        producer = wf.task_by_label("produce")
+        consumer = wf.task_by_label("consume")
+        producer.status = TaskStatus.SKIPPED
+        producer.condition_result = {"passed": False, "reason": "condition false"}
+        producer.skip_reason = "condition evaluated false"
+        consumer.inputs = [
+            TaskInputSpec(name="producer_status", from_ref="produce.status"),
+            TaskInputSpec(name="producer_condition", from_ref="produce.condition_result"),
+            TaskInputSpec(name="producer_skip_reason", from_ref="produce.skip_reason"),
+        ]
+
+        resolved = materialize_task_inputs(wf, consumer, store)
+
+        assert [item.resolved_type for item in resolved] == ["text", "json", "text"]
+        assert resolved[0].value == "skipped"
+        assert resolved[1].value == {"passed": False, "reason": "condition false"}
+        assert resolved[2].value == "condition evaluated false"
+
+    def test_branch_context_optional_fields_resolve_null_when_absent(self, store):
+        wf = _workflow()
+        producer = wf.task_by_label("produce")
+        consumer = wf.task_by_label("consume")
+        producer.status = TaskStatus.SUCCEEDED
+        producer.condition_result = None
+        producer.skip_reason = None
+        consumer.inputs = [
+            TaskInputSpec(name="producer_condition", from_ref="produce.condition_result"),
+            TaskInputSpec(name="producer_skip_reason", from_ref="produce.skip_reason"),
+        ]
+
+        resolved = materialize_task_inputs(wf, consumer, store)
+
+        assert [item.resolved_type for item in resolved] == ["json", "json"]
+        assert resolved[0].value is None
+        assert resolved[1].value is None
+
+    def test_missing_task_label_still_fails(self, store):
+        wf = _workflow()
+        consumer = wf.task_by_label("consume")
+        consumer.inputs = [
+            TaskInputSpec(name="unknown_status", from_ref="unknown.status"),
+        ]
+
+        resolved = materialize_task_inputs(wf, consumer, store)
+
+        assert resolved[0].resolved_type == "missing"
+        assert resolved[0].metadata["reason"] == "unknown_label"
+
+    def test_normal_result_refs_still_fail_when_output_missing(self, store):
+        wf = _workflow()
+        consumer = wf.task_by_label("consume")
+        consumer.inputs = [
+            TaskInputSpec(name="producer_text", from_ref="produce.result.text"),
+        ]
+
+        resolved = materialize_task_inputs(wf, consumer, store)
+
+        assert resolved[0].resolved_type == "missing"
+        assert resolved[0].metadata["reason"] == "missing_output"
 
     def test_invalid_label_and_invalid_path(self):
         with pytest.raises(Exception):

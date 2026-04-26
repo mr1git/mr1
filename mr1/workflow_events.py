@@ -26,6 +26,7 @@ TASK_CREATED = "task_created"
 TASK_READY = "task_ready"
 TASK_STARTED = "task_started"
 TASK_SUCCEEDED = "task_succeeded"
+TASK_SKIPPED = "task_skipped"
 TASK_FAILED = "task_failed"
 TASK_TIMED_OUT = "task_timed_out"
 TASK_CANCELLED = "task_cancelled"
@@ -34,6 +35,7 @@ TASK_UNBLOCKED = "task_unblocked"
 TASK_RERUN = "task_rerun"
 TASK_ATTEMPT_STARTED = "task_attempt_started"
 TASK_ATTEMPT_FINISHED = "task_attempt_finished"
+CONDITION_EVALUATED = "condition_evaluated"
 
 WATCHER_STARTED = "watcher_started"
 WATCHER_CHECKED = "watcher_checked"
@@ -121,6 +123,9 @@ class WorkflowEventLog:
     def task_succeeded(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(TASK_SUCCEEDED, workflow_id, task_id=task_id, **kw)
 
+    def task_skipped(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(TASK_SKIPPED, workflow_id, task_id=task_id, **kw)
+
     def task_failed(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(TASK_FAILED, workflow_id, task_id=task_id, **kw)
 
@@ -144,6 +149,9 @@ class WorkflowEventLog:
 
     def task_attempt_finished(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(TASK_ATTEMPT_FINISHED, workflow_id, task_id=task_id, **kw)
+
+    def condition_evaluated(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
+        return self.emit(CONDITION_EVALUATED, workflow_id, task_id=task_id, **kw)
 
     def watcher_started(self, workflow_id: str, task_id: str, **kw: Any) -> WorkflowEvent:
         return self.emit(WATCHER_STARTED, workflow_id, task_id=task_id, **kw)

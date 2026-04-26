@@ -110,6 +110,22 @@ class TestTask:
         )
         assert Task.from_dict(t.to_dict()).to_dict() == t.to_dict()
 
+    def test_branching_fields_roundtrip(self):
+        t = Task(
+            task_id="tk-branch",
+            workflow_id="wf-1",
+            label="branch",
+            title="Branch",
+            task_kind="agent",
+            agent_type="kazi",
+            prompt="Run conditionally",
+            run_if={"ref": "check.result.data.exit_code", "op": "eq", "value": 0},
+            dependency_policy="any_succeeded",
+            skip_reason="condition false",
+            condition_result={"passed": False, "reason": "values not equal"},
+        )
+        assert Task.from_dict(t.to_dict()).to_dict() == t.to_dict()
+
     def test_tool_fields_roundtrip(self):
         t = Task(
             task_id="tk-tool",
