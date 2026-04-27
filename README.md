@@ -171,6 +171,7 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/agent kill <ag-id>` | Terminate a scoped agent |
 | `/inbox` | List MR1/root inbox messages |
 | `/inbox --archived` | List MR1/root inbox including archived messages |
+| `/inbox triage --max-actions N --max-messages N` | Run one bounded inbox triage pass |
 | `/outbox` | List MR1/root sent messages |
 | `/message <msg-id>` | Show one persistent message |
 | `/message read <msg-id>` | Mark one persistent message as read |
@@ -644,6 +645,7 @@ Inspection and control commands:
 ```text
 /inbox
 /inbox --archived
+/inbox triage --max-actions 2 --max-messages 5
 /outbox
 /message <msg-id>
 /message read <msg-id>
@@ -656,12 +658,36 @@ And via the deterministic CLI:
 ```bash
 python -m mr1.workflow_cli inbox
 python -m mr1.workflow_cli inbox --archived
+python -m mr1.workflow_cli inbox-triage --max-actions 2 --max-messages 5
 python -m mr1.workflow_cli outbox
 python -m mr1.workflow_cli message <message_id>
 python -m mr1.workflow_cli message-read <message_id>
 python -m mr1.workflow_cli message-archive <message_id>
 python -m mr1.workflow_cli message-send <ag-id> "subject" path/to/body.txt
 ```
+
+## Inbox Triage
+
+Inbox triage is a single bounded coordination pass over unread root inbox messages. MR1 reads a capped slice of unread messages, produces a JSON-only triage plan, executes a small number of safe local actions, then stops.
+
+- There is no daemon, background worker, or autonomous loop.
+- Triage can summarize messages, mark or archive them, reply locally, advance scoped MRn agents, assign missions, or prepare a workflow.
+- Workflow creation keeps the existing confirmation path: if the compiler requires confirmation, MR1 stores a pending workflow draft instead of submitting immediately.
+- Triage never sends email, SMS, or any other external message.
+
+Commands:
+
+```text
+/inbox triage
+/inbox triage --max-actions 2 --max-messages 5
+```
+
+```bash
+python -m mr1.workflow_cli inbox-triage
+python -m mr1.workflow_cli inbox-triage --max-actions 2 --max-messages 5
+```
+
+The result prints a short summary, the actions taken, and bounded counts for reads, archives, replies, agent advances, and created workflows.
 
 ## Agent Runtime
 

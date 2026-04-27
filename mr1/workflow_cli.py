@@ -33,6 +33,7 @@ from typing import Any, Optional
 from mr1.agents import AgentRegistry, default_agent_registry, run_agent_health
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.inbox_triage import InboxTriagePolicy, InboxTriageResult, InboxTriageRunner
 from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunResult, MRnRunRunner
@@ -706,6 +707,45 @@ def _format_mrn_run_result(result: MRnRunResult) -> str:
         f"messages_created={result.messages_created}",
         f"final_run_status={result.final_run_status}",
     ])
+
+
+def _format_inbox_triage_result(result: InboxTriageResult) -> str:
+    lines = [
+        f"summary: {result.summary}",
+        f"processed_messages: {len(result.processed_messages)}",
+        "actions:",
+    ]
+    if result.actions_executed:
+        for action in result.actions_executed:
+            parts = [
+                action["type"],
+                f"status={action.get('status', '-')}",
+                f"reason={action.get('reason', '-')}",
+            ]
+            if action.get("message_id"):
+                parts.append(f"message_id={action['message_id']}")
+            if action.get("agent_id"):
+                parts.append(f"agent_id={action['agent_id']}")
+            if action.get("created_message_id"):
+                parts.append(f"created_message_id={action['created_message_id']}")
+            if action.get("created_workflow_id"):
+                parts.append(f"created_workflow_id={action['created_workflow_id']}")
+            if action.get("run_id"):
+                parts.append(f"run_id={action['run_id']}")
+            if action.get("step_iteration") is not None:
+                parts.append(f"step_iteration={action['step_iteration']}")
+            if action.get("user_message"):
+                parts.append(f"user_message={_compact_text(action['user_message'], limit=80)}")
+            lines.append("  - " + " | ".join(parts))
+    else:
+        lines.append("  none")
+    lines.append("counts:")
+    lines.append(f"  messages_read={result.counts['messages_read']}")
+    lines.append(f"  messages_archived={result.counts['messages_archived']}")
+    lines.append(f"  messages_sent={result.counts['messages_sent']}")
+    lines.append(f"  agents_run={result.counts['agents_run']}")
+    lines.append(f"  workflows_created={result.counts['workflows_created']}")
+    return "\n".join(lines)
 
 
 def _message_preview_payload(message: PersistentMessage) -> dict[str, str]:
@@ -1633,6 +1673,39 @@ def _cmd_inbox(
     return 0
 
 
+def _cmd_inbox_triage(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    from mr1.mr1 import StateManager
+
+    message_store = getattr(args, "message_store")
+    compiler_client = WorkflowCompilerClient(
+        compiler=getattr(args, "workflow_compiler", None),
+        scoped_agent_store=scoped_agents,
+    )
+    runner = InboxTriageRunner(
+        workflow_store=store,
+        scoped_agent_store=scoped_agents,
+        message_store=message_store,
+        workflow_compiler_client=compiler_client,
+        pending_workflow_state=StateManager(),
+    )
+    policy = InboxTriagePolicy(
+        max_messages=args.max_messages,
+        max_actions=args.max_actions,
+    )
+    try:
+        result = runner.run(policy, caller_agent_id=caller_agent_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_inbox_triage_result(result))
+    return 0
+
+
 def _cmd_outbox(
     args: argparse.Namespace,
     store: WorkflowStore,
@@ -1957,6 +2030,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_inbox.add_argument("--archived", action="store_true")
     add_common_flags(p_inbox, include_example=False)
     p_inbox.set_defaults(func=_cmd_inbox)
+
+    p_inbox_triage = subs.add_parser("inbox-triage", help="Run one bounded root inbox triage pass.")
+    p_inbox_triage.add_argument("--max-messages", type=int, default=10)
+    p_inbox_triage.add_argument("--max-actions", type=int, default=3)
+    p_inbox_triage.set_defaults(func=_cmd_inbox_triage)
 
     p_outbox = subs.add_parser("outbox", help="List outbox messages for an agent.")
     p_outbox.add_argument("--agent", default=None)

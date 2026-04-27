@@ -59,6 +59,7 @@ from mr1.workflow_authoring import (
     workflow_to_spec,
 )
 from mr1.workflow_compiler import WorkflowCompilerClient
+from mr1.inbox_triage import InboxTriagePolicy, InboxTriageRunner
 
 
 # ---------------------------------------------------------------------------
@@ -1995,6 +1996,7 @@ class MR1:
         return workflow_cli._format_mrn_run_result(result)
 
     def _handle_message_builtin(self, cmd: str) -> str:
+        inbox_usage = "usage: /inbox [--archived] | /inbox triage [--max-actions N] [--max-messages N]"
         try:
             parts = shlex.split(cmd)
         except ValueError:
@@ -2002,14 +2004,69 @@ class MR1:
                 return "usage: /message <message_id> | /message read <message_id> | /message archive <message_id> | /message send <agent_id> <subject> <body-file>"
             if cmd.startswith("/outbox"):
                 return "usage: /outbox"
-            return "usage: /inbox [--archived]"
+            return inbox_usage
 
         command = parts[0]
         flags = {part for part in parts[1:] if part.startswith("--")}
         positionals = [part for part in parts[1:] if not part.startswith("--")]
         if command == "/inbox":
+            if positionals and positionals[0] == "triage":
+                if "--archived" in flags:
+                    return inbox_usage
+                max_messages = 10
+                max_actions = 3
+                index = 1
+                while index < len(parts):
+                    token = parts[index]
+                    if token == "triage":
+                        index += 1
+                        continue
+                    if token == "--max-actions":
+                        if index + 1 >= len(parts):
+                            return inbox_usage
+                        try:
+                            max_actions = int(parts[index + 1])
+                        except ValueError:
+                            return inbox_usage
+                        index += 2
+                        continue
+                    if token == "--max-messages":
+                        if index + 1 >= len(parts):
+                            return inbox_usage
+                        try:
+                            max_messages = int(parts[index + 1])
+                        except ValueError:
+                            return inbox_usage
+                        index += 2
+                        continue
+                    return inbox_usage
+                compiler_client = getattr(self._workflow_authoring, "_workflow_compiler_client", None)
+                if compiler_client is None:
+                    compiler_client = WorkflowCompilerClient(
+                        compiler=getattr(self._workflow_authoring, "_compiler", None) or self._run_workflow_compiler,
+                        scoped_agent_store=self._scoped_agents,
+                    )
+                runner = InboxTriageRunner(
+                    workflow_store=self._workflow_store,
+                    scoped_agent_store=self._scoped_agents,
+                    message_store=self._message_store,
+                    workflow_compiler_client=compiler_client,
+                    workflow_authoring_service=self._workflow_authoring,
+                    pending_workflow_state=self._state,
+                )
+                try:
+                    result = runner.run(
+                        InboxTriagePolicy(
+                            max_messages=max_messages,
+                            max_actions=max_actions,
+                        ),
+                        caller_agent_id=self._root_agent_id,
+                    )
+                except ValueError as exc:
+                    return f"error: {exc}"
+                return workflow_cli._format_inbox_triage_result(result)
             if flags - {"--archived"} or positionals:
-                return "usage: /inbox [--archived]"
+                return inbox_usage
             return workflow_cli._format_messages_table(
                 self._message_store.list_inbox(
                     self._root_agent_id,
