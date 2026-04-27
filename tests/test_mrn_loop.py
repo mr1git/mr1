@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
 from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
 from mr1.scheduler import submit_spec_to_disk
@@ -73,6 +74,10 @@ def _action(action: str, **extra) -> str:
         "workflow_context": extra.pop("workflow_context", None),
         "workflow_id": extra.pop("workflow_id", None),
         "report": extra.pop("report", None),
+        "message_kind": extra.pop("message_kind", None),
+        "message_subject": extra.pop("message_subject", None),
+        "message_body": extra.pop("message_body", None),
+        "to_agent_id": extra.pop("to_agent_id", None),
         "parent_request": extra.pop("parent_request", None),
     }
     payload.update(extra)
@@ -98,6 +103,11 @@ def workflow_store(tmp_path):
 @pytest.fixture
 def agent_store(tmp_path):
     return PersistentAgentStore(root=tmp_path / "agents")
+
+
+@pytest.fixture
+def message_store(tmp_path, agent_store):
+    return MessageStore(root=tmp_path / "messages", scoped_agent_store=agent_store)
 
 
 def test_assign_mission_persists_fields(agent_store):
@@ -187,42 +197,129 @@ def test_valid_idle_action_updates_iteration_and_log(workflow_store, agent_store
     assert record["iteration"] == 1
 
 
-def test_valid_write_report_writes_report_file_and_updates_status(workflow_store, agent_store):
+def test_valid_write_report_writes_report_file_and_updates_status(workflow_store, agent_store, message_store):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
     agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
     runner = MRnStepRunner(
         workflow_store=workflow_store,
         scoped_agent_store=agent_store,
+        message_store=message_store,
         reasoner=FakeReasoner(_action("write_report", report="## Findings\nReady.", next_status="reporting")),
     )
 
     result = runner.step(child.agent_id)
     reloaded = agent_store.require_agent(child.agent_id)
     content = agent_store.list_reports(child.agent_id)[0].read_text(encoding="utf-8")
+    inbox = message_store.list_inbox(root.agent_id)
 
     assert result.report_path is not None
+    assert result.message_id is not None
     assert reloaded.run_status == "reporting"
     assert "Investigate" in content
     assert "## Findings" in content
+    assert inbox[0].kind == "report"
+    assert "Report path:" in inbox[0].body
 
 
-def test_ask_parent_stores_parent_request_and_waiting_status(workflow_store, agent_store):
+def test_ask_parent_stores_parent_request_and_waiting_status(workflow_store, agent_store, message_store):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
     agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
     runner = MRnStepRunner(
         workflow_store=workflow_store,
         scoped_agent_store=agent_store,
+        message_store=message_store,
         reasoner=FakeReasoner(_action("ask_parent", parent_request="Need product clarification")),
     )
 
     result = runner.step(child.agent_id)
     reloaded = agent_store.require_agent(child.agent_id)
+    inbox = message_store.list_inbox(root.agent_id)
 
     assert result.parent_request == "Need product clarification"
+    assert result.message_id is not None
     assert reloaded.parent_request == "Need product clarification"
     assert reloaded.run_status == "waiting"
+    assert inbox[0].kind == "question"
+    assert inbox[0].subject == f"Parent request from {child.title}"
+
+
+def test_send_message_action_creates_parent_message_and_persists_message_id(workflow_store, agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        reasoner=FakeReasoner(_action(
+            "send_message",
+            message_kind="status",
+            message_subject="Checkpoint",
+            message_body="Need review.",
+            next_status="waiting",
+        )),
+    )
+
+    result = runner.step(child.agent_id)
+    reloaded = agent_store.require_agent(child.agent_id)
+    record = json.loads(agent_store.step_log_path(child.agent_id).read_text(encoding="utf-8").strip().splitlines()[-1])
+    message = message_store.list_inbox(root.agent_id)[0]
+
+    assert result.message_id == message.message_id
+    assert reloaded.last_action["message_id"] == message.message_id
+    assert record["message_id"] == message.message_id
+    assert message.subject == "Checkpoint"
+    assert message.kind == "status"
+
+
+def test_send_message_action_can_target_descendant(workflow_store, agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    parent = agent_store.create_child_agent(root.agent_id, "parent")
+    child = agent_store.create_child_agent(parent.agent_id, "child")
+    agent_store.assign_mission(root.agent_id, parent.agent_id, "Coordinate")
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        reasoner=FakeReasoner(_action(
+            "send_message",
+            message_kind="request",
+            message_subject="Do task",
+            message_body="Please handle this.",
+            to_agent_id=child.agent_id,
+        )),
+    )
+
+    result = runner.step(parent.agent_id)
+
+    assert message_store.list_inbox(child.agent_id)[0].message_id == result.message_id
+
+
+def test_send_message_action_to_sibling_blocks_agent(workflow_store, agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    left = agent_store.create_child_agent(root.agent_id, "left")
+    right = agent_store.create_child_agent(root.agent_id, "right")
+    agent_store.assign_mission(root.agent_id, left.agent_id, "Coordinate")
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        reasoner=FakeReasoner(_action(
+            "send_message",
+            message_kind="request",
+            message_subject="Nope",
+            message_body="This should fail.",
+            to_agent_id=right.agent_id,
+        )),
+    )
+
+    result = runner.step(left.agent_id)
+
+    assert result.status_after == "blocked"
+    assert result.error == "access denied: recipient not in agent scope"
+    assert message_store.list_inbox(right.agent_id) == []
 
 
 def test_inspect_workflow_respects_scope_and_logs_summary(workflow_store, agent_store):
@@ -310,6 +407,43 @@ def test_invalid_action_triggers_one_correction_pass(workflow_store, agent_store
     assert len(reasoner.calls) == 2
 
 
+def test_step_prompt_includes_bounded_message_context(workflow_store, agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
+    for index in range(6):
+        message_store.create_message(
+            from_agent_id=root.agent_id,
+            to_agent_id=child.agent_id,
+            kind="request",
+            subject=f"Inbox {index}",
+            body="body",
+        )
+    for index in range(6):
+        message_store.create_message(
+            from_agent_id=child.agent_id,
+            to_agent_id=root.agent_id,
+            kind="status",
+            subject=f"Outbox {index}",
+            body="body",
+        )
+    reasoner = FakeReasoner(_action("idle"))
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        reasoner=reasoner,
+    )
+
+    runner.step(child.agent_id)
+    payload = json.loads(reasoner.calls[0][2].split("Scoped context:\n", 1)[1])
+
+    assert len(payload["unread_messages"]) == 5
+    assert len(payload["recent_sent_messages"]) == 5
+    assert payload["parent_messages"]
+    assert payload["unread_messages"][0]["subject"] == "Inbox 5"
+
+
 def test_second_invalid_action_blocks_agent(workflow_store, agent_store):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
@@ -330,16 +464,37 @@ def test_second_invalid_action_blocks_agent(workflow_store, agent_store):
     assert "invalid mrn action:" in (record["error"] or "")
 
 
-def test_agent_inspection_shows_mission_status_and_iteration(agent_store):
+def test_agent_inspection_shows_mission_status_iteration_and_message_counts(agent_store, message_store):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
     child.mission = "Investigate repo"
     child.run_status = "waiting"
     child.current_iteration = 3
     agent_store.save_agent(child)
+    message_store.create_message(
+        from_agent_id=root.agent_id,
+        to_agent_id=child.agent_id,
+        kind="request",
+        subject="Need update",
+        body="Status?",
+    )
+    message_store.create_message(
+        from_agent_id=child.agent_id,
+        to_agent_id=root.agent_id,
+        kind="status",
+        subject="Update",
+        body="Working.",
+    )
 
-    formatted = _format_agent(child, reports=agent_store.list_reports(child.agent_id))
+    formatted = _format_agent(
+        child,
+        reports=agent_store.list_reports(child.agent_id),
+        message_store=message_store,
+    )
 
     assert "mission:      Investigate repo" in formatted
     assert "run_status:   waiting" in formatted
     assert "iteration:    3" in formatted
+    assert "unread_inbox: 1" in formatted
+    assert "Need update" in formatted
+    assert "Update" in formatted

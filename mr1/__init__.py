@@ -54,6 +54,8 @@ _EXPORTS = {
     "WorkflowCompilerFailure": ("mr1.workflow_compiler", "WorkflowCompilerFailure"),
     "MRnStepRunner": ("mr1.mrn_loop", "MRnStepRunner"),
     "MRnStepResult": ("mr1.mrn_loop", "MRnStepResult"),
+    "PersistentMessage": ("mr1.messages", "PersistentMessage"),
+    "MessageStore": ("mr1.messages", "MessageStore"),
 }
 
 __all__ = sorted(_EXPORTS)

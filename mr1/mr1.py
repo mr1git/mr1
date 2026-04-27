@@ -44,6 +44,7 @@ sys.path.insert(0, str(_PKG_ROOT.parent))
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 from mr1 import kazi, mrn
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
+from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
 from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
 from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
@@ -731,6 +732,7 @@ class MR1:
         *,
         workflow_store: Optional[WorkflowStore] = None,
         scoped_agent_store: Optional[PersistentAgentStore] = None,
+        message_store: Optional[MessageStore] = None,
         workflow_runner: Optional[Runner] = None,
         workflow_concurrency: int = 4,
         workflow_auto_tick: bool = True,
@@ -764,6 +766,10 @@ class MR1:
         self._scoped_agents = scoped_agent_store or PersistentAgentStore(
             root=self._workflow_store.root.parent / "agents"
         )
+        self._message_store = message_store or MessageStore(
+            root=self._workflow_store.root.parent / "messages",
+            scoped_agent_store=self._scoped_agents,
+        )
         self._root_agent_id = self._scoped_agents.root_agent_id
         runner = workflow_runner or KaziAsyncRunner(
             self._workflow_store,
@@ -776,6 +782,7 @@ class MR1:
             auto_tick=workflow_auto_tick,
             agent_id="MR1",
             scoped_agent_store=self._scoped_agents,
+            message_store=self._message_store,
         )
         self._workflow_authoring = workflow_authoring_service or WorkflowAuthoringService(
             self._scheduler,
@@ -1578,6 +1585,12 @@ class MR1:
             return self._handle_agent_builtin(cmd)
         if cmd.startswith("/agent"):
             return self._handle_agent_builtin(cmd)
+        if cmd == "/inbox" or cmd.startswith("/inbox "):
+            return self._handle_message_builtin(cmd)
+        if cmd == "/outbox" or cmd.startswith("/outbox "):
+            return self._handle_message_builtin(cmd)
+        if cmd.startswith("/message"):
+            return self._handle_message_builtin(cmd)
         if cmd == "/tools" or cmd.startswith("/tools "):
             return self._handle_capability_builtin(cmd)
         if cmd == "/capabilities" or cmd.startswith("/capabilities "):
@@ -1879,6 +1892,7 @@ class MR1:
             runner = MRnStepRunner(
                 workflow_store=self._workflow_store,
                 scoped_agent_store=self._scoped_agents,
+                message_store=self._message_store,
                 workflow_authoring_service=self._workflow_authoring,
             )
             try:
@@ -1899,6 +1913,7 @@ class MR1:
             return workflow_cli._format_agent(
                 agent,
                 reports=self._scoped_agents.list_reports(agent.agent_id),
+                message_store=self._message_store,
                 json_output="--json" in flags,
                 brief="--brief" in flags,
             )
@@ -1918,6 +1933,105 @@ class MR1:
             )
         except ValueError:
             return f"agent not found: {agent_name}"
+
+    def _handle_message_builtin(self, cmd: str) -> str:
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            if cmd.startswith("/message"):
+                return "usage: /message <message_id> | /message read <message_id> | /message archive <message_id> | /message send <agent_id> <subject> <body-file>"
+            if cmd.startswith("/outbox"):
+                return "usage: /outbox"
+            return "usage: /inbox [--archived]"
+
+        command = parts[0]
+        flags = {part for part in parts[1:] if part.startswith("--")}
+        positionals = [part for part in parts[1:] if not part.startswith("--")]
+        if command == "/inbox":
+            if flags - {"--archived"} or positionals:
+                return "usage: /inbox [--archived]"
+            return workflow_cli._format_messages_table(
+                self._message_store.list_inbox(
+                    self._root_agent_id,
+                    include_archived="--archived" in flags,
+                ),
+                mode="inbox",
+            )
+        if command == "/outbox":
+            if flags:
+                return "usage: /outbox"
+            if positionals:
+                return "usage: /outbox"
+            return workflow_cli._format_messages_table(
+                self._message_store.list_outbox(self._root_agent_id),
+                mode="outbox",
+            )
+
+        if flags:
+            return "usage: /message <message_id> | /message read <message_id> | /message archive <message_id> | /message send <agent_id> <subject> <body-file>"
+        if not positionals:
+            return "usage: /message <message_id> | /message read <message_id> | /message archive <message_id> | /message send <agent_id> <subject> <body-file>"
+        if positionals[0] == "read":
+            if len(positionals) != 2:
+                return "usage: /message read <message_id>"
+            try:
+                workflow_cli._require_message(
+                    self._message_store,
+                    positionals[1],
+                    self._root_agent_id,
+                )
+                message = self._message_store.mark_read(positionals[1])
+                if message is None:
+                    return f"message not found: {positionals[1]}"
+                return message.message_id
+            except (ValueError, AgentScopeError) as exc:
+                return str(exc)
+        if positionals[0] == "archive":
+            if len(positionals) != 2:
+                return "usage: /message archive <message_id>"
+            try:
+                workflow_cli._require_message(
+                    self._message_store,
+                    positionals[1],
+                    self._root_agent_id,
+                )
+                message = self._message_store.archive_message(positionals[1])
+                if message is None:
+                    return f"message not found: {positionals[1]}"
+                return message.message_id
+            except (ValueError, AgentScopeError) as exc:
+                return str(exc)
+        if positionals[0] == "send":
+            if len(positionals) != 4:
+                return "usage: /message send <agent_id> <subject> <body-file>"
+            body_path = Path(positionals[3])
+            if not body_path.exists():
+                return f"error: message body file not found: {body_path}"
+            try:
+                body = body_path.read_text(encoding="utf-8")
+            except OSError:
+                return f"error: message body file not found: {body_path}"
+            if not self._message_store.can_agent_send_message(self._root_agent_id, positionals[1]):
+                return "access denied: recipient not in agent scope"
+            message = self._message_store.create_message(
+                from_agent_id=self._root_agent_id,
+                to_agent_id=positionals[1],
+                kind="request",
+                subject=positionals[2],
+                body=body,
+            )
+            return message.message_id
+        if len(positionals) != 1:
+            return "usage: /message <message_id>"
+        try:
+            message = workflow_cli._require_message(
+                self._message_store,
+                positionals[0],
+                self._root_agent_id,
+            )
+        except (ValueError, AgentScopeError) as exc:
+            return str(exc)
+        return workflow_cli._format_message_detail(message)
 
     def _handle_schema_builtin(self, cmd: str) -> str:
         usage = "usage: /schema [workflow|task|inputs|refs|task-kinds] [--json] [--brief]"
@@ -1992,7 +2106,8 @@ class MR1:
         print(
             "Commands: /status  /tasks  /kill  /history  /memdltr  "
             "/workflows  /watchers  /capabilities  /capability <name>  "
-            "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  /schema  /vizualize  /visualize-web  "
+            "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  "
+            "/inbox  /outbox  /message <id>  /schema  /vizualize  /visualize-web  "
             "/test spawn agents <h>  /test kill agents"
         )
         print("Type 'exit' or Ctrl+C to quit.\n")

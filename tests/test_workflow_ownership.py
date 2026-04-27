@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.scheduler import (
     Scheduler,
@@ -148,6 +149,7 @@ def test_descendant_access_allowed_and_sibling_access_denied(tmp_path):
 def test_terminal_mrn_workflow_writes_report(tmp_path):
     workflow_store = WorkflowStore(root=tmp_path / "workflows")
     agent_store = PersistentAgentStore(root=tmp_path / "agents")
+    message_store = MessageStore(root=tmp_path / "messages", scoped_agent_store=agent_store)
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
     runner = MockRunner()
@@ -156,6 +158,7 @@ def test_terminal_mrn_workflow_writes_report(tmp_path):
         runner,
         auto_tick=False,
         scoped_agent_store=agent_store,
+        message_store=message_store,
     )
 
     workflow_id = scheduler.submit_workflow(
@@ -186,3 +189,7 @@ def test_terminal_mrn_workflow_writes_report(tmp_path):
     assert workflow_id in content
     assert "status: succeeded" in content
     assert "workflow output" in content
+    inbox = message_store.list_inbox(root.agent_id)
+    assert len(inbox) == 1
+    assert inbox[0].subject == f"Workflow completed: {workflow.title}"
+    assert "Report path:" in inbox[0].body

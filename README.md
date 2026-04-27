@@ -168,6 +168,13 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/agent create <title>` | Create a scoped MRn child agent |
 | `/agent <ag-id>` | Show one scoped agent record and its reports |
 | `/agent kill <ag-id>` | Terminate a scoped agent |
+| `/inbox` | List MR1/root inbox messages |
+| `/inbox --archived` | List MR1/root inbox including archived messages |
+| `/outbox` | List MR1/root sent messages |
+| `/message <msg-id>` | Show one persistent message |
+| `/message read <msg-id>` | Mark one persistent message as read |
+| `/message archive <msg-id>` | Archive one persistent message |
+| `/message send <ag-id> <subject> <body-file>` | Send one root-scoped persistent message |
 | `/agent kazi` | Show one runtime agent profile |
 | `/capabilities` | List all registered capabilities across tools, watchers, and agents |
 | `/capability <name>` | Show one capability contract |
@@ -226,6 +233,13 @@ python -m mr1.workflow_cli agent-assign <ag-id> path/to/mission.txt
 python -m mr1.workflow_cli agent-step <ag-id>
 python -m mr1.workflow_cli agent <ag-id>
 python -m mr1.workflow_cli agent kill <ag-id>
+python -m mr1.workflow_cli inbox
+python -m mr1.workflow_cli inbox --archived
+python -m mr1.workflow_cli outbox
+python -m mr1.workflow_cli message <message_id>
+python -m mr1.workflow_cli message-read <message_id>
+python -m mr1.workflow_cli message-archive <message_id>
+python -m mr1.workflow_cli message-send <ag-id> "subject" path/to/body.txt
 python -m mr1.workflow_cli agent kazi
 python -m mr1.workflow_cli agent kazi health
 python -m mr1.workflow_cli result <task_id>
@@ -554,6 +568,45 @@ MR1 is the root MRn at `tree_level=1`. Persistent MRn agents can now be assigned
 - Reports are written under `mr1/memory/agents/<agent_id>/reports/`.
 - Step logs are appended to `mr1/memory/agents/<agent_id>/logs/steps.jsonl`.
 - Messaging delivery, infinite loops, and autonomous background execution are not part of this phase.
+
+## Persistent Agent Messaging
+
+MR1 now persists local durable agent messages under:
+
+```text
+mr1/memory/messages/<message_id>.json
+```
+
+- Messages are local coordination records, not external notifications.
+- MRn agents do not contact the user directly.
+- MRn agents report upward through MR1/root, and MR1 decides what reaches the user.
+- Root can read all messages and send to any persistent agent.
+- MRn agents can read only their own inbox/outbox and can send only to their parent or owned descendants.
+- Archived messages remain on disk and are hidden from inbox/outbox listings unless explicitly requested.
+
+Inspection and control commands:
+
+```text
+/inbox
+/inbox --archived
+/outbox
+/message <msg-id>
+/message read <msg-id>
+/message archive <msg-id>
+/message send <ag-id> <subject> <body-file>
+```
+
+And via the deterministic CLI:
+
+```bash
+python -m mr1.workflow_cli inbox
+python -m mr1.workflow_cli inbox --archived
+python -m mr1.workflow_cli outbox
+python -m mr1.workflow_cli message <message_id>
+python -m mr1.workflow_cli message-read <message_id>
+python -m mr1.workflow_cli message-archive <message_id>
+python -m mr1.workflow_cli message-send <ag-id> "subject" path/to/body.txt
+```
 
 ## Agent Runtime
 

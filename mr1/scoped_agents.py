@@ -373,7 +373,7 @@ class PersistentAgentStore:
             return None
         path = self.report_dir(owner.agent_id) / f"{_report_ts(workflow.finished_at)}.md"
         if path.exists():
-            return path
+            return None
         lines = [
             f"# Workflow Report: {workflow.title}",
             "",

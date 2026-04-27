@@ -20,6 +20,7 @@ from mr1.agents import AgentRuntimeError, parse_agent_json_envelope
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.core import Dispatcher, PermissionDenied
 from mr1.kazi_runner import MockRunner
+from mr1.messages import MessageStore
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import Scheduler, WorkflowSpecError
 from mr1.tools import ToolRegistry, default_tool_registry
@@ -38,6 +39,7 @@ _ALLOWED_ACTIONS = frozenset({
     "create_workflow",
     "inspect_workflow",
     "write_report",
+    "send_message",
     "ask_parent",
     "idle",
 })
@@ -53,6 +55,7 @@ _ACTION_DEFAULT_STATUS = {
     "create_workflow": "working",
     "inspect_workflow": "working",
     "write_report": "reporting",
+    "send_message": "waiting",
     "ask_parent": "waiting",
     "idle": "idle",
 }
@@ -62,12 +65,16 @@ You are MRn, a persistent scoped orchestrator inside MR1.
 
 You must return JSON only with this exact shape:
 {
-  "action": "create_workflow" | "inspect_workflow" | "write_report" | "ask_parent" | "idle",
+  "action": "create_workflow" | "inspect_workflow" | "write_report" | "send_message" | "ask_parent" | "idle",
   "reason": "short reason",
   "workflow_request": "optional natural-language workflow request",
   "workflow_context": "optional extra context",
   "workflow_id": "optional existing workflow id",
   "report": "optional markdown report",
+  "message_kind": "optional message kind",
+  "message_subject": "optional message subject",
+  "message_body": "optional message body",
+  "to_agent_id": "optional message recipient",
   "parent_request": "optional question/request for parent",
   "next_status": "idle" | "working" | "waiting" | "reporting" | "blocked"
 }
@@ -96,6 +103,7 @@ class MRnStepResult:
     message: str
     workflow_id: Optional[str] = None
     report_path: Optional[str] = None
+    message_id: Optional[str] = None
     parent_request: Optional[str] = None
     error: Optional[str] = None
 
@@ -110,6 +118,7 @@ class MRnStepResult:
             "message": self.message,
             "workflow_id": self.workflow_id,
             "report_path": self.report_path,
+            "message_id": self.message_id,
             "parent_request": self.parent_request,
             "error": self.error,
         }
@@ -218,6 +227,7 @@ class MRnStepRunner:
         workflow_schema_registry: Optional[WorkflowSchemaRegistry] = None,
         watcher_registry: Optional[WatcherRegistry] = None,
         tool_registry: Optional[ToolRegistry] = None,
+        message_store: Optional[MessageStore] = None,
         reasoner: Optional[ReasonerFn] = None,
     ):
         self._workflow_store = workflow_store or WorkflowStore()
@@ -232,6 +242,10 @@ class MRnStepRunner:
         )
         self._watcher_registry = watcher_registry or default_watcher_registry()
         self._tool_registry = tool_registry or default_tool_registry()
+        self._message_store = message_store or MessageStore(
+            root=self._workflow_store.root.parent / "messages",
+            scoped_agent_store=self._scoped_agents,
+        )
         self._workflow_compiler_client = (
             workflow_compiler_client or
             self._build_default_workflow_compiler_client()
@@ -258,6 +272,7 @@ class MRnStepRunner:
             MockRunner(),
             auto_tick=False,
             scoped_agent_store=self._scoped_agents,
+            message_store=self._message_store,
         )
         return WorkflowAuthoringService(
             scheduler,
@@ -331,6 +346,9 @@ class MRnStepRunner:
             },
             "visible_workflows": self._workflow_summaries(agent),
             "recent_reports": self._recent_reports(agent),
+            "unread_messages": self._inbox_messages(agent),
+            "recent_sent_messages": self._outbox_messages(agent),
+            "parent_messages": self._parent_messages(agent),
             "recent_events": self._recent_events(agent),
             "memory": _compact(self._scoped_agents.read_memory(agent.agent_id), limit=1000),
             "capabilities": self._capability_summaries(),
@@ -392,6 +410,55 @@ class MRnStepRunner:
         events.sort(key=lambda item: item["timestamp"], reverse=True)
         return events[:10]
 
+    def _message_summary(self, message) -> dict[str, Any]:
+        return {
+            "message_id": message.message_id,
+            "from_agent_id": message.from_agent_id,
+            "to_agent_id": message.to_agent_id,
+            "kind": message.kind,
+            "subject": message.subject,
+            "status": message.status,
+            "created_at": message.created_at,
+            "body_excerpt": _compact(message.body, limit=160),
+        }
+
+    def _inbox_messages(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+        messages = [
+            self._message_summary(message)
+            for message in self._message_store.list_inbox(agent.agent_id)
+            if message.status == "unread"
+        ]
+        return messages[:5]
+
+    def _outbox_messages(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+        return [
+            self._message_summary(message)
+            for message in self._message_store.list_outbox(agent.agent_id)[:5]
+        ]
+
+    def _parent_messages(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+        parent_id = agent.parent_agent_id
+        if not parent_id:
+            return []
+        summaries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for message in self._message_store.list_inbox(agent.agent_id)[:5]:
+            if message.from_agent_id != parent_id:
+                continue
+            if message.message_id in seen:
+                continue
+            summaries.append(self._message_summary(message))
+            seen.add(message.message_id)
+        for message in self._message_store.list_outbox(agent.agent_id)[:5]:
+            if message.to_agent_id != parent_id:
+                continue
+            if message.message_id in seen:
+                continue
+            summaries.append(self._message_summary(message))
+            seen.add(message.message_id)
+        summaries.sort(key=lambda item: (item["created_at"], item["message_id"]), reverse=True)
+        return summaries[:5]
+
     def _capability_summaries(self) -> list[dict[str, str]]:
         summaries = []
         for item in self._capability_registry.describe_all():
@@ -423,7 +490,7 @@ class MRnStepRunner:
         action = _extract_json_object(raw)
         action_name = action.get("action")
         if action_name not in _ALLOWED_ACTIONS:
-            raise ValueError("field 'action' must be one of: create_workflow, inspect_workflow, write_report, ask_parent, idle")
+            raise ValueError("field 'action' must be one of: create_workflow, inspect_workflow, write_report, send_message, ask_parent, idle")
         reason = action.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("field 'reason' must be a non-empty string")
@@ -438,6 +505,10 @@ class MRnStepRunner:
             "workflow_context": action.get("workflow_context"),
             "workflow_id": action.get("workflow_id"),
             "report": action.get("report"),
+            "message_kind": action.get("message_kind"),
+            "message_subject": action.get("message_subject"),
+            "message_body": action.get("message_body"),
+            "to_agent_id": action.get("to_agent_id"),
             "parent_request": action.get("parent_request"),
             "next_status": next_status,
         }
@@ -451,6 +522,13 @@ class MRnStepRunner:
         elif action_name == "write_report":
             if not isinstance(normalized["report"], str) or not normalized["report"].strip():
                 raise ValueError("write_report requires report")
+        elif action_name == "send_message":
+            if not isinstance(normalized["message_kind"], str) or not normalized["message_kind"].strip():
+                raise ValueError("send_message requires message_kind")
+            if not isinstance(normalized["message_subject"], str) or not normalized["message_subject"].strip():
+                raise ValueError("send_message requires message_subject")
+            if not isinstance(normalized["message_body"], str) or not normalized["message_body"].strip():
+                raise ValueError("send_message requires message_body")
         elif action_name == "ask_parent":
             if not isinstance(normalized["parent_request"], str) or not normalized["parent_request"].strip():
                 raise ValueError("ask_parent requires parent_request")
@@ -461,6 +539,10 @@ class MRnStepRunner:
                 normalized["workflow_context"],
                 normalized["workflow_id"],
                 normalized["report"],
+                normalized["message_kind"],
+                normalized["message_subject"],
+                normalized["message_body"],
+                normalized["to_agent_id"],
                 normalized["parent_request"],
             )
             if any(value not in (None, "") for value in extra_fields):
@@ -475,6 +557,8 @@ class MRnStepRunner:
             return self._execute_inspect_workflow(agent, action)
         if action["action"] == "write_report":
             return self._execute_write_report(agent, action)
+        if action["action"] == "send_message":
+            return self._execute_send_message(agent, action)
         if action["action"] == "ask_parent":
             return self._execute_ask_parent(agent, action)
         return self._execute_idle(agent, action)
@@ -646,20 +730,55 @@ class MRnStepRunner:
             action["report"].rstrip(),
         ])
         report_path = self._scoped_agents.write_report(agent.agent_id, content)
+        message = None
+        if agent.parent_agent_id:
+            message = self._send_agent_message(
+                agent,
+                kind="report",
+                subject=f"Report from {agent.title}",
+                body="\n".join([content, "", f"Report path: {report_path}"]),
+            )
         return self._persist_step(
             agent,
             action=action,
             status_after=action["next_status"],
             message="report written",
             report_path=str(report_path),
+            message_id=message.message_id if message is not None else None,
+        )
+
+    def _execute_send_message(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+        message = self._send_agent_message(
+            agent,
+            kind=action["message_kind"],
+            subject=action["message_subject"],
+            body=action["message_body"],
+            workflow_id=action.get("workflow_id"),
+            to_agent_id=action.get("to_agent_id"),
+        )
+        return self._persist_step(
+            agent,
+            action=action,
+            status_after=action["next_status"],
+            message=f"message sent to {message.to_agent_id}",
+            workflow_id=action.get("workflow_id"),
+            message_id=message.message_id,
         )
 
     def _execute_ask_parent(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+        message = self._send_agent_message(
+            agent,
+            kind="question",
+            subject=f"Parent request from {agent.title}",
+            body=action["parent_request"],
+            to_agent_id=agent.parent_agent_id,
+        )
         return self._persist_step(
             agent,
             action=action,
             status_after="waiting",
             message="parent clarification requested",
+            message_id=message.message_id,
             parent_request=action["parent_request"],
         )
 
@@ -680,6 +799,7 @@ class MRnStepRunner:
         message: str,
         workflow_id: Optional[str] = None,
         report_path: Optional[str] = None,
+        message_id: Optional[str] = None,
         parent_request: Optional[str] = None,
         error: Optional[str] = None,
         workflow_summary: Optional[dict[str, Any]] = None,
@@ -701,6 +821,8 @@ class MRnStepRunner:
             normalized_last_action["workflow_id"] = workflow_id
         if report_path is not None:
             normalized_last_action["report_path"] = report_path
+        if message_id is not None:
+            normalized_last_action["message_id"] = message_id
         if parent_request is not None:
             normalized_last_action["parent_request"] = parent_request
         if error is not None:
@@ -716,6 +838,7 @@ class MRnStepRunner:
             "status_after": status_after,
             "workflow_id": workflow_id,
             "report_path": report_path,
+            "message_id": message_id,
             "parent_request": parent_request,
             "error": error,
         }
@@ -732,8 +855,36 @@ class MRnStepRunner:
             message=message,
             workflow_id=workflow_id,
             report_path=report_path,
+            message_id=message_id,
             parent_request=parent_request,
             error=error,
+        )
+
+    def _send_agent_message(
+        self,
+        agent: PersistentAgent,
+        *,
+        kind: str,
+        subject: str,
+        body: str,
+        workflow_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        to_agent_id: Optional[str] = None,
+    ):
+        resolved_to_agent_id = to_agent_id or agent.parent_agent_id
+        if not resolved_to_agent_id or not self._message_store.can_agent_send_message(
+            agent.agent_id,
+            resolved_to_agent_id,
+        ):
+            raise AgentScopeError("access denied: recipient not in agent scope")
+        return self._message_store.create_message(
+            from_agent_id=agent.agent_id,
+            to_agent_id=resolved_to_agent_id,
+            kind=kind,
+            subject=subject,
+            body=body,
+            workflow_id=workflow_id,
+            task_id=task_id,
         )
 
     def _persist_blocked_step(

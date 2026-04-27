@@ -65,6 +65,7 @@ from mr1.tools import (
     ToolResult,
     default_tool_registry,
 )
+from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.watchers import (
     WatcherConfigError,
@@ -1224,6 +1225,7 @@ class Scheduler:
         tick_interval_s: float = 1.0,
         agent_id: str = "scheduler",
         scoped_agent_store: Optional[PersistentAgentStore] = None,
+        message_store: Optional[MessageStore] = None,
     ):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
@@ -1234,6 +1236,10 @@ class Scheduler:
         self._tools = tool_registry or default_tool_registry()
         self._scoped_agents = scoped_agent_store or PersistentAgentStore(
             root=self._store.root.parent / "agents"
+        )
+        self._message_store = message_store or MessageStore(
+            root=self._store.root.parent / "messages",
+            scoped_agent_store=self._scoped_agents,
         )
         self._concurrency = concurrency
         self._tick_interval_s = tick_interval_s
@@ -2078,8 +2084,51 @@ class Scheduler:
                     agent_id=self._agent_id, message=message,
                 )
         if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
-            self._scoped_agents.write_workflow_report(wf, self._store)
+            report_path = self._scoped_agents.write_workflow_report(wf, self._store)
+            if report_path is not None:
+                self._send_workflow_report_message(wf, report_path)
         return True
+
+    def _send_workflow_report_message(self, wf: Workflow, report_path: Path) -> None:
+        wf = self._scoped_agents.normalize_workflow_ownership(wf)
+        owner = self._scoped_agents.load_agent(wf.owner_agent_id)
+        if owner is None or owner.parent_agent_id is None:
+            return
+        body_lines = [
+            f"Workflow completed: {wf.title}",
+            "",
+            f"workflow_id: {wf.workflow_id}",
+            f"owner_agent_id: {wf.owner_agent_id}",
+            f"owner_agent_title: {wf.owner_agent_title or owner.title}",
+            f"status: {wf.status.value}",
+            f"finished_at: {wf.finished_at or '-'}",
+            "",
+            "Task summary:",
+        ]
+        emitted = False
+        for label, task_id in wf.label_to_task_id.items():
+            task = wf.tasks.get(task_id)
+            if task is None:
+                continue
+            emitted = True
+            summary = f"{label}: {task.status.value}"
+            if task.result_summary:
+                summary += f" | {task.result_summary}"
+            body_lines.append(f"- {summary}")
+        if not emitted:
+            body_lines.append("- none")
+        body_lines.extend([
+            "",
+            f"Report path: {report_path}",
+        ])
+        self._message_store.create_message(
+            from_agent_id=owner.agent_id,
+            to_agent_id=owner.parent_agent_id,
+            kind="report",
+            subject=f"Workflow completed: {wf.title}",
+            body="\n".join(body_lines).rstrip(),
+            workflow_id=wf.workflow_id,
+        )
 
     def _begin_attempt(
         self,

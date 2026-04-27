@@ -33,6 +33,7 @@ from typing import Any, Optional
 from mr1.agents import AgentRegistry, default_agent_registry, run_agent_health
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import (
@@ -569,11 +570,24 @@ def _persistent_agent_payload(
     agent: PersistentAgent,
     *,
     reports: Optional[list[Path]] = None,
+    message_store: Optional[MessageStore] = None,
 ) -> dict[str, Any]:
     payload = agent.to_dict()
     if reports is not None:
         payload["reports"] = [str(path) for path in reports]
         payload["latest_reports"] = [path.name for path in reports[:5]]
+    if message_store is not None:
+        inbox = message_store.list_inbox(agent.agent_id)
+        outbox = message_store.list_outbox(agent.agent_id)
+        payload["unread_inbox_count"] = sum(1 for item in inbox if item.status == "unread")
+        payload["latest_inbox_messages"] = [
+            _message_preview_payload(item)
+            for item in inbox[:3]
+        ]
+        payload["latest_outbox_messages"] = [
+            _message_preview_payload(item)
+            for item in outbox[:3]
+        ]
     return payload
 
 
@@ -590,10 +604,11 @@ def _format_agent(
     agent: PersistentAgent,
     *,
     reports: Optional[list[Path]] = None,
+    message_store: Optional[MessageStore] = None,
     json_output: bool = False,
     brief: bool = False,
 ) -> str:
-    payload = _persistent_agent_payload(agent, reports=reports)
+    payload = _persistent_agent_payload(agent, reports=reports, message_store=message_store)
     if brief:
         payload = {
             "agent_id": payload["agent_id"],
@@ -619,6 +634,7 @@ def _format_agent(
         f"parent:       {agent.parent_agent_id or '-'}",
         f"created_at:   {agent.created_at}",
         f"workflows:    {len(agent.owned_workflow_ids)}",
+        f"unread_inbox: {payload.get('unread_inbox_count', 0)}",
     ]
     if agent.owned_workflow_ids:
         lines.append(f"owned_ids:    {', '.join(agent.owned_workflow_ids)}")
@@ -626,6 +642,16 @@ def _format_agent(
     for path in reports or []:
         lines.append(f"  {path.name}")
     if not reports:
+        lines.append("  none")
+    lines.append("latest_inbox:")
+    for item in payload.get("latest_inbox_messages", []):
+        lines.append(f"  {_format_message_preview_line(item, direction='from')}")
+    if not payload.get("latest_inbox_messages"):
+        lines.append("  none")
+    lines.append("latest_outbox:")
+    for item in payload.get("latest_outbox_messages", []):
+        lines.append(f"  {_format_message_preview_line(item, direction='to')}")
+    if not payload.get("latest_outbox_messages"):
         lines.append("  none")
     return "\n".join(lines)
 
@@ -651,11 +677,110 @@ def _format_mrn_step_result(result: MRnStepResult) -> str:
         parts.append(f"workflow_id={result.workflow_id}")
     if result.report_path:
         parts.append(f"report={Path(result.report_path).name}")
+    if result.message_id:
+        parts.append(f"message_id={result.message_id}")
     if result.parent_request:
         parts.append(f"parent_request={_compact_text(result.parent_request, limit=80)}")
     if result.error:
         parts.append(f"error={result.error}")
     return "step " + " | ".join(parts)
+
+
+def _message_preview_payload(message: PersistentMessage) -> dict[str, str]:
+    return {
+        "message_id": message.message_id,
+        "from_agent_id": message.from_agent_id,
+        "to_agent_id": message.to_agent_id,
+        "kind": message.kind,
+        "subject": message.subject,
+        "created_at": message.created_at,
+        "status": message.status,
+    }
+
+
+def _format_message_preview_line(item: dict[str, str], *, direction: str) -> str:
+    peer = item["from_agent_id"] if direction == "from" else item["to_agent_id"]
+    return (
+        f"{item['message_id']} {direction}={peer} "
+        f"kind={item['kind']} subject={item['subject']} "
+        f"status={item['status']} created={_short_ts(item['created_at'])}"
+    )
+
+
+def _format_messages_table(
+    messages: list[PersistentMessage],
+    *,
+    mode: str,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps([message.to_dict() for message in messages], indent=2, sort_keys=True)
+    if not messages:
+        return "No messages."
+    header = "FROM" if mode == "inbox" else "TO"
+    rows = [("MESSAGE_ID", header, "KIND", "SUBJECT", "CREATED_AT", "STATUS")]
+    for message in messages:
+        rows.append((
+            message.message_id,
+            message.from_agent_id if mode == "inbox" else message.to_agent_id,
+            message.kind,
+            message.subject[:40],
+            _short_ts(message.created_at),
+            message.status,
+        ))
+    return _render_table(rows)
+
+
+def _format_message_detail(
+    message: PersistentMessage,
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(message.to_dict(), indent=2, sort_keys=True)
+    return "\n".join([
+        f"message_id:   {message.message_id}",
+        f"from:         {message.from_agent_id}",
+        f"to:           {message.to_agent_id}",
+        f"kind:         {message.kind}",
+        f"subject:      {message.subject}",
+        f"status:       {message.status}",
+        f"workflow_id:  {message.workflow_id or '-'}",
+        f"task_id:      {message.task_id or '-'}",
+        f"created_at:   {message.created_at}",
+        f"read_at:      {message.read_at or '-'}",
+        f"archived_at:  {message.archived_at or '-'}",
+        "body:",
+        message.body,
+    ])
+
+
+def _resolve_mailbox_agent_id(
+    target_agent_id: Optional[str],
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> str:
+    resolved = target_agent_id or caller_agent_id
+    if scoped_agents.load_agent(resolved) is None:
+        raise ValueError(f"agent not found: {resolved}")
+    if scoped_agents.is_root_agent(caller_agent_id):
+        return resolved
+    if resolved != caller_agent_id:
+        raise AgentScopeError("access denied: message not in agent scope")
+    return resolved
+
+
+def _require_message(
+    message_store: MessageStore,
+    message_id: str,
+    caller_agent_id: str,
+) -> PersistentMessage:
+    message = message_store.get_message(message_id)
+    if message is None:
+        raise ValueError(f"message not found: {message_id}")
+    if not message_store.can_agent_access_message(caller_agent_id, message):
+        raise AgentScopeError("access denied: message not in agent scope")
+    return message
 
 
 def _format_tool(
@@ -1345,6 +1470,7 @@ def _cmd_agent(
     print(_format_agent(
         agent,
         reports=scoped_agents.list_reports(agent.agent_id),
+        message_store=getattr(args, "message_store", None),
         json_output=args.json,
         brief=args.brief,
     ))
@@ -1390,6 +1516,7 @@ def _cmd_agent_step(
     runner = MRnStepRunner(
         workflow_store=store,
         scoped_agent_store=scoped_agents,
+        message_store=getattr(args, "message_store", None),
         workflow_compiler=getattr(args, "workflow_compiler", None),
     )
     try:
@@ -1398,6 +1525,147 @@ def _cmd_agent_step(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_mrn_step_result(result))
+    return 0
+
+
+def _cmd_inbox(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    message_store = getattr(args, "message_store")
+    try:
+        target_agent_id = _resolve_mailbox_agent_id(
+            getattr(args, "agent", None),
+            caller_agent_id,
+            scoped_agents,
+        )
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_messages_table(
+        message_store.list_inbox(target_agent_id, include_archived=bool(args.archived)),
+        mode="inbox",
+        json_output=args.json,
+    ))
+    return 0
+
+
+def _cmd_outbox(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    message_store = getattr(args, "message_store")
+    try:
+        target_agent_id = _resolve_mailbox_agent_id(
+            getattr(args, "agent", None),
+            caller_agent_id,
+            scoped_agents,
+        )
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_messages_table(
+        message_store.list_outbox(target_agent_id, include_archived=bool(args.archived)),
+        mode="outbox",
+        json_output=args.json,
+    ))
+    return 0
+
+
+def _cmd_message(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, scoped_agents
+    message_store = getattr(args, "message_store")
+    try:
+        message = _require_message(message_store, args.message_id, caller_agent_id)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_message_detail(message, json_output=args.json))
+    return 0
+
+
+def _cmd_message_read(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, scoped_agents
+    message_store = getattr(args, "message_store")
+    try:
+        _require_message(message_store, args.message_id, caller_agent_id)
+        message = message_store.mark_read(args.message_id)
+        if message is None:
+            raise ValueError(f"message not found: {args.message_id}")
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(message.message_id)
+    return 0
+
+
+def _cmd_message_archive(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, scoped_agents
+    message_store = getattr(args, "message_store")
+    try:
+        _require_message(message_store, args.message_id, caller_agent_id)
+        message = message_store.archive_message(args.message_id)
+        if message is None:
+            raise ValueError(f"message not found: {args.message_id}")
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(message.message_id)
+    return 0
+
+
+def _cmd_message_send(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    message_store = getattr(args, "message_store")
+    body_path = Path(args.body_file)
+    if not body_path.exists():
+        print(f"error: message body file not found: {body_path}", file=sys.stderr)
+        return 2
+    try:
+        body = body_path.read_text(encoding="utf-8")
+    except OSError:
+        print(f"error: message body file not found: {body_path}", file=sys.stderr)
+        return 2
+    if not message_store.can_agent_send_message(caller_agent_id, args.to_agent_id):
+        print("error: access denied: recipient not in agent scope", file=sys.stderr)
+        return 2
+    if scoped_agents.load_agent(caller_agent_id) is None:
+        print("error: access denied: recipient not in agent scope", file=sys.stderr)
+        return 2
+    message = message_store.create_message(
+        from_agent_id=caller_agent_id,
+        to_agent_id=args.to_agent_id,
+        kind=args.kind,
+        subject=args.subject,
+        body=body,
+    )
+    print(message.message_id)
     return 0
 
 
@@ -1592,6 +1860,42 @@ def _build_parser() -> argparse.ArgumentParser:
     p_agent_step.add_argument("agent_id")
     p_agent_step.set_defaults(func=_cmd_agent_step)
 
+    p_inbox = subs.add_parser("inbox", help="List inbox messages for an agent.")
+    p_inbox.add_argument("--agent", default=None)
+    p_inbox.add_argument("--archived", action="store_true")
+    add_common_flags(p_inbox, include_example=False)
+    p_inbox.set_defaults(func=_cmd_inbox)
+
+    p_outbox = subs.add_parser("outbox", help="List outbox messages for an agent.")
+    p_outbox.add_argument("--agent", default=None)
+    p_outbox.add_argument("--archived", action="store_true")
+    add_common_flags(p_outbox, include_example=False)
+    p_outbox.set_defaults(func=_cmd_outbox)
+
+    p_message = subs.add_parser("message", help="Show one message.")
+    p_message.add_argument("message_id")
+    add_common_flags(p_message, include_example=False)
+    p_message.set_defaults(func=_cmd_message)
+
+    p_message_read = subs.add_parser("message-read", help="Mark one message as read.")
+    p_message_read.add_argument("message_id")
+    p_message_read.set_defaults(func=_cmd_message_read)
+
+    p_message_archive = subs.add_parser("message-archive", help="Archive one message.")
+    p_message_archive.add_argument("message_id")
+    p_message_archive.set_defaults(func=_cmd_message_archive)
+
+    p_message_send = subs.add_parser("message-send", help="Send one persistent message.")
+    p_message_send.add_argument("to_agent_id")
+    p_message_send.add_argument("subject")
+    p_message_send.add_argument("body_file")
+    p_message_send.add_argument(
+        "--kind",
+        choices=["report", "question", "alert", "status", "request"],
+        default="request",
+    )
+    p_message_send.set_defaults(func=_cmd_message_send)
+
     p_result = subs.add_parser("result", help="Show normalized task output.")
     p_result.add_argument("task_id")
     p_result.set_defaults(func=_cmd_result)
@@ -1637,6 +1941,7 @@ def main(
     store: Optional[WorkflowStore] = None,
     caller_agent_id: Optional[str] = None,
     scoped_agent_store: Optional[PersistentAgentStore] = None,
+    message_store: Optional[MessageStore] = None,
     workflow_compiler: Optional[Any] = None,
 ) -> int:
     parser = _build_parser()
@@ -1645,8 +1950,13 @@ def main(
     active_scoped_store = scoped_agent_store or PersistentAgentStore(
         root=active_store.root.parent / "agents"
     )
+    active_message_store = message_store or MessageStore(
+        root=active_store.root.parent / "messages",
+        scoped_agent_store=active_scoped_store,
+    )
     resolved_caller_agent_id = caller_agent_id or active_scoped_store.root_agent_id
     setattr(args, "workflow_compiler", workflow_compiler)
+    setattr(args, "message_store", active_message_store)
     return args.func(args, active_store, resolved_caller_agent_id, active_scoped_store)
 
 
