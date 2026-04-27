@@ -42,6 +42,11 @@ def new_agent_id() -> str:
     return f"ag-{_ts_compact()}-{uuid.uuid4().hex[:6]}"
 
 
+def new_run_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return f"run-{timestamp}-{uuid.uuid4().hex[:6]}"
+
+
 @dataclass
 class PersistentAgent:
     agent_id: str
@@ -59,6 +64,7 @@ class PersistentAgent:
     last_step_at: Optional[str] = None
     last_action: Optional[dict[str, Any]] = None
     parent_request: Optional[str] = None
+    last_run: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +83,7 @@ class PersistentAgent:
             "last_step_at": self.last_step_at,
             "last_action": dict(self.last_action) if self.last_action is not None else None,
             "parent_request": self.parent_request,
+            "last_run": dict(self.last_run) if self.last_run is not None else None,
         }
 
     @classmethod
@@ -98,6 +105,8 @@ class PersistentAgent:
             last_action=dict(data["last_action"])
             if isinstance(data.get("last_action"), dict) else None,
             parent_request=data.get("parent_request"),
+            last_run=dict(data["last_run"])
+            if isinstance(data.get("last_run"), dict) else None,
         )
 
 
@@ -138,6 +147,17 @@ class PersistentAgentStore:
     def step_log_path(self, agent_id: str) -> Path:
         return self.logs_dir(agent_id) / "steps.jsonl"
 
+    def run_logs_dir(self, agent_id: str) -> Path:
+        path = self.logs_dir(agent_id) / "runs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def run_log_path(self, agent_id: str, run_id: str) -> Path:
+        return self.run_logs_dir(agent_id) / f"{run_id}.json"
+
+    def run_summary_log_path(self, agent_id: str) -> Path:
+        return self.logs_dir(agent_id) / "runs.jsonl"
+
     def report_dir(self, agent_id: str) -> Path:
         path = self.agent_dir(agent_id) / "reports"
         path.mkdir(parents=True, exist_ok=True)
@@ -146,6 +166,7 @@ class PersistentAgentStore:
     def ensure_agent_files(self, agent_id: str) -> None:
         self.agent_dir(agent_id)
         self.logs_dir(agent_id)
+        self.run_logs_dir(agent_id)
         self.report_dir(agent_id)
         memory_path = self.memory_path(agent_id)
         if not memory_path.exists():
@@ -338,6 +359,22 @@ class PersistentAgentStore:
     def append_step_log(self, agent_id: str, record: dict[str, Any]) -> Path:
         with self._lock:
             path = self.step_log_path(agent_id)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            return path
+
+    def write_run_log(self, agent_id: str, run_id: str, record: dict[str, Any]) -> Path:
+        with self._lock:
+            path = self.run_log_path(agent_id, run_id)
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, indent=2, sort_keys=True)
+            tmp.replace(path)
+            return path
+
+    def append_run_summary(self, agent_id: str, record: dict[str, Any]) -> Path:
+        with self._lock:
+            path = self.run_summary_log_path(agent_id)
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
             return path

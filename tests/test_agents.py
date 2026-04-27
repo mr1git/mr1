@@ -13,6 +13,7 @@ from mr1 import workflow_cli
 from mr1.agents import default_agent_registry, run_agent_health
 from mr1.kazi_runner import MockRunner
 from mr1.mrn_loop import MRnStepResult
+from mr1.mrn_run import MRnRunResult
 from mr1.mr1 import MR1, StateManager
 from mr1.workflow_store import WorkflowStore
 
@@ -265,4 +266,29 @@ class TestAgentBuiltins:
         output = mr1._handle_builtin(f"/agent step {child.agent_id}")
 
         assert "action=idle" in output
+        assert child.agent_id in output
+
+    @patch("mr1.mr1.MRnRunRunner.run")
+    def test_agent_run_builtin(self, mock_run, tmp_path):
+        mr1 = _build_mr1(tmp_path)
+        child = mr1._scoped_agents.create_child_agent(mr1._root_agent_id, "research")
+        mr1._scoped_agents.assign_mission(mr1._root_agent_id, child.agent_id, "Investigate")
+        mock_run.return_value = MRnRunResult(
+            run_id="run-1",
+            agent_id=child.agent_id,
+            caller_agent_id=mr1._root_agent_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:02+00:00",
+            policy={"max_steps": 5},
+            steps=[{"iteration": 1}],
+            workflows_created=0,
+            messages_created=0,
+            stopped_reason="max_steps",
+            status="completed",
+            final_run_status="idle",
+        )
+
+        output = mr1._handle_builtin(f"/agent run {child.agent_id} --steps 5")
+
+        assert "run_id=run-1" in output
         assert child.agent_id in output

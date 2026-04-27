@@ -35,6 +35,7 @@ from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
+from mr1.mrn_run import MRnRunPolicy, MRnRunResult, MRnRunRunner
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import (
     WatcherTriggerError,
@@ -573,6 +574,11 @@ def _persistent_agent_payload(
     message_store: Optional[MessageStore] = None,
 ) -> dict[str, Any]:
     payload = agent.to_dict()
+    last_run = agent.last_run or {}
+    payload["latest_run_id"] = last_run.get("run_id")
+    payload["latest_run_stopped_reason"] = last_run.get("stopped_reason")
+    payload["latest_run_step_count"] = last_run.get("step_count")
+    payload["latest_run_at"] = last_run.get("finished_at")
     if reports is not None:
         payload["reports"] = [str(path) for path in reports]
         payload["latest_reports"] = [path.name for path in reports[:5]]
@@ -629,6 +635,10 @@ def _format_agent(
         f"iteration:    {agent.current_iteration}",
         f"last_step_at: {_short_ts(agent.last_step_at)}",
         f"last_action:  {_summarize_last_action(agent.last_action)}",
+        f"latest_run:   {payload.get('latest_run_id') or '-'}",
+        f"run_reason:   {payload.get('latest_run_stopped_reason') or '-'}",
+        f"run_steps:    {payload.get('latest_run_step_count') or 0}",
+        f"run_at:       {_short_ts(payload.get('latest_run_at'))}",
         f"parent_req:   {_compact_text(agent.parent_request)}",
         f"tree_level:   {agent.tree_level}",
         f"parent:       {agent.parent_agent_id or '-'}",
@@ -684,6 +694,18 @@ def _format_mrn_step_result(result: MRnStepResult) -> str:
     if result.error:
         parts.append(f"error={result.error}")
     return "step " + " | ".join(parts)
+
+
+def _format_mrn_run_result(result: MRnRunResult) -> str:
+    return "run " + " | ".join([
+        f"agent_id={result.agent_id}",
+        f"run_id={result.run_id}",
+        f"steps={result.steps_completed}",
+        f"stopped_reason={result.stopped_reason}",
+        f"workflows_created={result.workflows_created}",
+        f"messages_created={result.messages_created}",
+        f"final_run_status={result.final_run_status}",
+    ])
 
 
 def _message_preview_payload(message: PersistentMessage) -> dict[str, str]:
@@ -1398,13 +1420,17 @@ def _cmd_agent(
     caller_agent_id: str,
     scoped_agents: PersistentAgentStore,
 ) -> int:
-    del store
+    usage = (
+        "agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|"
+        "step <ag-id>|run <ag-id> [--steps N] [--max-workflows N] "
+        "[--no-confirm-workflows]|<ag-id>|kazi [health]>"
+    )
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
         return rc
     parts = list(args.parts)
     if not parts:
-        print("error: usage: agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]>", file=sys.stderr)
+        print(f"error: usage: {usage}", file=sys.stderr)
         return 2
     if parts[0] == "create":
         title = " ".join(parts[1:]).strip()
@@ -1443,6 +1469,29 @@ def _cmd_agent(
             caller_agent_id,
             scoped_agents,
         ) if len(parts) == 2 else _print_agent_usage_error("agent step <ag-id>")
+    if parts[0] == "run":
+        if len(parts) < 2:
+            return _print_agent_usage_error(
+                "agent run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]"
+            )
+        return _cmd_agent_run(
+            argparse.Namespace(
+                agent_id=parts[1],
+                steps=getattr(args, "steps", 3),
+                max_workflows=getattr(args, "max_workflows", 2),
+                no_stop_on_waiting=getattr(args, "no_stop_on_waiting", False),
+                stop_on_idle=getattr(args, "stop_on_idle", False),
+                no_stop_on_workflow_running=getattr(args, "no_stop_on_workflow_running", False),
+                allow_action=getattr(args, "allow_action", []),
+                no_confirm_workflows=getattr(args, "no_confirm_workflows", False),
+                max_runtime_s=getattr(args, "max_runtime_s", None),
+                workflow_compiler=getattr(args, "workflow_compiler", None),
+                message_store=getattr(args, "message_store", None),
+            ),
+            store,
+            caller_agent_id,
+            scoped_agents,
+        )
     target = parts[0]
     if not target.startswith("ag-"):
         action = parts[1] if len(parts) > 1 else None
@@ -1525,6 +1574,37 @@ def _cmd_agent_step(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_mrn_step_result(result))
+    return 0
+
+
+def _cmd_agent_run(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    runner = MRnRunRunner(
+        workflow_store=store,
+        scoped_agent_store=scoped_agents,
+        message_store=getattr(args, "message_store", None),
+        workflow_compiler=getattr(args, "workflow_compiler", None),
+    )
+    policy = MRnRunPolicy(
+        max_steps=args.steps,
+        max_workflows_created=args.max_workflows,
+        stop_on_waiting=not args.no_stop_on_waiting,
+        stop_on_idle=bool(args.stop_on_idle),
+        stop_on_workflow_running=not args.no_stop_on_workflow_running,
+        allowed_actions=list(args.allow_action) if args.allow_action else None,
+        require_confirmation_for_workflows=not args.no_confirm_workflows,
+        max_runtime_s=args.max_runtime_s,
+    )
+    try:
+        result = runner.run(args.agent_id, policy, caller_agent_id=caller_agent_id)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_mrn_run_result(result))
     return 0
 
 
@@ -1859,6 +1939,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_agent_step = subs.add_parser("agent-step", help="Run one bounded MRn step for a persistent scoped agent.")
     p_agent_step.add_argument("agent_id")
     p_agent_step.set_defaults(func=_cmd_agent_step)
+
+    p_agent_run = subs.add_parser("agent-run", help="Run a bounded multi-step MRn run for a persistent scoped agent.")
+    p_agent_run.add_argument("agent_id")
+    p_agent_run.add_argument("--steps", type=int, default=3)
+    p_agent_run.add_argument("--max-workflows", type=int, default=2)
+    p_agent_run.add_argument("--no-stop-on-waiting", action="store_true")
+    p_agent_run.add_argument("--stop-on-idle", action="store_true")
+    p_agent_run.add_argument("--no-stop-on-workflow-running", action="store_true")
+    p_agent_run.add_argument("--allow-action", action="append", default=[])
+    p_agent_run.add_argument("--no-confirm-workflows", action="store_true")
+    p_agent_run.add_argument("--max-runtime-s", type=int, default=None)
+    p_agent_run.set_defaults(func=_cmd_agent_run)
 
     p_inbox = subs.add_parser("inbox", help="List inbox messages for an agent.")
     p_inbox.add_argument("--agent", default=None)

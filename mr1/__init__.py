@@ -54,6 +54,9 @@ _EXPORTS = {
     "WorkflowCompilerFailure": ("mr1.workflow_compiler", "WorkflowCompilerFailure"),
     "MRnStepRunner": ("mr1.mrn_loop", "MRnStepRunner"),
     "MRnStepResult": ("mr1.mrn_loop", "MRnStepResult"),
+    "MRnRunPolicy": ("mr1.mrn_run", "MRnRunPolicy"),
+    "MRnRunResult": ("mr1.mrn_run", "MRnRunResult"),
+    "MRnRunRunner": ("mr1.mrn_run", "MRnRunRunner"),
     "PersistentMessage": ("mr1.messages", "PersistentMessage"),
     "MessageStore": ("mr1.messages", "MessageStore"),
 }

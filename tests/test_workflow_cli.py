@@ -20,6 +20,7 @@ from mr1 import workflow_cli
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.kazi_runner import MockRunner, RunStatus
 from mr1.mrn_loop import MRnStepResult
+from mr1.mrn_run import MRnRunResult
 from mr1.scheduler import Scheduler
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.workflow_models import Provenance, TaskStatus
@@ -273,6 +274,39 @@ class TestAgentStepCommands:
         out = capsys.readouterr().out
         assert "action=idle" in out
         assert f"agent_id={child.agent_id}" in out
+
+    def test_agent_run_command_formats_result(self, tmp_path, store, capsys):
+        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        root = agent_store.ensure_root_agent()
+        child = agent_store.create_child_agent(root.agent_id, "research")
+        agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
+
+        with patch("mr1.workflow_cli.MRnRunRunner.run") as mock_run:
+            mock_run.return_value = MRnRunResult(
+                run_id="run-1",
+                agent_id=child.agent_id,
+                caller_agent_id=root.agent_id,
+                started_at="2026-01-01T00:00:00+00:00",
+                finished_at="2026-01-01T00:00:02+00:00",
+                policy={"max_steps": 2},
+                steps=[{"iteration": 1}, {"iteration": 2}],
+                workflows_created=1,
+                messages_created=0,
+                stopped_reason="max_steps",
+                status="completed",
+                final_run_status="working",
+            )
+            rc = workflow_cli.main(
+                ["agent-run", child.agent_id, "--steps", "2"],
+                store=store,
+                scoped_agent_store=agent_store,
+            )
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "run_id=run-1" in out
+        assert f"agent_id={child.agent_id}" in out
+        assert "steps=2" in out
 
     def test_events_workflow_not_found(self, store, capsys):
         rc = workflow_cli.main(["events", "wf-missing"], store=store)

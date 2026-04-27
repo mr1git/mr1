@@ -35,7 +35,7 @@ from mr1.workflow_store import WorkflowStore
 _PKG_ROOT = Path(__file__).resolve().parent
 _MRN_CONFIG_PATH = _PKG_ROOT / "agents" / "mrn.yml"
 _DEFAULT_TIMEOUT_S = 300
-_ALLOWED_ACTIONS = frozenset({
+ALLOWED_MRN_ACTIONS = frozenset({
     "create_workflow",
     "inspect_workflow",
     "write_report",
@@ -43,6 +43,7 @@ _ALLOWED_ACTIONS = frozenset({
     "ask_parent",
     "idle",
 })
+_ALLOWED_ACTIONS = ALLOWED_MRN_ACTIONS
 _ALLOWED_STATUSES = frozenset({
     "idle",
     "working",
@@ -106,6 +107,12 @@ class MRnStepResult:
     message_id: Optional[str] = None
     parent_request: Optional[str] = None
     error: Optional[str] = None
+    created_workflow_id: Optional[str] = None
+    created_workflow_status: Optional[str] = None
+    created_parent_message_id: Optional[str] = None
+    message_to_agent_id: Optional[str] = None
+    confirmation_required: bool = False
+    workflow_submitted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +128,12 @@ class MRnStepResult:
             "message_id": self.message_id,
             "parent_request": self.parent_request,
             "error": self.error,
+            "created_workflow_id": self.created_workflow_id,
+            "created_workflow_status": self.created_workflow_status,
+            "created_parent_message_id": self.created_parent_message_id,
+            "message_to_agent_id": self.message_to_agent_id,
+            "confirmation_required": self.confirmation_required,
+            "workflow_submitted": self.workflow_submitted,
         }
 
 
@@ -229,6 +242,7 @@ class MRnStepRunner:
         tool_registry: Optional[ToolRegistry] = None,
         message_store: Optional[MessageStore] = None,
         reasoner: Optional[ReasonerFn] = None,
+        require_confirmation_for_workflows: bool = False,
     ):
         self._workflow_store = workflow_store or WorkflowStore()
         self._scoped_agents = scoped_agent_store or PersistentAgentStore(
@@ -251,6 +265,7 @@ class MRnStepRunner:
             self._build_default_workflow_compiler_client()
         )
         self._reasoner = reasoner or run_mrn_step_agent
+        self._require_confirmation_for_workflows = bool(require_confirmation_for_workflows)
         self._workflow_authoring = (
             workflow_authoring_service or
             self._build_default_authoring_service()
@@ -594,19 +609,29 @@ class MRnStepRunner:
             risks = list(authored.risks)
             needs_confirmation = bool(authored.needs_confirmation)
 
-        if not needs_confirmation:
+        should_require_confirmation = (
+            bool(needs_confirmation) or self._require_confirmation_for_workflows
+        )
+
+        if not should_require_confirmation:
             submission = self._workflow_authoring.submit(
                 spec,
                 created_by=Provenance(type="agent", id=agent.agent_id),
                 caller_agent_id=agent.agent_id,
                 owner_agent_id=agent.agent_id,
             )
+            created_workflow = self._workflow_store.load_workflow(submission.workflow_id)
             return self._persist_step(
                 agent,
                 action=action,
                 status_after=action["next_status"],
                 message=submission.message,
                 workflow_id=submission.workflow_id,
+                created_workflow_id=submission.workflow_id,
+                created_workflow_status=(
+                    created_workflow.status.value if created_workflow is not None else None
+                ),
+                workflow_submitted=True,
             )
 
         report_path = self._scoped_agents.write_report(
@@ -619,12 +644,33 @@ class MRnStepRunner:
                 risks,
             ),
         )
+        parent_message = None
+        if agent.parent_agent_id:
+            parent_message = self._send_agent_message(
+                agent,
+                kind="report",
+                subject=f"Workflow confirmation needed from {agent.title}",
+                body="\n".join([
+                    "Workflow creation requires confirmation.",
+                    f"Agent: {agent.agent_id}",
+                    f"Reason: {action['reason']}",
+                    f"Report path: {report_path}",
+                ]),
+                to_agent_id=agent.parent_agent_id,
+            )
         return self._persist_step(
             agent,
             action=action,
             status_after="reporting",
             message="workflow creation requires confirmation",
             report_path=str(report_path),
+            message_id=parent_message.message_id if parent_message is not None else None,
+            created_parent_message_id=(
+                parent_message.message_id if parent_message is not None else None
+            ),
+            message_to_agent_id=parent_message.to_agent_id if parent_message is not None else None,
+            confirmation_required=True,
+            workflow_submitted=False,
         )
 
     def _build_create_workflow_context(self, agent: PersistentAgent, action: dict[str, Any]) -> str:
@@ -745,6 +791,8 @@ class MRnStepRunner:
             message="report written",
             report_path=str(report_path),
             message_id=message.message_id if message is not None else None,
+            created_parent_message_id=message.message_id if message is not None else None,
+            message_to_agent_id=message.to_agent_id if message is not None else None,
         )
 
     def _execute_send_message(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
@@ -763,6 +811,12 @@ class MRnStepRunner:
             message=f"message sent to {message.to_agent_id}",
             workflow_id=action.get("workflow_id"),
             message_id=message.message_id,
+            created_parent_message_id=(
+                message.message_id
+                if message.to_agent_id == agent.parent_agent_id
+                else None
+            ),
+            message_to_agent_id=message.to_agent_id,
         )
 
     def _execute_ask_parent(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
@@ -780,6 +834,8 @@ class MRnStepRunner:
             message="parent clarification requested",
             message_id=message.message_id,
             parent_request=action["parent_request"],
+            created_parent_message_id=message.message_id,
+            message_to_agent_id=message.to_agent_id,
         )
 
     def _execute_idle(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
@@ -803,6 +859,12 @@ class MRnStepRunner:
         parent_request: Optional[str] = None,
         error: Optional[str] = None,
         workflow_summary: Optional[dict[str, Any]] = None,
+        created_workflow_id: Optional[str] = None,
+        created_workflow_status: Optional[str] = None,
+        created_parent_message_id: Optional[str] = None,
+        message_to_agent_id: Optional[str] = None,
+        confirmation_required: bool = False,
+        workflow_submitted: bool = False,
     ) -> MRnStepResult:
         updated = self._scoped_agents.require_agent(agent.agent_id)
         status_before = updated.run_status
@@ -823,6 +885,16 @@ class MRnStepRunner:
             normalized_last_action["report_path"] = report_path
         if message_id is not None:
             normalized_last_action["message_id"] = message_id
+        if created_workflow_id is not None:
+            normalized_last_action["created_workflow_id"] = created_workflow_id
+        if created_parent_message_id is not None:
+            normalized_last_action["created_parent_message_id"] = created_parent_message_id
+        if message_to_agent_id is not None:
+            normalized_last_action["message_to_agent_id"] = message_to_agent_id
+        if confirmation_required:
+            normalized_last_action["confirmation_required"] = True
+        if workflow_submitted:
+            normalized_last_action["workflow_submitted"] = True
         if parent_request is not None:
             normalized_last_action["parent_request"] = parent_request
         if error is not None:
@@ -841,6 +913,12 @@ class MRnStepRunner:
             "message_id": message_id,
             "parent_request": parent_request,
             "error": error,
+            "created_workflow_id": created_workflow_id,
+            "created_workflow_status": created_workflow_status,
+            "created_parent_message_id": created_parent_message_id,
+            "message_to_agent_id": message_to_agent_id,
+            "confirmation_required": confirmation_required,
+            "workflow_submitted": workflow_submitted,
         }
         if workflow_summary is not None:
             log_record["workflow_summary"] = workflow_summary
@@ -858,6 +936,12 @@ class MRnStepRunner:
             message_id=message_id,
             parent_request=parent_request,
             error=error,
+            created_workflow_id=created_workflow_id,
+            created_workflow_status=created_workflow_status,
+            created_parent_message_id=created_parent_message_id,
+            message_to_agent_id=message_to_agent_id,
+            confirmation_required=confirmation_required,
+            workflow_submitted=workflow_submitted,
         )
 
     def _send_agent_message(

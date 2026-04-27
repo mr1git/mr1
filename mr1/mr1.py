@@ -46,6 +46,7 @@ from mr1 import kazi, mrn
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
 from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
+from mr1.mrn_run import MRnRunPolicy, MRnRunRunner
 from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
 from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
 from mr1.workflow_models import Provenance, TaskStatus
@@ -1823,20 +1824,27 @@ class MR1:
             return f"tool not found: {positionals[0]}"
 
     def _handle_agent_builtin(self, cmd: str) -> str:
+        usage = (
+            "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|"
+            "step <ag-id>|run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]|"
+            "<ag-id>|kazi [health]> [--json] [--brief]"
+        )
         try:
             parts = shlex.split(cmd)
         except ValueError:
             if cmd.startswith("/agent"):
-                return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+                return usage
             return "usage: /agents [--json] [--brief]"
 
         command = parts[0]
+        if command == "/agent" and len(parts) > 1 and parts[1] == "run":
+            return self._handle_agent_run_builtin(parts[2:], usage)
         flags = {part for part in parts[1:] if part.startswith("--")}
         positionals = [part for part in parts[1:] if not part.startswith("--")]
         allowed_flags = {"--json", "--brief"}
         if any(flag not in allowed_flags for flag in flags):
             if command == "/agent":
-                return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+                return usage
             return "usage: /agents [--json] [--brief]"
 
         if command == "/agents":
@@ -1849,7 +1857,7 @@ class MR1:
             )
 
         if not positionals:
-            return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+            return usage
         if positionals[0] == "create":
             title = " ".join(positionals[1:]).strip()
             if not title:
@@ -1919,7 +1927,7 @@ class MR1:
             )
 
         if len(positionals) > 2 or (action is not None and action != "health"):
-            return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+            return usage
         try:
             if action == "health":
                 return workflow_cli._format_runtime_agent_health(
@@ -1933,6 +1941,58 @@ class MR1:
             )
         except ValueError:
             return f"agent not found: {agent_name}"
+
+    def _handle_agent_run_builtin(self, parts: list[str], usage: str) -> str:
+        if not parts:
+            return "usage: /agent run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]"
+        agent_id = parts[0]
+        if agent_id.startswith("--"):
+            return "usage: /agent run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]"
+        steps = 3
+        max_workflows = 2
+        require_confirmation_for_workflows = True
+        index = 1
+        while index < len(parts):
+            token = parts[index]
+            if token == "--steps":
+                if index + 1 >= len(parts):
+                    return "usage: /agent run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]"
+                try:
+                    steps = int(parts[index + 1])
+                except ValueError:
+                    return "usage: /agent run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]"
+                index += 2
+                continue
+            if token == "--max-workflows":
+                if index + 1 >= len(parts):
+                    return "usage: /agent run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]"
+                try:
+                    max_workflows = int(parts[index + 1])
+                except ValueError:
+                    return "usage: /agent run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]"
+                index += 2
+                continue
+            if token == "--no-confirm-workflows":
+                require_confirmation_for_workflows = False
+                index += 1
+                continue
+            return usage
+
+        runner = MRnRunRunner(
+            workflow_store=self._workflow_store,
+            scoped_agent_store=self._scoped_agents,
+            message_store=self._message_store,
+        )
+        policy = MRnRunPolicy(
+            max_steps=steps,
+            max_workflows_created=max_workflows,
+            require_confirmation_for_workflows=require_confirmation_for_workflows,
+        )
+        try:
+            result = runner.run(agent_id, policy, caller_agent_id=self._root_agent_id)
+        except (ValueError, AgentScopeError) as exc:
+            return str(exc)
+        return workflow_cli._format_mrn_run_result(result)
 
     def _handle_message_builtin(self, cmd: str) -> str:
         try:
@@ -2107,6 +2167,7 @@ class MR1:
             "Commands: /status  /tasks  /kill  /history  /memdltr  "
             "/workflows  /watchers  /capabilities  /capability <name>  "
             "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  "
+            "/agent step <ag-id>  /agent run <ag-id> --steps N  "
             "/inbox  /outbox  /message <id>  /schema  /vizualize  /visualize-web  "
             "/test spawn agents <h>  /test kill agents"
         )

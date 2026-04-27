@@ -167,6 +167,7 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/agents` | List persistent scoped agents visible to the caller |
 | `/agent create <title>` | Create a scoped MRn child agent |
 | `/agent <ag-id>` | Show one scoped agent record and its reports |
+| `/agent run <ag-id> --steps N` | Run a bounded multi-step MRn loop under explicit policy |
 | `/agent kill <ag-id>` | Terminate a scoped agent |
 | `/inbox` | List MR1/root inbox messages |
 | `/inbox --archived` | List MR1/root inbox including archived messages |
@@ -231,6 +232,7 @@ python -m mr1.workflow_cli agents
 python -m mr1.workflow_cli agent create research
 python -m mr1.workflow_cli agent-assign <ag-id> path/to/mission.txt
 python -m mr1.workflow_cli agent-step <ag-id>
+python -m mr1.workflow_cli agent-run <ag-id> --steps 5
 python -m mr1.workflow_cli agent <ag-id>
 python -m mr1.workflow_cli agent kill <ag-id>
 python -m mr1.workflow_cli inbox
@@ -548,6 +550,7 @@ Scoped agent commands:
 /agent create research
 /agent assign <ag-id> path/to/mission.txt
 /agent step <ag-id>
+/agent run <ag-id> --steps 5
 /agent <ag-id>
 /agent kill <ag-id>
 ```
@@ -568,6 +571,58 @@ MR1 is the root MRn at `tree_level=1`. Persistent MRn agents can now be assigned
 - Reports are written under `mr1/memory/agents/<agent_id>/reports/`.
 - Step logs are appended to `mr1/memory/agents/<agent_id>/logs/steps.jsonl`.
 - Messaging delivery, infinite loops, and autonomous background execution are not part of this phase.
+
+## Controlled MRn Runs
+
+MRn can now execute multiple bounded steps under an explicit MR1-controlled run policy.
+
+- `step` runs one iteration and returns immediately.
+- `run` executes up to a fixed number of iterations and stops deterministically when policy requires it.
+- There is still no background daemon, scheduler loop, or unbounded autonomy.
+
+Default run policy:
+
+- `max_steps=3`
+- `max_workflows_created=2`
+- `stop_on_parent_message=true`
+- `stop_on_blocked=true`
+- `stop_on_waiting=true`
+- `stop_on_idle=false`
+- `stop_on_workflow_running=true`
+- `require_confirmation_for_workflows=true`
+
+Stop reasons:
+
+- `max_steps`
+- `waiting`
+- `blocked`
+- `idle`
+- `parent_message`
+- `workflow_running`
+- `workflow_limit`
+- `runtime_limit`
+- `disallowed_action`
+- `confirmation_required`
+
+Commands:
+
+```text
+/agent run <ag-id> --steps 5
+```
+
+```bash
+python -m mr1.workflow_cli agent-run <ag-id> --steps 5
+python -m mr1.workflow_cli agent-run <ag-id> --max-workflows 1 --no-confirm-workflows
+```
+
+Run logs are written under:
+
+```text
+mr1/memory/agents/<agent_id>/logs/runs/<run_id>.json
+mr1/memory/agents/<agent_id>/logs/runs.jsonl
+```
+
+Workflow validation and scoped ownership rules are unchanged. A bounded run can request workflow creation, but it cannot bypass workflow confirmation policy, runtime validation, or agent scope.
 
 ## Persistent Agent Messaging
 

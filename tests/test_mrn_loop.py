@@ -367,6 +367,9 @@ def test_create_workflow_stamps_owner_agent_id_as_mrn(workflow_store, agent_stor
 
     assert workflow is not None
     assert workflow.owner_agent_id == child.agent_id
+    assert result.created_workflow_id == result.workflow_id
+    assert result.created_workflow_status == "pending"
+    assert result.workflow_submitted is True
 
 
 def test_create_workflow_uses_default_compiler_client_when_only_compiler_is_provided(
@@ -388,6 +391,34 @@ def test_create_workflow_uses_default_compiler_client_when_only_compiler_is_prov
 
     assert workflow is not None
     assert workflow.owner_agent_id == child.agent_id
+
+
+def test_create_workflow_forced_confirmation_writes_report_and_parent_message(
+    workflow_store,
+    agent_store,
+    message_store,
+):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Create a workflow")
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        workflow_compiler=FakeCompiler(_envelope(COMPILE_SPEC)),
+        reasoner=FakeReasoner(_action("create_workflow", workflow_request="Read notes")),
+        require_confirmation_for_workflows=True,
+    )
+
+    result = runner.step(child.agent_id)
+    inbox = message_store.list_inbox(root.agent_id)
+
+    assert result.workflow_id is None
+    assert result.confirmation_required is True
+    assert result.workflow_submitted is False
+    assert result.report_path is not None
+    assert result.created_parent_message_id == result.message_id
+    assert inbox[0].subject == f"Workflow confirmation needed from {child.title}"
 
 
 def test_invalid_action_triggers_one_correction_pass(workflow_store, agent_store):
@@ -470,6 +501,12 @@ def test_agent_inspection_shows_mission_status_iteration_and_message_counts(agen
     child.mission = "Investigate repo"
     child.run_status = "waiting"
     child.current_iteration = 3
+    child.last_run = {
+        "run_id": "run-1",
+        "stopped_reason": "waiting",
+        "step_count": 2,
+        "finished_at": "2026-01-01T00:00:00+00:00",
+    }
     agent_store.save_agent(child)
     message_store.create_message(
         from_agent_id=root.agent_id,
@@ -495,6 +532,8 @@ def test_agent_inspection_shows_mission_status_iteration_and_message_counts(agen
     assert "mission:      Investigate repo" in formatted
     assert "run_status:   waiting" in formatted
     assert "iteration:    3" in formatted
+    assert "latest_run:   run-1" in formatted
+    assert "run_reason:   waiting" in formatted
     assert "unread_inbox: 1" in formatted
     assert "Need update" in formatted
     assert "Update" in formatted
