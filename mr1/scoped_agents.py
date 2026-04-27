@@ -52,6 +52,13 @@ class PersistentAgent:
     status: str = "active"
     created_at: str = field(default_factory=_now_iso)
     owned_workflow_ids: list[str] = field(default_factory=list)
+    mission: Optional[str] = None
+    mode: str = "manual"
+    run_status: str = "idle"
+    current_iteration: int = 0
+    last_step_at: Optional[str] = None
+    last_action: Optional[dict[str, Any]] = None
+    parent_request: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +70,13 @@ class PersistentAgent:
             "status": self.status,
             "created_at": self.created_at,
             "owned_workflow_ids": list(self.owned_workflow_ids),
+            "mission": self.mission,
+            "mode": self.mode,
+            "run_status": self.run_status,
+            "current_iteration": self.current_iteration,
+            "last_step_at": self.last_step_at,
+            "last_action": dict(self.last_action) if self.last_action is not None else None,
+            "parent_request": self.parent_request,
         }
 
     @classmethod
@@ -76,6 +90,14 @@ class PersistentAgent:
             status=data.get("status", "active"),
             created_at=data.get("created_at", _now_iso()),
             owned_workflow_ids=list(data.get("owned_workflow_ids", [])),
+            mission=data.get("mission"),
+            mode=data.get("mode", "manual"),
+            run_status=data.get("run_status", "idle"),
+            current_iteration=int(data.get("current_iteration", 0)),
+            last_step_at=data.get("last_step_at"),
+            last_action=dict(data["last_action"])
+            if isinstance(data.get("last_action"), dict) else None,
+            parent_request=data.get("parent_request"),
         )
 
 
@@ -100,13 +122,38 @@ class PersistentAgentStore:
     def agent_path(self, agent_id: str) -> Path:
         return self._root / f"{agent_id}.json"
 
-    def report_dir(self, agent_id: str) -> Path:
-        path = self._root / agent_id / "reports"
+    def agent_dir(self, agent_id: str) -> Path:
+        path = self._root / agent_id
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def memory_path(self, agent_id: str) -> Path:
+        return self.agent_dir(agent_id) / "memory.md"
+
+    def logs_dir(self, agent_id: str) -> Path:
+        path = self.agent_dir(agent_id) / "logs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def step_log_path(self, agent_id: str) -> Path:
+        return self.logs_dir(agent_id) / "steps.jsonl"
+
+    def report_dir(self, agent_id: str) -> Path:
+        path = self.agent_dir(agent_id) / "reports"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def ensure_agent_files(self, agent_id: str) -> None:
+        self.agent_dir(agent_id)
+        self.logs_dir(agent_id)
+        self.report_dir(agent_id)
+        memory_path = self.memory_path(agent_id)
+        if not memory_path.exists():
+            memory_path.write_text("", encoding="utf-8")
+
     def save_agent(self, agent: PersistentAgent) -> None:
         with self._lock:
+            self.ensure_agent_files(agent.agent_id)
             target = self.agent_path(agent.agent_id)
             tmp = target.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as handle:
@@ -119,7 +166,9 @@ class PersistentAgentStore:
             if not path.exists():
                 return None
             with open(path, "r", encoding="utf-8") as handle:
-                return PersistentAgent.from_dict(json.load(handle))
+                agent = PersistentAgent.from_dict(json.load(handle))
+            self.ensure_agent_files(agent.agent_id)
+            return agent
 
     def require_agent(self, agent_id: str) -> PersistentAgent:
         agent = self.load_agent(agent_id)
@@ -133,7 +182,9 @@ class PersistentAgentStore:
             for path in sorted(self._root.glob("ag-*.json")):
                 try:
                     with open(path, "r", encoding="utf-8") as handle:
-                        agents.append(PersistentAgent.from_dict(json.load(handle)))
+                        agent = PersistentAgent.from_dict(json.load(handle))
+                    self.ensure_agent_files(agent.agent_id)
+                    agents.append(agent)
                 except (OSError, json.JSONDecodeError, KeyError, ValueError):
                     continue
             agents.sort(key=lambda item: (item.tree_level, item.created_at, item.agent_id))
@@ -240,6 +291,56 @@ class PersistentAgentStore:
         if workflow_id not in agent.owned_workflow_ids:
             agent.owned_workflow_ids.append(workflow_id)
             self.save_agent(agent)
+
+    def assign_mission(
+        self,
+        caller_agent_id: str,
+        target_agent_id: str,
+        mission: str,
+    ) -> PersistentAgent:
+        if not self.can_manage_agent(caller_agent_id, target_agent_id):
+            raise AgentScopeError("access denied: agent not in scope")
+        agent = self.require_agent(target_agent_id)
+        if agent.status == "terminated":
+            raise ValueError(f"agent terminated: {target_agent_id}")
+        agent.mission = mission.strip() if isinstance(mission, str) else None
+        agent.run_status = "idle"
+        agent.current_iteration = 0
+        agent.last_step_at = None
+        agent.last_action = None
+        agent.parent_request = None
+        self.save_agent(agent)
+        return agent
+
+    def read_memory(self, agent_id: str) -> str:
+        path = self.memory_path(agent_id)
+        with self._lock:
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                return ""
+
+    def write_report(
+        self,
+        agent_id: str,
+        content: str,
+        *,
+        timestamp: Optional[str] = None,
+    ) -> Path:
+        with self._lock:
+            path = self.report_dir(agent_id) / f"{_report_ts(timestamp)}.md"
+            tmp = path.with_suffix(".md.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(content.rstrip() + "\n")
+            tmp.replace(path)
+            return path
+
+    def append_step_log(self, agent_id: str, record: dict[str, Any]) -> Path:
+        with self._lock:
+            path = self.step_log_path(agent_id)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            return path
 
     def normalize_workflow_ownership(self, workflow: "Workflow") -> "Workflow":
         root = self.ensure_root_agent()

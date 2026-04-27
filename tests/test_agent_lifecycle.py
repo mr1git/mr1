@@ -43,8 +43,15 @@ class TestRootBootstrap:
 
         assert root.agent_type == "mr1"
         assert root.tree_level == 1
+        assert root.mission is None
+        assert root.mode == "manual"
+        assert root.run_status == "idle"
+        assert root.current_iteration == 0
         assert agent_store.root_agent_id_path.exists()
         assert agent_store.agent_path(root.agent_id).exists()
+        assert agent_store.memory_path(root.agent_id).exists()
+        assert agent_store.logs_dir(root.agent_id).exists()
+        assert agent_store.report_dir(root.agent_id).exists()
 
         reloaded = PersistentAgentStore(root=agent_store.root)
         same_root = reloaded.ensure_root_agent()
@@ -61,6 +68,9 @@ class TestHierarchy:
         assert child.parent_agent_id == root.agent_id
         assert child.tree_level == root.tree_level + 1
         assert agent_store.agent_path(child.agent_id).exists()
+        assert agent_store.memory_path(child.agent_id).exists()
+        assert agent_store.logs_dir(child.agent_id).exists()
+        assert agent_store.report_dir(child.agent_id).exists()
 
         reloaded = agent_store.load_agent(child.agent_id)
         assert reloaded is not None

@@ -222,6 +222,8 @@ python -m mr1.workflow_cli tools
 python -m mr1.workflow_cli tool shell_command --example
 python -m mr1.workflow_cli agents
 python -m mr1.workflow_cli agent create research
+python -m mr1.workflow_cli agent-assign <ag-id> path/to/mission.txt
+python -m mr1.workflow_cli agent-step <ag-id>
 python -m mr1.workflow_cli agent <ag-id>
 python -m mr1.workflow_cli agent kill <ag-id>
 python -m mr1.workflow_cli agent kazi
@@ -530,6 +532,8 @@ Scoped agent commands:
 ```text
 /agents
 /agent create research
+/agent assign <ag-id> path/to/mission.txt
+/agent step <ag-id>
 /agent <ag-id>
 /agent kill <ag-id>
 ```
@@ -540,6 +544,16 @@ Scoped workflow rules:
 - MRn can inspect and mutate only workflows it owns or workflows owned by descendant agents.
 - Workflow-id commands return `access denied: workflow not in agent scope` when the caller is outside the owning branch.
 - Task-id lookups resolve only inside the caller's visible workflows.
+
+## Persistent MRn Execution Step
+
+MR1 is the root MRn at `tree_level=1`. Persistent MRn agents can now be assigned a mission and advanced one bounded step at a time.
+
+- `/agent step <ag-id>` runs exactly one reasoning/action iteration.
+- MRn actions are structured and deterministic: create a scoped workflow, inspect a scoped workflow, write a report, ask the parent for clarification, or stay idle.
+- Reports are written under `mr1/memory/agents/<agent_id>/reports/`.
+- Step logs are appended to `mr1/memory/agents/<agent_id>/logs/steps.jsonl`.
+- Messaging delivery, infinite loops, and autonomous background execution are not part of this phase.
 
 ## Agent Runtime
 

@@ -33,6 +33,7 @@ from typing import Any, Optional
 from mr1.agents import AgentRegistry, default_agent_registry, run_agent_health
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.mrn_loop import MRnStepResult, MRnStepRunner
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import (
     WatcherTriggerError,
@@ -572,7 +573,17 @@ def _persistent_agent_payload(
     payload = agent.to_dict()
     if reports is not None:
         payload["reports"] = [str(path) for path in reports]
+        payload["latest_reports"] = [path.name for path in reports[:5]]
     return payload
+
+
+def _summarize_last_action(action: Optional[dict[str, Any]]) -> str:
+    if not action:
+        return "-"
+    action_name = action.get("action", "-")
+    reason = action.get("reason", "-")
+    next_status = action.get("next_status", "-")
+    return f"{action_name} -> {next_status} ({reason})"
 
 
 def _format_agent(
@@ -597,6 +608,13 @@ def _format_agent(
         f"type:         {agent.agent_type}",
         f"title:        {agent.title}",
         f"status:       {agent.status}",
+        f"mission:      {_compact_text(agent.mission)}",
+        f"mode:         {agent.mode}",
+        f"run_status:   {agent.run_status}",
+        f"iteration:    {agent.current_iteration}",
+        f"last_step_at: {_short_ts(agent.last_step_at)}",
+        f"last_action:  {_summarize_last_action(agent.last_action)}",
+        f"parent_req:   {_compact_text(agent.parent_request)}",
         f"tree_level:   {agent.tree_level}",
         f"parent:       {agent.parent_agent_id or '-'}",
         f"created_at:   {agent.created_at}",
@@ -610,6 +628,34 @@ def _format_agent(
     if not reports:
         lines.append("  none")
     return "\n".join(lines)
+
+
+def _compact_text(text: Optional[str], *, limit: int = 120) -> str:
+    if not text:
+        return "-"
+    normalized = " ".join(text.split())
+    if len(normalized) > limit:
+        return normalized[:limit] + "..."
+    return normalized
+
+
+def _format_mrn_step_result(result: MRnStepResult) -> str:
+    parts = [
+        f"agent_id={result.agent_id}",
+        f"iteration={result.iteration}",
+        f"action={result.action}",
+        f"status={result.status_after}",
+        f"reason={result.reason}",
+    ]
+    if result.workflow_id:
+        parts.append(f"workflow_id={result.workflow_id}")
+    if result.report_path:
+        parts.append(f"report={Path(result.report_path).name}")
+    if result.parent_request:
+        parts.append(f"parent_request={_compact_text(result.parent_request, limit=80)}")
+    if result.error:
+        parts.append(f"error={result.error}")
+    return "step " + " | ".join(parts)
 
 
 def _format_tool(
@@ -1233,7 +1279,7 @@ def _cmd_agent(
         return rc
     parts = list(args.parts)
     if not parts:
-        print("error: usage: agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]>", file=sys.stderr)
+        print("error: usage: agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]>", file=sys.stderr)
         return 2
     if parts[0] == "create":
         title = " ".join(parts[1:]).strip()
@@ -1258,6 +1304,20 @@ def _cmd_agent(
             return 2
         print(agent.agent_id)
         return 0
+    if parts[0] == "assign":
+        return _cmd_agent_assign(
+            argparse.Namespace(agent_id=parts[1] if len(parts) > 1 else None, mission_file=parts[2] if len(parts) > 2 else None),
+            store,
+            caller_agent_id,
+            scoped_agents,
+        ) if len(parts) == 3 else _print_agent_usage_error("agent assign <ag-id> <mission-file>")
+    if parts[0] == "step":
+        return _cmd_agent_step(
+            argparse.Namespace(agent_id=parts[1] if len(parts) > 1 else None, workflow_compiler=getattr(args, "workflow_compiler", None)),
+            store,
+            caller_agent_id,
+            scoped_agents,
+        ) if len(parts) == 2 else _print_agent_usage_error("agent step <ag-id>")
     target = parts[0]
     if not target.startswith("ag-"):
         action = parts[1] if len(parts) > 1 else None
@@ -1288,6 +1348,56 @@ def _cmd_agent(
         json_output=args.json,
         brief=args.brief,
     ))
+    return 0
+
+
+def _print_agent_usage_error(usage: str) -> int:
+    print(f"error: usage: {usage}", file=sys.stderr)
+    return 2
+
+
+def _cmd_agent_assign(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    mission_path = Path(args.mission_file)
+    if not mission_path.exists():
+        print(f"error: mission file not found: {mission_path}", file=sys.stderr)
+        return 2
+    try:
+        mission = mission_path.read_text(encoding="utf-8")
+    except OSError:
+        print(f"error: mission file not found: {mission_path}", file=sys.stderr)
+        return 2
+    try:
+        agent = scoped_agents.assign_mission(caller_agent_id, args.agent_id, mission)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(agent.agent_id)
+    return 0
+
+
+def _cmd_agent_step(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    runner = MRnStepRunner(
+        workflow_store=store,
+        scoped_agent_store=scoped_agents,
+        workflow_compiler=getattr(args, "workflow_compiler", None),
+    )
+    try:
+        result = runner.step(args.agent_id, caller_agent_id=caller_agent_id)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_mrn_step_result(result))
     return 0
 
 
@@ -1472,6 +1582,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("parts", nargs="+")
     add_common_flags(p_agent, include_example=False)
     p_agent.set_defaults(func=_cmd_agent)
+
+    p_agent_assign = subs.add_parser("agent-assign", help="Assign a mission file to a persistent scoped agent.")
+    p_agent_assign.add_argument("agent_id")
+    p_agent_assign.add_argument("mission_file")
+    p_agent_assign.set_defaults(func=_cmd_agent_assign)
+
+    p_agent_step = subs.add_parser("agent-step", help="Run one bounded MRn step for a persistent scoped agent.")
+    p_agent_step.add_argument("agent_id")
+    p_agent_step.set_defaults(func=_cmd_agent_step)
 
     p_result = subs.add_parser("result", help="Show normalized task output.")
     p_result.add_argument("task_id")

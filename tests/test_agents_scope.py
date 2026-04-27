@@ -122,6 +122,23 @@ def test_agent_inspection_blocks_out_of_scope_agents(workflow_store, agent_store
     assert capsys.readouterr().err.strip() == "error: access denied: agent not in scope"
 
 
+def test_agent_step_blocks_out_of_scope_agents(workflow_store, agent_store, capsys):
+    root = agent_store.ensure_root_agent()
+    left = agent_store.create_child_agent(root.agent_id, "left")
+    right = agent_store.create_child_agent(root.agent_id, "right")
+    agent_store.assign_mission(root.agent_id, right.agent_id, "Investigate")
+
+    rc = workflow_cli.main(
+        ["agent-step", right.agent_id],
+        store=workflow_store,
+        caller_agent_id=left.agent_id,
+        scoped_agent_store=agent_store,
+    )
+
+    assert rc == 2
+    assert capsys.readouterr().err.strip() == "error: access denied: agent not in scope"
+
+
 def test_workflow_commands_deny_out_of_scope_workflows(workflow_store, agent_store, capsys, tmp_path):
     root = agent_store.ensure_root_agent()
     left = agent_store.create_child_agent(root.agent_id, "left")

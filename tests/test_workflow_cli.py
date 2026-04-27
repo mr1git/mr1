@@ -12,13 +12,16 @@ from __future__ import annotations
 import json
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from mr1 import workflow_cli
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.mrn_loop import MRnStepResult
 from mr1.scheduler import Scheduler
+from mr1.scoped_agents import PersistentAgentStore
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -222,6 +225,54 @@ class TestReadCommands:
         assert rc == 0
         out = capsys.readouterr().out
         assert "workflow_submitted" in out
+
+
+class TestAgentStepCommands:
+    def test_agent_assign_persists_mission(self, tmp_path, store, capsys):
+        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        root = agent_store.ensure_root_agent()
+        child = agent_store.create_child_agent(root.agent_id, "research")
+        mission_path = tmp_path / "mission.txt"
+        mission_path.write_text("Investigate the repo", encoding="utf-8")
+
+        rc = workflow_cli.main(
+            ["agent-assign", child.agent_id, str(mission_path)],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == child.agent_id
+        reloaded = agent_store.require_agent(child.agent_id)
+        assert reloaded.mission == "Investigate the repo"
+        assert reloaded.current_iteration == 0
+
+    def test_agent_step_command_formats_result(self, tmp_path, store, capsys):
+        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        root = agent_store.ensure_root_agent()
+        child = agent_store.create_child_agent(root.agent_id, "research")
+        agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
+
+        with patch("mr1.workflow_cli.MRnStepRunner.step") as mock_step:
+            mock_step.return_value = MRnStepResult(
+                agent_id=child.agent_id,
+                iteration=1,
+                action="idle",
+                status_before="idle",
+                status_after="idle",
+                reason="nothing to do",
+                message="agent remains idle",
+            )
+            rc = workflow_cli.main(
+                ["agent-step", child.agent_id],
+                store=store,
+                scoped_agent_store=agent_store,
+            )
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "action=idle" in out
+        assert f"agent_id={child.agent_id}" in out
 
     def test_events_workflow_not_found(self, store, capsys):
         rc = workflow_cli.main(["events", "wf-missing"], store=store)

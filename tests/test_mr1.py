@@ -174,6 +174,19 @@ class TestBuiltinCommands:
         result = mr1_instance._handle_builtin("not a command")
         assert result is None
 
+    def test_agent_builtin_shows_mission_and_iteration(self, mr1_instance):
+        child = mr1_instance._scoped_agents.create_child_agent(mr1_instance._root_agent_id, "research")
+        child.mission = "Investigate the repo"
+        child.run_status = "working"
+        child.current_iteration = 2
+        mr1_instance._scoped_agents.save_agent(child)
+
+        result = mr1_instance._handle_builtin(f"/agent {child.agent_id}")
+
+        assert "mission:      Investigate the repo" in result
+        assert "run_status:   working" in result
+        assert "iteration:    2" in result
+
     def test_memdltr_is_recognized(self, mr1_instance):
         # /memdltr needs a running process — mock it.
         mock_process = MagicMock(spec=MR1Process)

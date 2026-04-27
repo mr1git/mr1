@@ -181,6 +181,7 @@ def test_terminal_mrn_workflow_writes_report(tmp_path):
 
     reports = agent_store.list_reports(child.agent_id)
     assert len(reports) == 1
+    assert agent_store.logs_dir(child.agent_id).exists()
     content = reports[0].read_text(encoding="utf-8")
     assert workflow_id in content
     assert "status: succeeded" in content

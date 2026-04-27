@@ -44,6 +44,7 @@ sys.path.insert(0, str(_PKG_ROOT.parent))
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 from mr1 import kazi, mrn
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
+from mr1.mrn_loop import MRnStepRunner
 from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
 from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
 from mr1.workflow_models import Provenance, TaskStatus
@@ -1813,7 +1814,7 @@ class MR1:
             parts = shlex.split(cmd)
         except ValueError:
             if cmd.startswith("/agent"):
-                return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+                return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
             return "usage: /agents [--json] [--brief]"
 
         command = parts[0]
@@ -1822,7 +1823,7 @@ class MR1:
         allowed_flags = {"--json", "--brief"}
         if any(flag not in allowed_flags for flag in flags):
             if command == "/agent":
-                return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+                return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
             return "usage: /agents [--json] [--brief]"
 
         if command == "/agents":
@@ -1835,7 +1836,7 @@ class MR1:
             )
 
         if not positionals:
-            return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+            return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
         if positionals[0] == "create":
             title = " ".join(positionals[1:]).strip()
             if not title:
@@ -1853,6 +1854,38 @@ class MR1:
             except (ValueError, AgentScopeError) as exc:
                 return str(exc)
             return agent.agent_id
+        if positionals[0] == "assign":
+            if len(positionals) != 3:
+                return "usage: /agent assign <ag-id> <mission-file>"
+            mission_path = Path(positionals[2])
+            if not mission_path.exists():
+                return f"error: mission file not found: {mission_path}"
+            try:
+                mission = mission_path.read_text(encoding="utf-8")
+            except OSError:
+                return f"error: mission file not found: {mission_path}"
+            try:
+                agent = self._scoped_agents.assign_mission(
+                    self._root_agent_id,
+                    positionals[1],
+                    mission,
+                )
+            except (ValueError, AgentScopeError) as exc:
+                return str(exc)
+            return agent.agent_id
+        if positionals[0] == "step":
+            if len(positionals) != 2:
+                return "usage: /agent step <ag-id>"
+            runner = MRnStepRunner(
+                workflow_store=self._workflow_store,
+                scoped_agent_store=self._scoped_agents,
+                workflow_authoring_service=self._workflow_authoring,
+            )
+            try:
+                result = runner.step(positionals[1], caller_agent_id=self._root_agent_id)
+            except (ValueError, AgentScopeError) as exc:
+                return str(exc)
+            return workflow_cli._format_mrn_step_result(result)
 
         agent_name = positionals[0]
         action = positionals[1] if len(positionals) > 1 else None
@@ -1871,7 +1904,7 @@ class MR1:
             )
 
         if len(positionals) > 2 or (action is not None and action != "health"):
-            return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+            return "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|step <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
         try:
             if action == "health":
                 return workflow_cli._format_runtime_agent_health(

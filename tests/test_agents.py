@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from mr1 import workflow_cli
 from mr1.agents import default_agent_registry, run_agent_health
 from mr1.kazi_runner import MockRunner
+from mr1.mrn_loop import MRnStepResult
 from mr1.mr1 import MR1, StateManager
 from mr1.workflow_store import WorkflowStore
 
@@ -232,3 +234,35 @@ class TestAgentBuiltins:
         mr1 = _build_mr1(tmp_path)
 
         assert mr1._handle_builtin("/agent missing") == "agent not found: missing"
+
+    def test_agent_assign_builtin(self, tmp_path):
+        mr1 = _build_mr1(tmp_path)
+        child = mr1._scoped_agents.create_child_agent(mr1._root_agent_id, "research")
+        mission_path = tmp_path / "mission.txt"
+        mission_path.write_text("Investigate the repo", encoding="utf-8")
+
+        output = mr1._handle_builtin(f"/agent assign {child.agent_id} {mission_path}")
+
+        assert output == child.agent_id
+        reloaded = mr1._scoped_agents.require_agent(child.agent_id)
+        assert reloaded.mission == "Investigate the repo"
+
+    @patch("mr1.mr1.MRnStepRunner.step")
+    def test_agent_step_builtin(self, mock_step, tmp_path):
+        mr1 = _build_mr1(tmp_path)
+        child = mr1._scoped_agents.create_child_agent(mr1._root_agent_id, "research")
+        mr1._scoped_agents.assign_mission(mr1._root_agent_id, child.agent_id, "Investigate")
+        mock_step.return_value = MRnStepResult(
+            agent_id=child.agent_id,
+            iteration=1,
+            action="idle",
+            status_before="idle",
+            status_after="idle",
+            reason="nothing to do",
+            message="agent remains idle",
+        )
+
+        output = mr1._handle_builtin(f"/agent step {child.agent_id}")
+
+        assert "action=idle" in output
+        assert child.agent_id in output
