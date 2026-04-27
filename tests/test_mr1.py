@@ -735,3 +735,55 @@ class TestStep:
         assert "/artifacts wf-" in response
         assert "/result tk-" in response
         assert "/inputs tk-" in response
+
+    def test_compiler_agent_backend_uses_preview_and_auto_submit_gate(self, tmp_path):
+        compiler = FakeCompiler(
+            json.dumps(
+                {
+                    "preview": "Read the notes, then summarize them.",
+                    "spec": {
+                        "title": "Read and summarize",
+                        "tasks": [
+                            {
+                                "label": "read_notes",
+                                "title": "Read notes",
+                                "task_kind": "tool",
+                                "tool_type": "read_file",
+                                "tool_config": {"path": str(tmp_path / "notes.txt")},
+                            },
+                            {
+                                "label": "summarize",
+                                "title": "Summarize",
+                                "task_kind": "agent",
+                                "agent_type": "kazi",
+                                "depends_on": ["read_notes"],
+                                "inputs": [
+                                    {"name": "notes", "from": "read_notes.result.text"},
+                                ],
+                                "prompt": "Summarize the notes.",
+                            },
+                        ],
+                    },
+                    "assumptions": [],
+                    "risks": [],
+                    "needs_confirmation": True,
+                    "confidence": "high",
+                }
+            )
+        )
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_authoring_backend="compiler_agent",
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+
+        response = mr1_instance.step("Read a file and summarize it")
+
+        assert response.startswith("Read the notes, then summarize them.")
+        assert mr1_instance._state.pending_workflow is not None
+        assert mr1_instance._process.send.call_count == 0

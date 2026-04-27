@@ -49,6 +49,9 @@ _EXPORTS = {
     "PendingWorkflowDraft": ("mr1.workflow_authoring", "PendingWorkflowDraft"),
     "WorkflowAuthoringService": ("mr1.workflow_authoring", "WorkflowAuthoringService"),
     "workflow_to_spec": ("mr1.workflow_authoring", "workflow_to_spec"),
+    "WorkflowCompilerClient": ("mr1.workflow_compiler", "WorkflowCompilerClient"),
+    "WorkflowCompilerEnvelope": ("mr1.workflow_compiler", "WorkflowCompilerEnvelope"),
+    "WorkflowCompilerFailure": ("mr1.workflow_compiler", "WorkflowCompilerFailure"),
 }
 
 __all__ = sorted(_EXPORTS)

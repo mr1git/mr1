@@ -6,10 +6,12 @@ Deterministic workflow inspection and submission CLI.
 The CLI NEVER instantiates a scheduler. `submit` writes a workflow
 directory to disk and exits; the MR1-owned scheduler picks it up on its
 next tick. Read commands load state directly from the store and
-pretty-print — zero LLM calls, zero subprocesses.
+pretty-print. `compile-workflow` is the one CLI command that may invoke
+the workflow compiler agent.
 
 Sub-commands:
     submit <path>                      write workflow spec to the store
+    compile-workflow <path>           compile workflow request text into an envelope
     workflows                          list all workflows
     workflow <wf_id>                   show one workflow's tasks
     task <task_id>                     show one task's detail
@@ -31,6 +33,7 @@ from typing import Any, Optional
 from mr1.agents import AgentRegistry, default_agent_registry, run_agent_health
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import (
     WatcherTriggerError,
     WorkflowSpecError,
@@ -44,6 +47,7 @@ from mr1.scheduler import (
     trigger_watcher_on_disk,
 )
 from mr1.tools import ToolRegistry, default_tool_registry
+from mr1.workflow_compiler import WorkflowCompilerClient, WorkflowCompilerFailure
 from mr1.workflow_schema import (
     WorkflowSchemaRegistry,
     default_workflow_schema_registry,
@@ -457,7 +461,7 @@ def _format_tools(
     return _render_table(rows)
 
 
-def _format_agents(
+def _format_runtime_agents(
     registry: Optional[AgentRegistry] = None,
     *,
     json_output: bool = False,
@@ -481,7 +485,7 @@ def _format_agents(
     return _render_table(rows)
 
 
-def _format_agent(
+def _format_runtime_agent(
     agent_name: str,
     registry: Optional[AgentRegistry] = None,
     *,
@@ -498,11 +502,11 @@ def _format_agent(
             f"name:        {view['name']}",
             f"type:        {view['type']}",
             f"description: {view['description']}",
-        ])
+    ])
     return _format_description_text(description)
 
 
-def _format_agent_health(
+def _format_runtime_agent_health(
     agent_name: str,
     registry: Optional[AgentRegistry] = None,
     *,
@@ -522,6 +526,89 @@ def _format_agent_health(
         lines.append(f"  {key}: {value}")
     if result.get("error"):
         lines.append(f"error:       {result['error']}")
+    return "\n".join(lines)
+
+
+def _format_agents(
+    agents: list[PersistentAgent],
+    *,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    if not agents:
+        return "No agents."
+    payload = [_persistent_agent_payload(agent) for agent in agents]
+    if brief:
+        payload = [
+            {
+                "agent_id": item["agent_id"],
+                "agent_type": item["agent_type"],
+                "title": item["title"],
+                "status": item["status"],
+            }
+            for item in payload
+        ]
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    rows = [("AGENT_ID", "TYPE", "TITLE", "STATUS", "LEVEL", "PARENT", "WORKFLOWS")]
+    for agent in agents:
+        rows.append((
+            agent.agent_id,
+            agent.agent_type,
+            agent.title,
+            agent.status,
+            str(agent.tree_level),
+            agent.parent_agent_id or "-",
+            str(len(agent.owned_workflow_ids)),
+        ))
+    return _render_table(rows)
+
+
+def _persistent_agent_payload(
+    agent: PersistentAgent,
+    *,
+    reports: Optional[list[Path]] = None,
+) -> dict[str, Any]:
+    payload = agent.to_dict()
+    if reports is not None:
+        payload["reports"] = [str(path) for path in reports]
+    return payload
+
+
+def _format_agent(
+    agent: PersistentAgent,
+    *,
+    reports: Optional[list[Path]] = None,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    payload = _persistent_agent_payload(agent, reports=reports)
+    if brief:
+        payload = {
+            "agent_id": payload["agent_id"],
+            "agent_type": payload["agent_type"],
+            "title": payload["title"],
+            "status": payload["status"],
+        }
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    lines = [
+        f"agent_id:     {agent.agent_id}",
+        f"type:         {agent.agent_type}",
+        f"title:        {agent.title}",
+        f"status:       {agent.status}",
+        f"tree_level:   {agent.tree_level}",
+        f"parent:       {agent.parent_agent_id or '-'}",
+        f"created_at:   {agent.created_at}",
+        f"workflows:    {len(agent.owned_workflow_ids)}",
+    ]
+    if agent.owned_workflow_ids:
+        lines.append(f"owned_ids:    {', '.join(agent.owned_workflow_ids)}")
+    lines.append("reports:")
+    for path in reports or []:
+        lines.append(f"  {path.name}")
+    if not reports:
+        lines.append("  none")
     return "\n".join(lines)
 
 
@@ -594,6 +681,10 @@ def _format_description_text(description: dict[str, Any]) -> str:
             "runtime:",
             json.dumps(description.get("runtime", {}), indent=2, sort_keys=True),
         ])
+    if "workflow_task_allowed" in description:
+        lines.append(
+            f"workflow_task_allowed: {bool(description.get('workflow_task_allowed'))}"
+        )
     lines.extend([
         "examples:",
         json.dumps(description.get("examples", []), indent=2, sort_keys=True),
@@ -634,12 +725,42 @@ def _label_for_task_id(wf: Workflow, task_id: str) -> Optional[str]:
 def _find_workflow_for_task(
     store: WorkflowStore,
     task_id: str,
+    *,
+    workflows: Optional[list[Workflow]] = None,
 ) -> tuple[Optional[Workflow], Optional[Task]]:
-    for wf in store.list_workflows():
+    for wf in workflows if workflows is not None else store.list_workflows():
         task = wf.tasks.get(task_id)
         if task is not None:
             return wf, task
     return None, None
+
+
+def _visible_workflows(
+    store: WorkflowStore,
+    scoped_agents: PersistentAgentStore,
+    caller_agent_id: str,
+) -> list[Workflow]:
+    workflows = []
+    for workflow in store.list_workflows():
+        workflow = scoped_agents.normalize_workflow_ownership(workflow)
+        if scoped_agents.can_agent_access_workflow(caller_agent_id, workflow):
+            workflows.append(workflow)
+    return workflows
+
+
+def _load_scoped_workflow(
+    store: WorkflowStore,
+    workflow_id: str,
+    scoped_agents: PersistentAgentStore,
+    caller_agent_id: str,
+) -> Workflow:
+    workflow = store.load_workflow(workflow_id)
+    if workflow is None:
+        raise WorkflowSpecError(f"workflow not found: {workflow_id}")
+    workflow = scoped_agents.normalize_workflow_ownership(workflow)
+    if not scoped_agents.can_agent_access_workflow(caller_agent_id, workflow):
+        raise WorkflowSpecError("access denied: workflow not in agent scope")
+    return workflow
 
 
 def _load_json_file(path_str: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
@@ -656,12 +777,30 @@ def _load_json_file(path_str: str) -> tuple[Optional[dict[str, Any]], Optional[s
     return payload, None
 
 
+def _load_text_file(path_str: str) -> tuple[Optional[str], Optional[str]]:
+    path = Path(path_str)
+    if not path.exists():
+        return None, f"request file not found: {path}"
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, str(exc)
+    if not payload.strip():
+        return None, "request file must not be empty"
+    return payload, None
+
+
 # ---------------------------------------------------------------------------
 # Sub-command implementations
 # ---------------------------------------------------------------------------
 
 
-def _cmd_submit(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_submit(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     spec, error = _load_json_file(args.path)
     if error:
         print(f"error: {error}", file=sys.stderr)
@@ -671,6 +810,9 @@ def _cmd_submit(args: argparse.Namespace, store: WorkflowStore) -> int:
             spec,
             Provenance(type="user", id="cli"),
             store,
+            owner_agent_id=caller_agent_id,
+            caller_agent_id=caller_agent_id,
+            scoped_agent_store=scoped_agents,
             tool_registry=default_tool_registry(),
         )
     except WorkflowSpecError as exc:
@@ -680,8 +822,59 @@ def _cmd_submit(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_rerun(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_compile_workflow(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    request_text, error = _load_text_file(args.path)
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    owner_agent_id = args.owner or caller_agent_id
+
+    def _submitter(spec: dict[str, Any], submit_caller_agent_id: str, submit_owner_agent_id: str) -> tuple[str, str]:
+        wf_id = submit_spec_to_disk(
+            spec,
+            Provenance(type="user", id="cli"),
+            store,
+            owner_agent_id=submit_owner_agent_id,
+            caller_agent_id=submit_caller_agent_id,
+            scoped_agent_store=scoped_agents,
+            tool_registry=default_tool_registry(),
+        )
+        return wf_id, wf_id
+
+    client = WorkflowCompilerClient(
+        compiler=getattr(args, "workflow_compiler", None),
+        scoped_agent_store=scoped_agents,
+        tool_registry=default_tool_registry(),
+        submitter=_submitter if args.submit else None,
+    )
     try:
+        result = client.compile(
+            request=request_text,
+            context="CLI compile-workflow request",
+            caller_agent_id=caller_agent_id,
+            owner_agent_id=owner_agent_id,
+            mode="submit_if_valid" if args.submit else "preview_only",
+        )
+    except (WorkflowCompilerFailure, WorkflowSpecError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_rerun(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
         task_id = rerun_task_on_disk(
             store,
             args.workflow_id,
@@ -695,13 +888,19 @@ def _cmd_rerun(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_cancel_task(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_cancel_task(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    visible = _visible_workflows(store, scoped_agents, caller_agent_id)
+    wf, task = _find_workflow_for_task(store, args.task_id, workflows=visible)
+    if wf is None or task is None:
+        print(f"error: task not found: {args.task_id}", file=sys.stderr)
+        return 2
     try:
-        task_id = cancel_task_on_disk(
-            store,
-            args.task_id,
-            agent_id="cli",
-        )
+        task_id = cancel_task_on_disk(store, task.task_id, agent_id="cli")
     except WorkflowSpecError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -709,8 +908,14 @@ def _cmd_cancel_task(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_cancel_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_cancel_workflow(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
         workflow_id = cancel_workflow_on_disk(
             store,
             args.workflow_id,
@@ -723,12 +928,18 @@ def _cmd_cancel_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_append_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_append_workflow(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     spec, error = _load_json_file(args.path)
     if error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
         workflow_id = append_workflow_on_disk(
             store,
             args.workflow_id,
@@ -742,12 +953,18 @@ def _cmd_append_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_insert_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_insert_workflow(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     spec, error = _load_json_file(args.path)
     if error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
         workflow_id = insert_workflow_on_disk(
             store,
             args.workflow_id,
@@ -762,12 +979,18 @@ def _cmd_insert_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_replace_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_replace_workflow(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     spec, error = _load_json_file(args.path)
     if error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
         workflow_id = replace_workflow_on_disk(
             store,
             args.workflow_id,
@@ -781,7 +1004,12 @@ def _cmd_replace_workflow(args: argparse.Namespace, store: WorkflowStore) -> int
     if args.rerun:
         from mr1.scheduler import Scheduler
 
-        scheduler = Scheduler(store, auto_tick=False, agent_id="cli")
+        scheduler = Scheduler(
+            store,
+            auto_tick=False,
+            agent_id="cli",
+            scoped_agent_store=scoped_agents,
+        )
         try:
             scheduler.tick()
         finally:
@@ -790,22 +1018,42 @@ def _cmd_replace_workflow(args: argparse.Namespace, store: WorkflowStore) -> int
     return 0
 
 
-def _cmd_workflows(args: argparse.Namespace, store: WorkflowStore) -> int:
-    print(_format_workflows_table(store.list_workflows()))
+def _cmd_workflows(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    print(_format_workflows_table(_visible_workflows(store, scoped_agents, caller_agent_id)))
     return 0
 
 
-def _cmd_workflow(args: argparse.Namespace, store: WorkflowStore) -> int:
-    wf = store.load_workflow(args.workflow_id)
-    if wf is None:
-        print(f"error: workflow not found: {args.workflow_id}", file=sys.stderr)
+def _cmd_workflow(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    try:
+        wf = _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_workflow_detail(wf))
     return 0
 
 
-def _cmd_task(args: argparse.Namespace, store: WorkflowStore) -> int:
-    wf, task = _find_workflow_for_task(store, args.task_id)
+def _cmd_task(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    wf, task = _find_workflow_for_task(
+        store,
+        args.task_id,
+        workflows=_visible_workflows(store, scoped_agents, caller_agent_id),
+    )
     if wf is None or task is None:
         print(f"error: task not found: {args.task_id}", file=sys.stderr)
         return 2
@@ -813,14 +1061,26 @@ def _cmd_task(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_jobs(args: argparse.Namespace, store: WorkflowStore) -> int:
-    print(_format_jobs(store.list_workflows()))
+def _cmd_jobs(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    print(_format_jobs(_visible_workflows(store, scoped_agents, caller_agent_id)))
     return 0
 
 
-def _cmd_events(args: argparse.Namespace, store: WorkflowStore) -> int:
-    if store.load_workflow(args.workflow_id) is None:
-        print(f"error: workflow not found: {args.workflow_id}", file=sys.stderr)
+def _cmd_events(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     events = store.load_events(
         args.workflow_id,
@@ -833,8 +1093,13 @@ def _cmd_events(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_watchers(args: argparse.Namespace, store: WorkflowStore) -> int:
-    print(_format_watchers(store.list_workflows()))
+def _cmd_watchers(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    print(_format_watchers(_visible_workflows(store, scoped_agents, caller_agent_id)))
     return 0
 
 
@@ -845,8 +1110,13 @@ def _reject_invalid_flag_combination(args: argparse.Namespace) -> Optional[int]:
     return None
 
 
-def _cmd_capabilities(args: argparse.Namespace, store: WorkflowStore) -> int:
-    del store
+def _cmd_capabilities(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
         return rc
@@ -854,8 +1124,13 @@ def _cmd_capabilities(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_capability(args: argparse.Namespace, store: WorkflowStore) -> int:
-    del store
+def _cmd_capability(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
         return rc
@@ -872,8 +1147,13 @@ def _cmd_capability(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_tools(args: argparse.Namespace, store: WorkflowStore) -> int:
-    del store
+def _cmd_tools(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
         return rc
@@ -881,17 +1161,31 @@ def _cmd_tools(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_agents(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_agents(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     del store
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
         return rc
-    print(_format_agents(json_output=args.json, brief=args.brief))
+    print(_format_agents(
+        scoped_agents.list_visible_agents(caller_agent_id),
+        json_output=args.json,
+        brief=args.brief,
+    ))
     return 0
 
 
-def _cmd_schema(args: argparse.Namespace, store: WorkflowStore) -> int:
-    del store
+def _cmd_schema(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, caller_agent_id, scoped_agents
     try:
         print(_format_schema(
             args.section,
@@ -904,8 +1198,13 @@ def _cmd_schema(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_tool(args: argparse.Namespace, store: WorkflowStore) -> int:
-    del store
+def _cmd_tool(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
         return rc
@@ -922,31 +1221,87 @@ def _cmd_tool(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_agent(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_agent(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     del store
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
         return rc
-    try:
-        if args.action == "health":
-            print(_format_agent_health(
-                args.agent_name,
-                json_output=args.json,
-            ))
-        else:
-            print(_format_agent(
-                args.agent_name,
-                json_output=args.json,
-                brief=args.brief,
-            ))
-    except ValueError:
-        print(f"error: agent not found: {args.agent_name}", file=sys.stderr)
+    parts = list(args.parts)
+    if not parts:
+        print("error: usage: agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]>", file=sys.stderr)
         return 2
+    if parts[0] == "create":
+        title = " ".join(parts[1:]).strip()
+        if not title:
+            print("error: usage: agent create <title>", file=sys.stderr)
+            return 2
+        try:
+            agent = scoped_agents.create_child_agent(caller_agent_id, title)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(agent.agent_id)
+        return 0
+    if parts[0] == "kill":
+        if len(parts) != 2:
+            print("error: usage: agent kill <ag-id>", file=sys.stderr)
+            return 2
+        try:
+            agent = scoped_agents.terminate_agent(caller_agent_id, parts[1])
+        except (ValueError, AgentScopeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(agent.agent_id)
+        return 0
+    target = parts[0]
+    if not target.startswith("ag-"):
+        action = parts[1] if len(parts) > 1 else None
+        try:
+            if action == "health":
+                print(_format_runtime_agent_health(target, json_output=args.json))
+            else:
+                print(_format_runtime_agent(
+                    target,
+                    json_output=args.json,
+                    brief=args.brief,
+                ))
+        except ValueError:
+            print(f"error: agent not found: {target}", file=sys.stderr)
+            return 2
+        return 0
+    if len(parts) != 1:
+        print("error: usage: agent <ag-id>", file=sys.stderr)
+        return 2
+    try:
+        agent = scoped_agents.get_visible_agent(caller_agent_id, target)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_agent(
+        agent,
+        reports=scoped_agents.list_reports(agent.agent_id),
+        json_output=args.json,
+        brief=args.brief,
+    ))
     return 0
 
 
-def _cmd_result(args: argparse.Namespace, store: WorkflowStore) -> int:
-    wf, task = _find_workflow_for_task(store, args.task_id)
+def _cmd_result(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    wf, task = _find_workflow_for_task(
+        store,
+        args.task_id,
+        workflows=_visible_workflows(store, scoped_agents, caller_agent_id),
+    )
     if wf is None or task is None:
         print(f"error: task not found: {args.task_id}", file=sys.stderr)
         return 2
@@ -954,8 +1309,17 @@ def _cmd_result(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_inputs(args: argparse.Namespace, store: WorkflowStore) -> int:
-    wf, task = _find_workflow_for_task(store, args.task_id)
+def _cmd_inputs(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    wf, task = _find_workflow_for_task(
+        store,
+        args.task_id,
+        workflows=_visible_workflows(store, scoped_agents, caller_agent_id),
+    )
     if wf is None or task is None:
         print(f"error: task not found: {args.task_id}", file=sys.stderr)
         return 2
@@ -963,17 +1327,29 @@ def _cmd_inputs(args: argparse.Namespace, store: WorkflowStore) -> int:
     return 0
 
 
-def _cmd_artifacts(args: argparse.Namespace, store: WorkflowStore) -> int:
-    wf = store.load_workflow(args.workflow_id)
-    if wf is None:
-        print(f"error: workflow not found: {args.workflow_id}", file=sys.stderr)
+def _cmd_artifacts(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    try:
+        wf = _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_artifacts(wf))
     return 0
 
 
-def _cmd_trigger(args: argparse.Namespace, store: WorkflowStore) -> int:
+def _cmd_trigger(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
     try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
         task_id = trigger_watcher_on_disk(
             store,
             args.workflow_id,
@@ -981,7 +1357,7 @@ def _cmd_trigger(args: argparse.Namespace, store: WorkflowStore) -> int:
             event_name=args.event_name,
             agent_id="cli",
         )
-    except WatcherTriggerError as exc:
+    except (WatcherTriggerError, WorkflowSpecError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(task_id)
@@ -1017,6 +1393,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit = subs.add_parser("submit", help="Write a workflow spec to the store.")
     p_submit.add_argument("path", help="Path to a workflow JSON spec.")
     p_submit.set_defaults(func=_cmd_submit)
+
+    p_compile = subs.add_parser(
+        "compile-workflow",
+        help="Compile a workflow request file into a validated envelope.",
+    )
+    p_compile.add_argument("path", help="Path to a text file containing the workflow request.")
+    p_compile.add_argument("--owner", default=None)
+    p_compile.add_argument("--submit", action="store_true")
+    p_compile.set_defaults(func=_cmd_compile_workflow)
 
     p_rerun = subs.add_parser("rerun", help="Rerun one task in a workflow.")
     p_rerun.add_argument("workflow_id")
@@ -1069,7 +1454,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_tools, include_example=False)
     p_tools.set_defaults(func=_cmd_tools)
 
-    p_agents = subs.add_parser("agents", help="List registered workflow agents.")
+    p_agents = subs.add_parser("agents", help="List persistent scoped agents.")
     add_common_flags(p_agents, include_example=False)
     p_agents.set_defaults(func=_cmd_agents)
 
@@ -1083,9 +1468,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_tool, include_example=True)
     p_tool.set_defaults(func=_cmd_tool)
 
-    p_agent = subs.add_parser("agent", help="Show one agent description or health status.")
-    p_agent.add_argument("agent_name")
-    p_agent.add_argument("action", nargs="?", choices=["health"])
+    p_agent = subs.add_parser("agent", help="Manage scoped agents or inspect runtime agent profiles.")
+    p_agent.add_argument("parts", nargs="+")
     add_common_flags(p_agent, include_example=False)
     p_agent.set_defaults(func=_cmd_agent)
 
@@ -1128,11 +1512,23 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list[str]] = None, *, store: Optional[WorkflowStore] = None) -> int:
+def main(
+    argv: Optional[list[str]] = None,
+    *,
+    store: Optional[WorkflowStore] = None,
+    caller_agent_id: Optional[str] = None,
+    scoped_agent_store: Optional[PersistentAgentStore] = None,
+    workflow_compiler: Optional[Any] = None,
+) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     active_store = store if store is not None else WorkflowStore(root=args.store_root)
-    return args.func(args, active_store)
+    active_scoped_store = scoped_agent_store or PersistentAgentStore(
+        root=active_store.root.parent / "agents"
+    )
+    resolved_caller_agent_id = caller_agent_id or active_scoped_store.root_agent_id
+    setattr(args, "workflow_compiler", workflow_compiler)
+    return args.func(args, active_store, resolved_caller_agent_id, active_scoped_store)
 
 
 def _format_inline_value(item: ResolvedTaskInput) -> str:

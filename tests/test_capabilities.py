@@ -40,6 +40,7 @@ class TestCapabilityRegistry:
         assert "shell_command" in names
         assert "manual_event" in names
         assert "kazi" in names
+        assert "workflow_compiler" in names
         assert names == sorted(names)
 
     def test_duplicate_capability_name_rejected(self):
@@ -125,6 +126,7 @@ class TestCapabilityCli:
         assert "shell_command" in out
         assert "manual_event" in out
         assert "kazi" in out
+        assert "workflow_compiler" in out
 
     def test_cli_unknown_tool_error_is_deterministic(self, store, capsys):
         rc = workflow_cli.main(["tool", "missing_tool"], store=store)
@@ -151,6 +153,7 @@ class TestCapabilityBuiltins:
         assert "shell_command" in output
         assert "manual_event" in output
         assert "kazi" in output
+        assert "workflow_compiler" in output
 
     def test_mr1_capability_json_builtin(self, tmp_path):
         mr1 = _build_mr1(tmp_path)

@@ -65,6 +65,7 @@ from mr1.tools import (
     ToolResult,
     default_tool_registry,
 )
+from mr1.scoped_agents import PersistentAgentStore
 from mr1.watchers import (
     WatcherConfigError,
     WatchEvaluation,
@@ -161,6 +162,10 @@ def validate_spec(
                 supported_agents = ", ".join(repr(name) for name in agents.list_agents()) or "'kazi'"
                 raise WorkflowSpecError(
                     f"task '{label}': agent_type '{agent_type}' not supported (only {supported_agents})"
+                )
+            if not agents.workflow_task_allowed(agent_type):
+                raise WorkflowSpecError(
+                    f"task '{label}': agent_type '{agent_type}' is not allowed in workflow tasks"
                 )
         elif task_kind == "watcher":
             try:
@@ -264,6 +269,8 @@ def validate_spec(
 def build_workflow_from_spec(
     spec: dict[str, Any],
     created_by: Provenance,
+    owner_agent_id: Optional[str] = None,
+    scoped_agent_store: Optional[PersistentAgentStore] = None,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
     agent_registry: Optional[AgentRegistry] = None,
@@ -279,6 +286,12 @@ def build_workflow_from_spec(
         agent_registry=agent_registry,
     )
 
+    scoped_agents = scoped_agent_store or PersistentAgentStore()
+    resolved_owner_agent_id = owner_agent_id or scoped_agents.root_agent_id
+    owner_agent = scoped_agents.require_agent(resolved_owner_agent_id)
+    if owner_agent.status == "terminated":
+        raise WorkflowSpecError(f"agent is terminated: {resolved_owner_agent_id}")
+
     workflow_id = new_workflow_id()
     title = spec.get("title") or f"workflow {workflow_id}"
     wf = Workflow(
@@ -286,6 +299,9 @@ def build_workflow_from_spec(
         title=title,
         status=WorkflowStatus.PENDING,
         created_by=created_by,
+        owner_agent_id=owner_agent.agent_id,
+        owner_agent_title=owner_agent.title,
+        parent_agent_id=owner_agent.parent_agent_id,
     )
 
     # First pass: create tasks and the label→id map.
@@ -338,6 +354,9 @@ def submit_spec_to_disk(
     spec: dict[str, Any],
     created_by: Provenance,
     store: WorkflowStore,
+    owner_agent_id: Optional[str] = None,
+    caller_agent_id: Optional[str] = None,
+    scoped_agent_store: Optional[PersistentAgentStore] = None,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
     agent_registry: Optional[AgentRegistry] = None,
@@ -349,9 +368,24 @@ def submit_spec_to_disk(
     Called by both `Scheduler.submit_workflow` (in-process) and the
     standalone `workflow_cli submit` command.
     """
+    scoped_agents = scoped_agent_store or PersistentAgentStore()
+    if caller_agent_id is not None:
+        scoped_agents.require_agent(caller_agent_id)
+    resolved_owner_agent_id = (
+        owner_agent_id
+        or caller_agent_id
+        or scoped_agents.root_agent_id
+    )
+    if (
+        caller_agent_id is not None
+        and not scoped_agents.can_manage_agent(caller_agent_id, resolved_owner_agent_id)
+    ):
+        raise WorkflowSpecError("access denied: owner agent not in caller scope")
     wf = build_workflow_from_spec(
         spec,
         created_by,
+        resolved_owner_agent_id,
+        scoped_agent_store=scoped_agents,
         watcher_registry=watcher_registry,
         tool_registry=tool_registry,
         agent_registry=agent_registry,
@@ -359,6 +393,7 @@ def submit_spec_to_disk(
     log = WorkflowEventLog(store, default_agent_id=created_by.id)
     with store.locked():
         store.save_workflow(wf)
+        scoped_agents.append_owned_workflow(resolved_owner_agent_id, wf.workflow_id)
         log.workflow_submitted(
             wf.workflow_id,
             agent_id=created_by.id,
@@ -1188,6 +1223,7 @@ class Scheduler:
         auto_tick: bool = True,
         tick_interval_s: float = 1.0,
         agent_id: str = "scheduler",
+        scoped_agent_store: Optional[PersistentAgentStore] = None,
     ):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
@@ -1196,6 +1232,9 @@ class Scheduler:
         self._events = event_log or WorkflowEventLog(store, default_agent_id=agent_id)
         self._watchers = watcher_registry or default_watcher_registry()
         self._tools = tool_registry or default_tool_registry()
+        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+            root=self._store.root.parent / "agents"
+        )
         self._concurrency = concurrency
         self._tick_interval_s = tick_interval_s
         self._agent_id = agent_id
@@ -1247,6 +1286,8 @@ class Scheduler:
         self,
         spec: dict[str, Any],
         created_by: Provenance,
+        owner_agent_id: Optional[str] = None,
+        caller_agent_id: Optional[str] = None,
     ) -> str:
         """
         Validate a spec, persist the resulting workflow, and emit
@@ -1256,6 +1297,9 @@ class Scheduler:
             spec,
             created_by,
             self._store,
+            owner_agent_id=owner_agent_id or caller_agent_id or self._scoped_agents.root_agent_id,
+            caller_agent_id=caller_agent_id,
+            scoped_agent_store=self._scoped_agents,
             watcher_registry=self._watchers,
             tool_registry=self._tools,
         )
@@ -1265,10 +1309,14 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def list_workflows(self) -> list[Workflow]:
-        return self._store.list_workflows()
+        return [
+            self._scoped_agents.normalize_workflow_ownership(wf)
+            for wf in self._store.list_workflows()
+        ]
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
-        return self._store.load_workflow(workflow_id)
+        wf = self._store.load_workflow(workflow_id)
+        return self._scoped_agents.normalize_workflow_ownership(wf) if wf is not None else None
 
     def get_task(self, task_id: str) -> Optional[Task]:
         for wf in self._store.list_workflows():
@@ -2022,12 +2070,15 @@ class Scheduler:
             wf.status = target
             if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
                 wf.finished_at = _now_iso()
+            self._scoped_agents.normalize_workflow_ownership(wf)
             self._store.save_workflow(wf)
             if event_type is not None:
                 self._events.emit(
                     event_type, wf.workflow_id,
                     agent_id=self._agent_id, message=message,
                 )
+        if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
+            self._scoped_agents.write_workflow_report(wf, self._store)
         return True
 
     def _begin_attempt(

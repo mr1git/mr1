@@ -45,14 +45,17 @@ from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 from mr1 import kazi, mrn
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
 from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
+from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 from mr1 import workflow_cli
 from mr1.workflow_authoring import (
+    AuthoringResult,
     PendingWorkflowDraft,
     WorkflowAuthoringService,
     workflow_to_spec,
 )
+from mr1.workflow_compiler import WorkflowCompilerClient
 
 
 # ---------------------------------------------------------------------------
@@ -726,10 +729,13 @@ class MR1:
         event_sink: Optional[Callable[[dict[str, Any]], None]] = None,
         *,
         workflow_store: Optional[WorkflowStore] = None,
+        scoped_agent_store: Optional[PersistentAgentStore] = None,
         workflow_runner: Optional[Runner] = None,
         workflow_concurrency: int = 4,
         workflow_auto_tick: bool = True,
         workflow_compiler: Optional[Callable[[str, str], str]] = None,
+        workflow_authoring_backend: str = "local",
+        workflow_compiler_client: Optional[WorkflowCompilerClient] = None,
         workflow_authoring_service: Optional[WorkflowAuthoringService] = None,
     ):
         self._dispatcher = Dispatcher()
@@ -754,6 +760,10 @@ class MR1:
 
         # Workflow scheduler (Phase 1). Lives inside this MR1 process.
         self._workflow_store = workflow_store or WorkflowStore()
+        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+            root=self._workflow_store.root.parent / "agents"
+        )
+        self._root_agent_id = self._scoped_agents.root_agent_id
         runner = workflow_runner or KaziAsyncRunner(
             self._workflow_store,
             dispatcher=self._dispatcher,
@@ -764,11 +774,14 @@ class MR1:
             concurrency=workflow_concurrency,
             auto_tick=workflow_auto_tick,
             agent_id="MR1",
+            scoped_agent_store=self._scoped_agents,
         )
         self._workflow_authoring = workflow_authoring_service or WorkflowAuthoringService(
             self._scheduler,
             self._workflow_store,
-            compiler=workflow_compiler or self._run_workflow_compiler,
+            compiler=workflow_compiler if workflow_authoring_backend == "compiler_agent" else (workflow_compiler or self._run_workflow_compiler),
+            authoring_backend=workflow_authoring_backend,
+            workflow_compiler_client=workflow_compiler_client,
         )
 
     # ------------------------------------------------------------------
@@ -987,6 +1000,18 @@ class MR1:
         proc = MR1Process(system_prompt, self._mr1_config["model"], [])
         proc.start()
         return proc.send(message)
+
+    def _format_authoring_preview(self, result: AuthoringResult) -> str:
+        lines = [result.preview_text]
+        if result.assumptions:
+            lines.extend(["", "Assumptions:"])
+            lines.extend(f"- {item}" for item in result.assumptions)
+        if result.risks:
+            lines.extend(["", "Risks:"])
+            lines.extend(f"- {item}" for item in result.risks)
+        if result.assumptions or result.risks or self._workflow_authoring._authoring_backend == "compiler_agent":
+            lines.extend(["", f"Confidence: {result.confidence}"])
+        return "\n".join(lines)
 
     def _answer_directly(self, user_input: str) -> str:
         raw = self._send_to_brain(
@@ -1219,6 +1244,8 @@ class MR1:
             result = self._workflow_authoring.submit(
                 pending.spec,
                 created_by=Provenance(type="agent", id="MR1"),
+                caller_agent_id=self._root_agent_id,
+                owner_agent_id=self._root_agent_id,
                 target_workflow_id=pending.target_workflow_id,
             )
             self._state.clear_pending_workflow()
@@ -1253,10 +1280,13 @@ class MR1:
             )
 
         try:
-            spec = self._workflow_authoring.generate_spec(
+            authoring = self._workflow_authoring.author_request(
                 user_input,
+                caller_agent_id=self._root_agent_id,
+                owner_agent_id=self._root_agent_id,
                 mode=mode,
                 baseline_spec=baseline_spec,
+                target_workflow_id=target_workflow_id,
             )
         except (RuntimeError, json.JSONDecodeError, WorkflowSpecError, ValueError) as exc:
             return self._record_local_response(
@@ -1267,21 +1297,12 @@ class MR1:
                 )
             )
 
-        validation = self._workflow_authoring.validate_and_maybe_fix(spec)
-        if not validation.ok or validation.spec is None:
-            return self._record_local_response(
-                self._workflow_authoring.clarify_message(
-                    validation.error or "workflow validation failed",
-                    mode=mode,
-                    target_workflow_id=target_workflow_id,
-                )
-            )
-
-        preview_text, complexity = self._workflow_authoring.preview(validation.spec)
-        if complexity == "simple":
+        if authoring.complexity == "simple" and not authoring.needs_confirmation:
             result = self._workflow_authoring.submit(
-                validation.spec,
+                authoring.spec,
                 created_by=Provenance(type="agent", id="MR1"),
+                caller_agent_id=self._root_agent_id,
+                owner_agent_id=self._root_agent_id,
                 target_workflow_id=target_workflow_id,
             )
             self._state.clear_pending_workflow()
@@ -1295,10 +1316,14 @@ class MR1:
         draft = PendingWorkflowDraft(
             original_request=user_input,
             mode=mode,
-            spec=validation.spec,
+            spec=authoring.spec,
             target_workflow_id=target_workflow_id,
-            preview_text=preview_text,
-            complexity=complexity,
+            preview_text=authoring.preview_text,
+            assumptions=list(authoring.assumptions),
+            risks=list(authoring.risks),
+            needs_confirmation=authoring.needs_confirmation,
+            confidence=authoring.confidence,
+            complexity=authoring.complexity,
         )
         self._state.set_pending_workflow(draft.to_dict())
         self._state.add_decision(
@@ -1306,7 +1331,10 @@ class MR1:
             "preview_workflow_modification" if mode == "modify" else "preview_workflow",
             target_workflow_id,
         )
-        return self._record_local_response(preview_text, kind="workflow_preview")
+        return self._record_local_response(
+            self._format_authoring_preview(authoring),
+            kind="workflow_preview",
+        )
 
     # ------------------------------------------------------------------
     # Memory dump + restart (/memdltr)
@@ -1785,7 +1813,7 @@ class MR1:
             parts = shlex.split(cmd)
         except ValueError:
             if cmd.startswith("/agent"):
-                return "usage: /agent <name> [health] [--json] [--brief]"
+                return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
             return "usage: /agents [--json] [--brief]"
 
         command = parts[0]
@@ -1794,30 +1822,63 @@ class MR1:
         allowed_flags = {"--json", "--brief"}
         if any(flag not in allowed_flags for flag in flags):
             if command == "/agent":
-                return "usage: /agent <name> [health] [--json] [--brief]"
+                return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
             return "usage: /agents [--json] [--brief]"
 
         if command == "/agents":
             if positionals:
                 return "usage: /agents [--json] [--brief]"
             return workflow_cli._format_agents(
+                self._scoped_agents.list_visible_agents(self._root_agent_id),
                 json_output="--json" in flags,
                 brief="--brief" in flags,
             )
 
         if not positionals:
-            return "usage: /agent <name> [health] [--json] [--brief]"
+            return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
+        if positionals[0] == "create":
+            title = " ".join(positionals[1:]).strip()
+            if not title:
+                return "usage: /agent create <title>"
+            try:
+                agent = self._scoped_agents.create_child_agent(self._root_agent_id, title)
+            except ValueError as exc:
+                return str(exc)
+            return agent.agent_id
+        if positionals[0] == "kill":
+            if len(positionals) != 2:
+                return "usage: /agent kill <ag-id>"
+            try:
+                agent = self._scoped_agents.terminate_agent(self._root_agent_id, positionals[1])
+            except (ValueError, AgentScopeError) as exc:
+                return str(exc)
+            return agent.agent_id
+
         agent_name = positionals[0]
         action = positionals[1] if len(positionals) > 1 else None
+        if agent_name.startswith("ag-"):
+            if len(positionals) != 1:
+                return "usage: /agent <ag-id>"
+            try:
+                agent = self._scoped_agents.get_visible_agent(self._root_agent_id, agent_name)
+            except (ValueError, AgentScopeError) as exc:
+                return str(exc)
+            return workflow_cli._format_agent(
+                agent,
+                reports=self._scoped_agents.list_reports(agent.agent_id),
+                json_output="--json" in flags,
+                brief="--brief" in flags,
+            )
+
         if len(positionals) > 2 or (action is not None and action != "health"):
-            return "usage: /agent <name> [health] [--json] [--brief]"
+            return "usage: /agent <create <title>|kill <ag-id>|<ag-id>|kazi [health]> [--json] [--brief]"
         try:
             if action == "health":
-                return workflow_cli._format_agent_health(
+                return workflow_cli._format_runtime_agent_health(
                     agent_name,
                     json_output="--json" in flags,
                 )
-            return workflow_cli._format_agent(
+            return workflow_cli._format_runtime_agent(
                 agent_name,
                 json_output="--json" in flags,
                 brief="--brief" in flags,
@@ -1859,7 +1920,10 @@ class MR1:
             return f"invalid JSON: {exc}"
         try:
             wf_id = self._scheduler.submit_workflow(
-                spec, Provenance(type="agent", id="MR1")
+                spec,
+                Provenance(type="agent", id="MR1"),
+                caller_agent_id=self._root_agent_id,
+                owner_agent_id=self._root_agent_id,
             )
         except WorkflowSpecError as exc:
             return f"invalid workflow: {exc}"
@@ -1895,7 +1959,7 @@ class MR1:
         print(
             "Commands: /status  /tasks  /kill  /history  /memdltr  "
             "/workflows  /watchers  /capabilities  /capability <name>  "
-            "/tools  /tool <type>  /agents  /agent <name>  /schema  /vizualize  /visualize-web  "
+            "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  /schema  /vizualize  /visualize-web  "
             "/test spawn agents <h>  /test kill agents"
         )
         print("Type 'exit' or Ctrl+C to quit.\n")

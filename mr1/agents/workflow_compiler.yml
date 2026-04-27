@@ -1,0 +1,9 @@
+# Workflow Compiler — Specialized authoring agent
+# Produces validated workflow envelopes from natural-language requests.
+
+name: workflow_compiler
+model: haiku
+allowed_tools: []
+timeout_s: 300
+lifetime: ephemeral
+memory_access: none

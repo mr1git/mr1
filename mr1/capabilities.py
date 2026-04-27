@@ -50,6 +50,12 @@ class CapabilityRegistry:
             "examples": deepcopy(list(capability.get("examples", []))),
             "config_schema": deepcopy(dict(capability.get("config_schema", {}))),
         }
+        if "runtime" in capability:
+            normalized["runtime"] = deepcopy(dict(capability.get("runtime", {})))
+        if "workflow_task_allowed" in capability:
+            normalized["workflow_task_allowed"] = bool(
+                capability.get("workflow_task_allowed")
+            )
         name = normalized["name"]
         if name in self._capabilities:
             raise ValueError(f"duplicate capability name '{name}'")

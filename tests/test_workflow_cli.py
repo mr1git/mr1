@@ -91,6 +91,64 @@ class TestSubmit:
         assert "invalid JSON" in capsys.readouterr().err
 
 
+class FakeCompiler:
+    def __init__(self, *responses: str):
+        self._responses = list(responses)
+
+    def __call__(self, system_prompt: str, prompt: str) -> str:
+        if not self._responses:
+            raise AssertionError("no compiler responses configured")
+        return self._responses.pop(0)
+
+
+class TestCompileWorkflow:
+    def test_compile_workflow_outputs_validated_envelope(self, tmp_path, store, capsys):
+        request_path = tmp_path / "request.txt"
+        request_path.write_text("Read notes and summarize them", encoding="utf-8")
+        compiler = FakeCompiler(json.dumps({
+            "preview": "Read notes, then summarize them.",
+            "spec": SPEC,
+            "assumptions": [],
+            "risks": [],
+            "needs_confirmation": False,
+            "confidence": "high",
+        }))
+
+        rc = workflow_cli.main(
+            ["compile-workflow", str(request_path)],
+            store=store,
+            workflow_compiler=compiler,
+        )
+
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["preview"] == "Read notes, then summarize them."
+        assert payload["spec"] == SPEC
+
+    def test_compile_workflow_submit_writes_workflow(self, tmp_path, store, capsys):
+        request_path = tmp_path / "request.txt"
+        request_path.write_text("Read notes and summarize them", encoding="utf-8")
+        compiler = FakeCompiler(json.dumps({
+            "preview": "Read notes, then summarize them.",
+            "spec": SPEC,
+            "assumptions": [],
+            "risks": [],
+            "needs_confirmation": False,
+            "confidence": "high",
+        }))
+
+        rc = workflow_cli.main(
+            ["compile-workflow", str(request_path), "--submit"],
+            store=store,
+            workflow_compiler=compiler,
+        )
+
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["workflow_id"].startswith("wf-")
+        assert len(store.list_workflows()) == 1
+
+
 class TestReadCommands:
     def test_workflows_empty(self, store, capsys):
         rc = workflow_cli.main(["workflows"], store=store)

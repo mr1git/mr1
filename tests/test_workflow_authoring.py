@@ -248,6 +248,53 @@ class TestPreviewing:
         assert "Reply with `show json`" in complex_preview
 
 
+class TestCompilerAgentBackend:
+    def test_author_request_uses_compiler_envelope_preview(self, scheduler, store, tmp_path):
+        compiler = FakeCompiler(json.dumps({
+            "preview": "Read the notes, then summarize them.",
+            "spec": _three_step_spec(tmp_path),
+            "assumptions": ["notes file exists"],
+            "risks": ["summary may omit nuance"],
+            "needs_confirmation": True,
+            "confidence": "medium",
+        }))
+        root_agent_id = scheduler._scoped_agents.root_agent_id
+        service = WorkflowAuthoringService(
+            scheduler,
+            store,
+            compiler=compiler,
+            authoring_backend="compiler_agent",
+        )
+
+        result = service.author_request(
+            "Read a file, check Python version, and summarize",
+            caller_agent_id=root_agent_id,
+            owner_agent_id=root_agent_id,
+        )
+
+        assert result.preview_text == "Read the notes, then summarize them."
+        assert result.assumptions == ["notes file exists"]
+        assert result.risks == ["summary may omit nuance"]
+        assert result.needs_confirmation is True
+        assert result.confidence == "medium"
+
+    def test_local_backend_behavior_remains_unchanged(self, scheduler, store, tmp_path):
+        compiler = FakeCompiler(json.dumps(_three_step_spec(tmp_path)))
+        root_agent_id = scheduler._scoped_agents.root_agent_id
+        service = WorkflowAuthoringService(scheduler, store, compiler=compiler)
+
+        result = service.author_request(
+            "Read a file, check Python version, and summarize",
+            caller_agent_id=root_agent_id,
+            owner_agent_id=root_agent_id,
+        )
+
+        assert result.spec["title"] == "Read and summarize"
+        assert result.assumptions == []
+        assert result.risks == []
+        assert result.confidence == "medium"
+
+
 class TestSubmissionAndRewrite:
     def test_safe_in_place_modification(self, scheduler, store, tmp_path):
         service = WorkflowAuthoringService(scheduler, store, compiler=lambda *_: "{}")

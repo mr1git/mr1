@@ -164,8 +164,11 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/artifacts <workflow_id>` | List registered artifacts for a workflow |
 | `/jobs` | List live workflow tasks |
 | `/watchers` | List active watcher tasks |
-| `/agents` | List registered workflow agents |
-| `/agent <name>` | Show one agent runtime profile |
+| `/agents` | List persistent scoped agents visible to the caller |
+| `/agent create <title>` | Create a scoped MRn child agent |
+| `/agent <ag-id>` | Show one scoped agent record and its reports |
+| `/agent kill <ag-id>` | Terminate a scoped agent |
+| `/agent kazi` | Show one runtime agent profile |
 | `/capabilities` | List all registered capabilities across tools, watchers, and agents |
 | `/capability <name>` | Show one capability contract |
 | `/schema [section]` | Show workflow schema metadata (`workflow`, `task`, `inputs`, `refs`, `task-kinds`) |
@@ -201,6 +204,8 @@ You can submit the same spec without entering MR1 by using the deterministic CLI
 
 ```bash
 python -m mr1.workflow_cli submit path/to/workflow.json
+python -m mr1.workflow_cli compile-workflow path/to/request.txt
+python -m mr1.workflow_cli compile-workflow path/to/request.txt --submit
 python -m mr1.workflow_cli rerun <workflow_id> <task_label_or_id>
 python -m mr1.workflow_cli cancel-task <task_id>
 python -m mr1.workflow_cli cancel-workflow <workflow_id>
@@ -216,6 +221,9 @@ python -m mr1.workflow_cli schema inputs --json
 python -m mr1.workflow_cli tools
 python -m mr1.workflow_cli tool shell_command --example
 python -m mr1.workflow_cli agents
+python -m mr1.workflow_cli agent create research
+python -m mr1.workflow_cli agent <ag-id>
+python -m mr1.workflow_cli agent kill <ag-id>
 python -m mr1.workflow_cli agent kazi
 python -m mr1.workflow_cli agent kazi health
 python -m mr1.workflow_cli result <task_id>
@@ -507,6 +515,32 @@ The distinction matters during workflow authoring:
 - `capabilities` = what MR1 can do
 - `workflow schema` = how to express workflows
 
+## Scoped Agents
+
+MR1 now persists a scoped agent tree alongside workflows.
+
+- MR1 is the root agent and can see every workflow and agent branch.
+- MRn agents are persistent child agents with their own `ag-...` identity, title, parent, level, lifecycle state, and owned workflows.
+- Workflows are not global. Each workflow stores `owner_agent_id`, `owner_agent_title`, and `parent_agent_id`.
+- MRn visibility is limited to self plus descendants. Sibling and parent branches are hidden.
+- Terminating an agent blocks future workflow creation for that agent, but its existing workflows and reports remain on disk.
+
+Scoped agent commands:
+
+```text
+/agents
+/agent create research
+/agent <ag-id>
+/agent kill <ag-id>
+```
+
+Scoped workflow rules:
+
+- MR1 can inspect and mutate every workflow.
+- MRn can inspect and mutate only workflows it owns or workflows owned by descendant agents.
+- Workflow-id commands return `access denied: workflow not in agent scope` when the caller is outside the owning branch.
+- Task-id lookups resolve only inside the caller's visible workflows.
+
 ## Agent Runtime
 
 Agent profiles describe the runtime contract for an agent: config schema, CLI binary, invocation shape, supported JSON output, and example workflow usage.
@@ -522,7 +556,6 @@ The distinction from the other capability types is:
 You can inspect the registered agent profiles directly:
 
 ```text
-/agents
 /agent kazi
 /agent kazi --json
 /agent kazi health
@@ -531,13 +564,22 @@ You can inspect the registered agent profiles directly:
 And through the deterministic CLI:
 
 ```bash
-python -m mr1.workflow_cli agents
 python -m mr1.workflow_cli agent kazi
 python -m mr1.workflow_cli agent kazi --json
 python -m mr1.workflow_cli agent kazi health
 ```
 
 `/agent kazi health` validates the binary path, version response, runtime config, dispatcher-approved flags, non-interactive prompt execution, auth state, and JSON envelope parsing.
+
+## WorkflowCompiler Agentic Tool
+
+MR1 and MRn own workflow intent. The `workflow_compiler` agentic tool owns workflow spec construction.
+
+- MR1/MRn validate the compiler's natural-language preview rather than reasoning over raw workflow JSON by default.
+- The compiler returns a structured envelope containing `preview`, `spec`, `assumptions`, `risks`, `needs_confirmation`, and `confidence`.
+- Runtime validation remains the authority on exact workflow JSON correctness.
+- Workflow submission still flows through the normal scheduler/authoring path, which stamps `owner_agent_id` and enforces scoped ownership.
+- `show json` is still available when the caller explicitly wants the raw workflow spec.
 
 Tool tasks write the same normalized `output.json` schema as agent and watcher tasks, so downstream references work without new syntax:
 

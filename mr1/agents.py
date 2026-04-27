@@ -50,6 +50,7 @@ class AgentDefinition:
     description: str
     config_schema: dict[str, Any]
     runtime: dict[str, Any]
+    workflow_task_allowed: bool
     inputs: dict[str, Any]
     outputs: dict[str, str]
     examples: list[dict[str, Any]]
@@ -354,6 +355,7 @@ class AgentRegistry:
         description: str,
         config_schema: dict[str, Any],
         runtime: dict[str, Any],
+        workflow_task_allowed: bool,
         inputs: dict[str, Any],
         outputs: dict[str, str],
         examples: list[dict[str, Any]],
@@ -366,6 +368,7 @@ class AgentRegistry:
             description=description,
             config_schema=deepcopy(config_schema),
             runtime=deepcopy(runtime),
+            workflow_task_allowed=workflow_task_allowed,
             inputs=deepcopy(inputs),
             outputs=deepcopy(outputs),
             examples=deepcopy(examples),
@@ -390,12 +393,16 @@ class AgentRegistry:
             "name": definition.name,
             "type": "agent",
             "description": definition.description,
+            "workflow_task_allowed": definition.workflow_task_allowed,
             "inputs": deepcopy(definition.inputs),
             "outputs": deepcopy(definition.outputs),
             "examples": deepcopy(definition.examples),
             "config_schema": deepcopy(definition.config_schema),
             "runtime": deepcopy(definition.runtime),
         }
+
+    def workflow_task_allowed(self, name: str) -> bool:
+        return self.get_definition(name).workflow_task_allowed
 
     def describe_all(self) -> list[dict[str, Any]]:
         return [self.describe_agent(name) for name in self.list_agents()]
@@ -431,6 +438,7 @@ def default_agent_registry() -> AgentRegistry:
                 "invocation": "claude -p <prompt> --output-format json",
                 "supports_json_output": True,
             },
+            workflow_task_allowed=True,
             inputs={
                 "prompt": "string",
                 "inputs": "dataflow inputs",
@@ -452,6 +460,54 @@ def default_agent_registry() -> AgentRegistry:
                 }
             ],
             config_path=_AGENTS_DIR / "kazi.yml",
+        )
+        registry.register(
+            "workflow_compiler",
+            description="Specialized workflow compiler agent that converts intent plus context into a workflow envelope.",
+            config_schema={
+                "model": {"type": "string", "required": False, "optional": True},
+                "allowed_tools": {
+                    "type": "list[string]",
+                    "required": False,
+                    "optional": True,
+                    "default": [],
+                },
+                "timeout_s": {
+                    "type": "int",
+                    "required": False,
+                    "optional": True,
+                    "default": _DEFAULT_AGENT_TIMEOUT_S,
+                },
+            },
+            runtime={
+                "binary": "claude",
+                "invocation": "claude -p <prompt> --append-system-prompt <system> --output-format json",
+                "supports_json_output": True,
+            },
+            workflow_task_allowed=False,
+            inputs={
+                "request": "natural language workflow request",
+                "context": "caller-supplied scoped authoring context",
+                "workflow_schema": "workflow JSON schema metadata",
+                "capabilities": "available scoped capability metadata",
+            },
+            outputs={
+                "result.text": "workflow compiler envelope JSON text",
+                "result.data.raw": "parsed Claude JSON envelope",
+                "result.data.is_error": "true when the Claude envelope reports an error",
+                "result.data.metadata": "Claude metadata block or extra envelope fields",
+                "result.metrics.usage": "Claude usage block when present",
+            },
+            examples=[
+                {
+                    "label": "compile_workflow",
+                    "title": "Compile workflow",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "This profile is inspectable only and cannot be used in workflow tasks.",
+                }
+            ],
+            config_path=_AGENTS_DIR / "workflow_compiler.yml",
         )
         _DEFAULT_REGISTRY = registry
     return _DEFAULT_REGISTRY

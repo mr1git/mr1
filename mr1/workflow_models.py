@@ -313,6 +313,9 @@ class Workflow:
     title: str
     status: WorkflowStatus = WorkflowStatus.PENDING
     created_by: Optional[Provenance] = None
+    owner_agent_id: Optional[str] = None
+    owner_agent_title: Optional[str] = None
+    parent_agent_id: Optional[str] = None
     created_at: str = field(default_factory=_now_iso)
     finished_at: Optional[str] = None
     tasks: dict[str, Task] = field(default_factory=dict)
@@ -331,6 +334,9 @@ class Workflow:
             "title": self.title,
             "status": self.status.value,
             "created_by": self.created_by.to_dict() if self.created_by else None,
+            "owner_agent_id": self.owner_agent_id,
+            "owner_agent_title": self.owner_agent_title,
+            "parent_agent_id": self.parent_agent_id,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "tasks": {tid: t.to_dict() for tid, t in self.tasks.items()},
@@ -352,6 +358,9 @@ class Workflow:
                 Provenance.from_dict(raw_created_by)
                 if raw_created_by else None
             ),
+            owner_agent_id=data.get("owner_agent_id"),
+            owner_agent_title=data.get("owner_agent_title"),
+            parent_agent_id=data.get("parent_agent_id"),
             created_at=data.get("created_at", _now_iso()),
             finished_at=data.get("finished_at"),
             tasks=tasks,

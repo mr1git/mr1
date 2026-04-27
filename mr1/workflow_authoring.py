@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from mr1.capabilities import CapabilityRegistry
 from mr1.dataflow import TaskInputSpec
@@ -35,6 +35,10 @@ from mr1.workflow_models import (
     new_task_id,
 )
 from mr1.workflow_store import WorkflowStore
+from mr1.workflow_compiler import (
+    WorkflowCompilerClient,
+    WorkflowCompilerFailure,
+)
 
 
 MODIFIABLE_TASK_STATUSES = frozenset({
@@ -239,6 +243,10 @@ class PendingWorkflowDraft:
     spec: dict[str, Any]
     target_workflow_id: Optional[str] = None
     preview_text: str = ""
+    assumptions: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    needs_confirmation: bool = True
+    confidence: str = "medium"
     complexity: str = "complex"
     created_at: str = field(default_factory=_now_iso)
 
@@ -249,6 +257,10 @@ class PendingWorkflowDraft:
             "spec": self.spec,
             "target_workflow_id": self.target_workflow_id,
             "preview_text": self.preview_text,
+            "assumptions": list(self.assumptions),
+            "risks": list(self.risks),
+            "needs_confirmation": self.needs_confirmation,
+            "confidence": self.confidence,
             "complexity": self.complexity,
             "created_at": self.created_at,
         }
@@ -261,6 +273,10 @@ class PendingWorkflowDraft:
             spec=dict(data["spec"]),
             target_workflow_id=data.get("target_workflow_id"),
             preview_text=data.get("preview_text", ""),
+            assumptions=list(data.get("assumptions", [])),
+            risks=list(data.get("risks", [])),
+            needs_confirmation=bool(data.get("needs_confirmation", True)),
+            confidence=data.get("confidence", "medium"),
             complexity=data.get("complexity", "complex"),
             created_at=data.get("created_at", _now_iso()),
         )
@@ -288,6 +304,17 @@ class SubmissionResult:
     workflow_id: str
     message: str
     in_place: bool = False
+
+
+@dataclass(frozen=True)
+class AuthoringResult:
+    preview_text: str
+    spec: dict[str, Any]
+    assumptions: list[str]
+    risks: list[str]
+    needs_confirmation: bool
+    confidence: str
+    complexity: str
 
 
 CompilerFn = Callable[[str, str], str]
@@ -472,6 +499,8 @@ class WorkflowAuthoringService:
         capability_registry: Optional[CapabilityRegistry] = None,
         workflow_schema_registry: Optional[WorkflowSchemaRegistry] = None,
         compiler_system_prompt: str = _DEFAULT_COMPILER_SYSTEM_PROMPT,
+        authoring_backend: Literal["local", "compiler_agent"] = "local",
+        workflow_compiler_client: Optional[WorkflowCompilerClient] = None,
     ):
         self._scheduler = scheduler
         self._store = store
@@ -486,6 +515,8 @@ class WorkflowAuthoringService:
             workflow_schema_registry or default_workflow_schema_registry()
         )
         self._compiler_system_prompt_base = compiler_system_prompt
+        self._authoring_backend = authoring_backend
+        self._workflow_compiler_client = workflow_compiler_client
 
     def classify_request(
         self,
@@ -566,6 +597,64 @@ class WorkflowAuthoringService:
         raw = compiler(self._build_compiler_system_prompt(), prompt)
         return self._normalize_compiled_spec(_extract_json_object(raw))
 
+    def author_request(
+        self,
+        user_input: str,
+        *,
+        caller_agent_id: str,
+        owner_agent_id: Optional[str] = None,
+        mode: str = "create",
+        baseline_spec: Optional[dict[str, Any]] = None,
+        target_workflow_id: Optional[str] = None,
+    ) -> AuthoringResult:
+        resolved_owner_agent_id = owner_agent_id or caller_agent_id
+        if self._authoring_backend == "compiler_agent":
+            context = self._build_compiler_agent_context(
+                mode=mode,
+                caller_agent_id=caller_agent_id,
+                owner_agent_id=resolved_owner_agent_id,
+                baseline_spec=baseline_spec,
+                target_workflow_id=target_workflow_id,
+            )
+            client = self._require_workflow_compiler_client()
+            result = client.compile(
+                request=user_input,
+                context=context,
+                caller_agent_id=caller_agent_id,
+                owner_agent_id=resolved_owner_agent_id,
+                mode="preview_only",
+            )
+            normalized_spec = self._normalize_compiled_spec(result.envelope.spec)
+            complexity = "simple" if self._is_simple_workflow(normalized_spec) else "complex"
+            return AuthoringResult(
+                preview_text=result.envelope.preview,
+                spec=normalized_spec,
+                assumptions=list(result.envelope.assumptions),
+                risks=list(result.envelope.risks),
+                needs_confirmation=result.envelope.needs_confirmation,
+                confidence=result.envelope.confidence,
+                complexity=complexity,
+            )
+
+        spec = self.generate_spec(
+            user_input,
+            mode=mode,
+            baseline_spec=baseline_spec,
+        )
+        validation = self.validate_and_maybe_fix(spec)
+        if not validation.ok or validation.spec is None:
+            raise WorkflowSpecError(validation.error or "workflow validation failed")
+        preview_text, complexity = self.preview(validation.spec)
+        return AuthoringResult(
+            preview_text=preview_text,
+            spec=validation.spec,
+            assumptions=[],
+            risks=[],
+            needs_confirmation=complexity == "complex",
+            confidence="medium",
+            complexity=complexity,
+        )
+
     def validate_and_maybe_fix(self, spec: dict[str, Any]) -> ValidationResult:
         spec = self._normalize_compiled_spec(spec)
         try:
@@ -635,6 +724,8 @@ class WorkflowAuthoringService:
         spec: dict[str, Any],
         *,
         created_by: Provenance,
+        caller_agent_id: Optional[str] = None,
+        owner_agent_id: Optional[str] = None,
         target_workflow_id: Optional[str] = None,
     ) -> SubmissionResult:
         spec = self._normalize_compiled_spec(spec)
@@ -653,7 +744,12 @@ class WorkflowAuthoringService:
                         in_place=True,
                     )
 
-        workflow_id = self._scheduler.submit_workflow(spec, created_by)
+        workflow_id = self._scheduler.submit_workflow(
+            spec,
+            created_by,
+            owner_agent_id=owner_agent_id or caller_agent_id,
+            caller_agent_id=caller_agent_id,
+        )
         workflow = self._store.load_workflow(workflow_id)
         if workflow is None:
             raise RuntimeError(f"submitted workflow not found: {workflow_id}")
@@ -705,6 +801,38 @@ class WorkflowAuthoringService:
         if self._compiler is None:
             raise RuntimeError("workflow compiler is not configured")
         return self._compiler
+
+    def _require_workflow_compiler_client(self) -> WorkflowCompilerClient:
+        if self._workflow_compiler_client is None:
+            self._workflow_compiler_client = WorkflowCompilerClient(
+                compiler=self._compiler,
+                capability_registry=self._capability_registry,
+                workflow_schema_registry=self._workflow_schema_registry,
+                scoped_agent_store=self._scheduler._scoped_agents,
+                watcher_registry=self._watcher_registry,
+                tool_registry=self._tool_registry,
+            )
+        return self._workflow_compiler_client
+
+    def _build_compiler_agent_context(
+        self,
+        *,
+        mode: str,
+        caller_agent_id: str,
+        owner_agent_id: str,
+        baseline_spec: Optional[dict[str, Any]],
+        target_workflow_id: Optional[str],
+    ) -> str:
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "caller_agent_id": caller_agent_id,
+            "owner_agent_id": owner_agent_id,
+        }
+        if target_workflow_id is not None:
+            payload["target_workflow_id"] = target_workflow_id
+        if baseline_spec is not None:
+            payload["baseline_spec"] = baseline_spec
+        return _json_dumps(payload)
 
     def _build_compiler_system_prompt(self) -> str:
         workflow_schema = _json_dumps(self._workflow_schema_registry.describe_all())
