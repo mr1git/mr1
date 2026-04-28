@@ -68,6 +68,88 @@ def _truncate(text: str, limit: int = 500) -> str:
     return text[: limit - 3] + "..."
 
 
+def _evaluate_file_exists_pure(path_str: str) -> dict[str, Any]:
+    """Pure file-exists check; no workflow task required."""
+    path = Path(path_str)
+    exists = path.exists()
+    return {
+        "state": "satisfied" if exists else "not_satisfied",
+        "message": f"path {'exists' if exists else 'does not exist'}: {path}",
+        "metadata": {"path": str(path), "exists": exists},
+    }
+
+
+def _evaluate_time_reached_pure(at_str: str, now: datetime) -> dict[str, Any]:
+    """Pure time-reached check; no workflow task required."""
+    target = _parse_iso_timestamp(at_str)
+    satisfied = now >= target
+    return {
+        "state": "satisfied" if satisfied else "not_satisfied",
+        "message": f"time {'reached' if satisfied else 'not reached'}: {target.isoformat()}",
+        "metadata": {"at": target.isoformat(), "now": now.isoformat()},
+    }
+
+
+def _evaluate_condition_script_pure(path_str: Any, timeout_s: int) -> dict[str, Any]:
+    """Pure condition-script evaluation; no workflow task required.
+
+    Returns failed state rather than raising for missing/invalid script paths.
+    """
+    try:
+        path = _resolve_condition_script_path(path_str)
+    except WatcherConfigError as exc:
+        return {
+            "state": "failed",
+            "message": str(exc),
+            "metadata": {"path": str(path_str) if path_str else "", "error": str(exc)},
+        }
+    cmd = [sys.executable, str(path)] if path.suffix == ".py" else [str(path)]
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            cwd=str(Path.cwd()),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "state": "timed_out",
+            "message": f"condition script timed out after {timeout_s}s",
+            "metadata": {
+                "path": str(path),
+                "timeout_s": timeout_s,
+                "stdout": _truncate(exc.stdout or ""),
+                "stderr": _truncate(exc.stderr or ""),
+            },
+        }
+    except OSError as exc:
+        return {
+            "state": "failed",
+            "message": f"condition script failed to start: {exc}",
+            "metadata": {"path": str(path), "error": str(exc)},
+        }
+    state = {0: "satisfied", 1: "not_satisfied"}.get(proc.returncode, "failed")
+    if state == "satisfied":
+        message = f"condition script satisfied: {path.name}"
+    elif state == "not_satisfied":
+        message = f"condition script not satisfied: {path.name}"
+    else:
+        message = f"condition script failed with exit {proc.returncode}"
+    return {
+        "state": state,
+        "message": message,
+        "metadata": {
+            "path": str(path),
+            "exit_code": proc.returncode,
+            "stdout": _truncate(proc.stdout or ""),
+            "stderr": _truncate(proc.stderr or ""),
+            "command": cmd,
+        },
+    }
+
+
 class FileExistsWatcher:
     def validate_config(self, watch_config: dict[str, Any]) -> None:
         path = watch_config.get("path")
@@ -75,12 +157,11 @@ class FileExistsWatcher:
             raise WatcherConfigError("file_exists requires watch_config.path")
 
     def evaluate(self, task: Task, now: datetime) -> WatchEvaluation:
-        path = Path(task.watch_config["path"])
-        exists = path.exists()
+        result = _evaluate_file_exists_pure(task.watch_config["path"])
         return WatchEvaluation(
-            state="satisfied" if exists else "not_satisfied",
-            message=f"path {'exists' if exists else 'does not exist'}: {path}",
-            metadata={"path": str(path), "exists": exists},
+            state=result["state"],
+            message=result["message"],
+            metadata=result["metadata"],
         )
 
 
@@ -89,12 +170,11 @@ class TimeReachedWatcher:
         _parse_iso_timestamp(watch_config.get("at"))
 
     def evaluate(self, task: Task, now: datetime) -> WatchEvaluation:
-        target = _parse_iso_timestamp(task.watch_config["at"])
-        satisfied = now >= target
+        result = _evaluate_time_reached_pure(task.watch_config["at"], now)
         return WatchEvaluation(
-            state="satisfied" if satisfied else "not_satisfied",
-            message=f"time {'reached' if satisfied else 'not reached'}: {target.isoformat()}",
-            metadata={"at": target.isoformat(), "now": now.isoformat()},
+            state=result["state"],
+            message=result["message"],
+            metadata=result["metadata"],
         )
 
 
@@ -148,56 +228,14 @@ class ConditionScriptWatcher:
             raise WatcherConfigError("condition_script timeout_s must be an integer >= 1")
 
     def evaluate(self, task: Task, now: datetime) -> WatchEvaluation:
-        path = _resolve_condition_script_path(task.watch_config.get("path"))
-        timeout_s = task.watch_config.get("timeout_s", 10)
-        cmd = [sys.executable, str(path)] if path.suffix == ".py" else [str(path)]
-        try:
-            proc = subprocess.run(
-                cmd,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                cwd=str(Path.cwd()),
-            )
-        except subprocess.TimeoutExpired as exc:
-            return WatchEvaluation(
-                state="timed_out",
-                message=f"condition script timed out after {timeout_s}s",
-                metadata={
-                    "path": str(path),
-                    "timeout_s": timeout_s,
-                    "stdout": _truncate(exc.stdout or ""),
-                    "stderr": _truncate(exc.stderr or ""),
-                },
-            )
-        except OSError as exc:
-            return WatchEvaluation(
-                state="failed",
-                message=f"condition script failed to start: {exc}",
-                metadata={"path": str(path), "error": str(exc)},
-            )
-
-        state = {
-            0: "satisfied",
-            1: "not_satisfied",
-        }.get(proc.returncode, "failed")
-        if state == "satisfied":
-            message = f"condition script satisfied: {path.name}"
-        elif state == "not_satisfied":
-            message = f"condition script not satisfied: {path.name}"
-        else:
-            message = f"condition script failed with exit {proc.returncode}"
+        result = _evaluate_condition_script_pure(
+            task.watch_config.get("path"),
+            task.watch_config.get("timeout_s", 10),
+        )
         return WatchEvaluation(
-            state=state,
-            message=message,
-            metadata={
-                "path": str(path),
-                "exit_code": proc.returncode,
-                "stdout": _truncate(proc.stdout or ""),
-                "stderr": _truncate(proc.stderr or ""),
-                "command": cmd,
-            },
+            state=result["state"],
+            message=result["message"],
+            metadata=result["metadata"],
         )
 
 

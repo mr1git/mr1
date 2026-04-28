@@ -537,3 +537,231 @@ def test_agent_inspection_shows_mission_status_iteration_and_message_counts(agen
     assert "unread_inbox: 1" in formatted
     assert "Need update" in formatted
     assert "Update" in formatted
+
+
+# ---------------------------------------------------------------------------
+# call_capability action (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+from mr1.capability_runner import CapabilityResult, CapabilityRunner
+
+
+class FakeCapabilityRunner:
+    """Stub CapabilityRunner for mrn_loop tests."""
+
+    def __init__(
+        self,
+        *,
+        result: CapabilityResult | None = None,
+        raises: str | None = None,
+    ):
+        self._result = result or CapabilityResult(
+            status="succeeded",
+            output={"value": "ok"},
+            error=None,
+            duration_ms=5,
+            capability="read_file",
+        )
+        self._raises = raises
+        self.calls: list[tuple[str, dict, str]] = []
+
+    def run_capability(
+        self,
+        name: str,
+        config: dict,
+        caller_agent_id: str,
+        mode: str = "direct",
+    ) -> CapabilityResult:
+        self.calls.append((name, config, caller_agent_id))
+        if self._raises:
+            raise ValueError(self._raises)
+        return CapabilityResult(
+            status=self._result.status,
+            output=self._result.output,
+            error=self._result.error,
+            duration_ms=self._result.duration_ms,
+            capability=name,
+        )
+
+
+def _call_cap_action(capability: str, **extra) -> str:
+    payload = {
+        "action": "call_capability",
+        "reason": "test",
+        "next_status": "working",
+        "capability": capability,
+        "config": extra.pop("config", {}),
+        "store_as": extra.pop("store_as", None),
+        "workflow_request": None,
+        "workflow_context": None,
+        "workflow_id": None,
+        "report": None,
+        "message_kind": None,
+        "message_subject": None,
+        "message_body": None,
+        "to_agent_id": None,
+        "parent_request": None,
+    }
+    payload.update(extra)
+    return json.dumps(payload)
+
+
+def test_call_capability_parse_and_validate(workflow_store, agent_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
+    fake_runner = FakeCapabilityRunner()
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        reasoner=FakeReasoner(_call_cap_action("read_file", config={"path": "/tmp/x"})),
+        capability_runner=fake_runner,
+    )
+
+    result = runner.step(child.agent_id)
+
+    assert result.action == "call_capability"
+    assert result.capability_result is not None
+    assert result.capability_result["status"] == "succeeded"
+    assert len(fake_runner.calls) == 1
+    name, config, caller = fake_runner.calls[0]
+    assert name == "read_file"
+    assert config == {"path": "/tmp/x"}
+    assert caller == child.agent_id
+
+
+def test_call_capability_store_as_persists_output_to_step_context(
+    workflow_store, agent_store
+):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
+    fake_runner = FakeCapabilityRunner(
+        result=CapabilityResult(
+            status="succeeded",
+            output={"exists": True},
+            error=None,
+            duration_ms=1,
+            capability="file_exists",
+        )
+    )
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        reasoner=FakeReasoner(
+            _call_cap_action("file_exists", store_as="check_result")
+        ),
+        capability_runner=fake_runner,
+    )
+
+    result = runner.step(child.agent_id)
+    reloaded = agent_store.require_agent(child.agent_id)
+
+    assert result.stored_as == "check_result"
+    assert reloaded.step_context["check_result"] == {"exists": True}
+
+
+def test_call_capability_store_as_skipped_on_failure(workflow_store, agent_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
+    fake_runner = FakeCapabilityRunner(
+        result=CapabilityResult(
+            status="failed",
+            output={},
+            error="path does not exist",
+            duration_ms=1,
+            capability="read_file",
+        )
+    )
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        reasoner=FakeReasoner(
+            _call_cap_action("read_file", config={"path": "/missing"}, store_as="data")
+        ),
+        capability_runner=fake_runner,
+    )
+
+    result = runner.step(child.agent_id)
+    reloaded = agent_store.require_agent(child.agent_id)
+
+    assert result.stored_as is None
+    assert "data" not in reloaded.step_context
+
+
+def test_step_context_included_in_scoped_prompt(workflow_store, agent_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
+    child = agent_store.require_agent(child.agent_id)
+    child.step_context["key1"] = {"value": 42}
+    agent_store.save_agent(child)
+
+    captured_prompts: list[str] = []
+
+    def capturing_reasoner(agent, system_prompt, prompt):
+        captured_prompts.append(prompt)
+        return _action("idle")
+
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        reasoner=capturing_reasoner,
+    )
+    runner.step(child.agent_id)
+
+    assert captured_prompts
+    context_text = captured_prompts[0]
+    assert "step_context" in context_text
+    assert "key1" in context_text
+
+
+def test_call_capability_limit_raises_when_count_already_at_max(
+    workflow_store, agent_store
+):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
+    fake_runner = FakeCapabilityRunner()
+    step_runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        reasoner=FakeReasoner(_call_cap_action("read_file")),
+        capability_runner=fake_runner,
+    )
+    action = {
+        "action": "call_capability",
+        "reason": "test",
+        "capability": "read_file",
+        "config": {},
+        "store_as": None,
+        "next_status": "working",
+    }
+    # Counter already at the limit — next call must be blocked
+    step_call_count = [2]
+
+    with pytest.raises(ValueError, match="direct call limit exceeded"):
+        step_runner._execute_call_capability(child, action, step_call_count)
+
+
+def test_call_capability_preflight_error_produces_blocked_step(
+    workflow_store, agent_store
+):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
+    fake_runner = FakeCapabilityRunner(raises="capability not callable in direct mode: write_file")
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        reasoner=FakeReasoner(_call_cap_action("write_file")),
+        capability_runner=fake_runner,
+    )
+
+    result = runner.step(child.agent_id)
+
+    assert result.action == "invalid"
+    assert result.status_after == "blocked"
+    assert "write_file" in (result.error or "")

@@ -18,6 +18,7 @@ import yaml
 
 from mr1.agents import AgentRuntimeError, parse_agent_json_envelope
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
+from mr1.capability_runner import CapabilityResult, CapabilityRunner
 from mr1.core import Dispatcher, PermissionDenied
 from mr1.kazi_runner import MockRunner
 from mr1.messages import MessageStore
@@ -35,6 +36,7 @@ from mr1.workflow_store import WorkflowStore
 _PKG_ROOT = Path(__file__).resolve().parent
 _MRN_CONFIG_PATH = _PKG_ROOT / "agents" / "mrn.yml"
 _DEFAULT_TIMEOUT_S = 300
+_MAX_DIRECT_CALLS_PER_STEP = 2
 ALLOWED_MRN_ACTIONS = frozenset({
     "create_workflow",
     "inspect_workflow",
@@ -42,6 +44,7 @@ ALLOWED_MRN_ACTIONS = frozenset({
     "send_message",
     "ask_parent",
     "idle",
+    "call_capability",
 })
 _ALLOWED_ACTIONS = ALLOWED_MRN_ACTIONS
 _ALLOWED_STATUSES = frozenset({
@@ -59,6 +62,7 @@ _ACTION_DEFAULT_STATUS = {
     "send_message": "waiting",
     "ask_parent": "waiting",
     "idle": "idle",
+    "call_capability": "working",
 }
 
 _SYSTEM_PROMPT = """\
@@ -66,7 +70,7 @@ You are MRn, a persistent scoped orchestrator inside MR1.
 
 You must return JSON only with this exact shape:
 {
-  "action": "create_workflow" | "inspect_workflow" | "write_report" | "send_message" | "ask_parent" | "idle",
+  "action": "create_workflow" | "inspect_workflow" | "write_report" | "send_message" | "ask_parent" | "idle" | "call_capability",
   "reason": "short reason",
   "workflow_request": "optional natural-language workflow request",
   "workflow_context": "optional extra context",
@@ -77,6 +81,9 @@ You must return JSON only with this exact shape:
   "message_body": "optional message body",
   "to_agent_id": "optional message recipient",
   "parent_request": "optional question/request for parent",
+  "capability": "optional direct-callable capability name for call_capability",
+  "config": {},
+  "store_as": "optional step_context key to store call_capability result",
   "next_status": "idle" | "working" | "waiting" | "reporting" | "blocked"
 }
 
@@ -88,6 +95,8 @@ Rules:
 - You cannot access workflows outside your scope.
 - You may request workflow creation, but runtime validation decides whether submission is allowed.
 - If you do not have enough information, use "ask_parent" or "idle".
+- For call_capability, set "capability" to a direct-callable capability name; optionally set "config" and "store_as".
+- Direct calls are capped at 2 per step.
 """
 
 ReasonerFn = Callable[[PersistentAgent, str, str], str]
@@ -113,6 +122,8 @@ class MRnStepResult:
     message_to_agent_id: Optional[str] = None
     confirmation_required: bool = False
     workflow_submitted: bool = False
+    capability_result: Optional[dict[str, Any]] = None
+    stored_as: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +145,8 @@ class MRnStepResult:
             "message_to_agent_id": self.message_to_agent_id,
             "confirmation_required": self.confirmation_required,
             "workflow_submitted": self.workflow_submitted,
+            "capability_result": self.capability_result,
+            "stored_as": self.stored_as,
         }
 
 
@@ -243,6 +256,7 @@ class MRnStepRunner:
         message_store: Optional[MessageStore] = None,
         reasoner: Optional[ReasonerFn] = None,
         require_confirmation_for_workflows: bool = False,
+        capability_runner: Optional[CapabilityRunner] = None,
     ):
         self._workflow_store = workflow_store or WorkflowStore()
         self._scoped_agents = scoped_agent_store or PersistentAgentStore(
@@ -266,6 +280,10 @@ class MRnStepRunner:
         )
         self._reasoner = reasoner or run_mrn_step_agent
         self._require_confirmation_for_workflows = bool(require_confirmation_for_workflows)
+        self._capability_runner = capability_runner or CapabilityRunner(
+            capability_registry=self._capability_registry,
+            scoped_agent_store=self._scoped_agents,
+        )
         self._workflow_authoring = (
             workflow_authoring_service or
             self._build_default_authoring_service()
@@ -330,8 +348,9 @@ class MRnStepRunner:
                     raw_action=corrected_raw,
                 )
 
+        step_call_count = [0]  # mutable counter, scoped to this step() invocation
         try:
-            return self._execute_action(agent, action)
+            return self._execute_action(agent, action, step_call_count)
         except (AgentScopeError, WorkflowCompilerFailure, WorkflowSpecError, RuntimeError, ValueError) as exc:
             return self._persist_blocked_step(
                 agent,
@@ -358,6 +377,7 @@ class MRnStepRunner:
                 "run_status": agent.run_status,
                 "current_iteration": agent.current_iteration,
                 "owned_workflow_ids": list(agent.owned_workflow_ids),
+                "step_context": dict(agent.step_context) if agent.step_context else {},
             },
             "visible_workflows": self._workflow_summaries(agent),
             "recent_reports": self._recent_reports(agent),
@@ -505,7 +525,7 @@ class MRnStepRunner:
         action = _extract_json_object(raw)
         action_name = action.get("action")
         if action_name not in _ALLOWED_ACTIONS:
-            raise ValueError("field 'action' must be one of: create_workflow, inspect_workflow, write_report, send_message, ask_parent, idle")
+            raise ValueError("field 'action' must be one of: create_workflow, inspect_workflow, write_report, send_message, ask_parent, idle, call_capability")
         reason = action.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("field 'reason' must be a non-empty string")
@@ -525,6 +545,9 @@ class MRnStepRunner:
             "message_body": action.get("message_body"),
             "to_agent_id": action.get("to_agent_id"),
             "parent_request": action.get("parent_request"),
+            "capability": action.get("capability"),
+            "config": action.get("config"),
+            "store_as": action.get("store_as"),
             "next_status": next_status,
         }
 
@@ -548,6 +571,16 @@ class MRnStepRunner:
             if not isinstance(normalized["parent_request"], str) or not normalized["parent_request"].strip():
                 raise ValueError("ask_parent requires parent_request")
             normalized["next_status"] = "waiting"
+        elif action_name == "call_capability":
+            if not isinstance(normalized["capability"], str) or not normalized["capability"].strip():
+                raise ValueError("call_capability requires capability")
+            if normalized["config"] is None:
+                normalized["config"] = {}
+            elif not isinstance(normalized["config"], dict):
+                raise ValueError("call_capability config must be a JSON object")
+            if normalized["store_as"] is not None:
+                if not isinstance(normalized["store_as"], str) or not normalized["store_as"].strip():
+                    raise ValueError("call_capability store_as must be a non-empty string when present")
         elif action_name == "idle":
             extra_fields = (
                 normalized["workflow_request"],
@@ -565,7 +598,14 @@ class MRnStepRunner:
             normalized["next_status"] = "idle"
         return normalized
 
-    def _execute_action(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+    def _execute_action(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        step_call_count: list[int],
+    ) -> MRnStepResult:
+        if action["action"] == "call_capability":
+            return self._execute_call_capability(agent, action, step_call_count)
         if action["action"] == "create_workflow":
             return self._execute_create_workflow(agent, action)
         if action["action"] == "inspect_workflow":
@@ -577,6 +617,51 @@ class MRnStepRunner:
         if action["action"] == "ask_parent":
             return self._execute_ask_parent(agent, action)
         return self._execute_idle(agent, action)
+
+    def _execute_call_capability(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        step_call_count: list[int],
+    ) -> MRnStepResult:
+        if step_call_count[0] >= _MAX_DIRECT_CALLS_PER_STEP:
+            raise ValueError(
+                f"direct call limit exceeded: max {_MAX_DIRECT_CALLS_PER_STEP} per step"
+            )
+        step_call_count[0] += 1
+
+        capability_name = action["capability"].strip()
+        config = dict(action.get("config") or {})
+        store_as = action.get("store_as")
+
+        result = self._capability_runner.run_capability(
+            capability_name,
+            config,
+            agent.agent_id,
+            mode="direct",
+        )
+
+        stored_as = None
+        if store_as and result.status == "succeeded":
+            agent_ctx = self._scoped_agents.require_agent(agent.agent_id)
+            agent_ctx.step_context[store_as] = result.output
+            self._scoped_agents.save_agent(agent_ctx)
+            stored_as = store_as
+
+        return self._persist_step(
+            agent,
+            action=action,
+            status_after=action["next_status"],
+            message=f"capability {capability_name}: {result.status}",
+            capability_result={
+                "status": result.status,
+                "output": result.output,
+                "error": result.error,
+                "duration_ms": result.duration_ms,
+                "capability": result.capability,
+            },
+            stored_as=stored_as,
+        )
 
     def _execute_create_workflow(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
         compile_context = self._build_create_workflow_context(agent, action)
@@ -865,6 +950,8 @@ class MRnStepRunner:
         message_to_agent_id: Optional[str] = None,
         confirmation_required: bool = False,
         workflow_submitted: bool = False,
+        capability_result: Optional[dict[str, Any]] = None,
+        stored_as: Optional[str] = None,
     ) -> MRnStepResult:
         updated = self._scoped_agents.require_agent(agent.agent_id)
         status_before = updated.run_status
@@ -919,6 +1006,8 @@ class MRnStepRunner:
             "message_to_agent_id": message_to_agent_id,
             "confirmation_required": confirmation_required,
             "workflow_submitted": workflow_submitted,
+            "capability_result": capability_result,
+            "stored_as": stored_as,
         }
         if workflow_summary is not None:
             log_record["workflow_summary"] = workflow_summary
@@ -942,6 +1031,8 @@ class MRnStepRunner:
             message_to_agent_id=message_to_agent_id,
             confirmation_required=confirmation_required,
             workflow_submitted=workflow_submitted,
+            capability_result=capability_result,
+            stored_as=stored_as,
         )
 
     def _send_agent_message(

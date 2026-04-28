@@ -390,3 +390,60 @@ def test_policy_confirmation_flag_is_passed_to_default_step_runner(workflow_stor
         )
 
     assert captured["require_confirmation_for_workflows"] is False
+
+
+# ---------------------------------------------------------------------------
+# call_capability in MRnRunPolicy (Phase 14)
+# ---------------------------------------------------------------------------
+
+
+def test_allowed_actions_accepts_call_capability(workflow_store, agent_store, message_store):
+    root, child = _child_agent(agent_store)
+    runner = MRnRunRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        step_runner=StubStepRunner(agent_store, [
+            _step_result(child.agent_id, 1, action="call_capability", status_after="working"),
+        ]),
+    )
+
+    result = runner.run(
+        child.agent_id,
+        MRnRunPolicy(allowed_actions=["call_capability", "idle"], max_steps=1),
+        caller_agent_id=root.agent_id,
+    )
+
+    assert result.stopped_reason != "disallowed_action"
+
+
+def test_allowed_actions_rejects_call_capability_when_omitted(
+    workflow_store, agent_store, message_store
+):
+    root, child = _child_agent(agent_store)
+    runner = MRnRunRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        step_runner=StubStepRunner(agent_store, [
+            _step_result(child.agent_id, 1, action="call_capability", status_after="working"),
+        ]),
+    )
+
+    result = runner.run(
+        child.agent_id,
+        MRnRunPolicy(allowed_actions=["idle"]),
+        caller_agent_id=root.agent_id,
+    )
+
+    assert result.stopped_reason == "disallowed_action"
+
+
+def test_call_capability_is_valid_allowed_action_name():
+    from mr1.mrn_loop import ALLOWED_MRN_ACTIONS
+    from mr1.mrn_run import MRnRunPolicy
+
+    policy = MRnRunPolicy(allowed_actions=["call_capability"])
+
+    assert "call_capability" in ALLOWED_MRN_ACTIONS
+    assert policy.allowed_actions == ["call_capability"]

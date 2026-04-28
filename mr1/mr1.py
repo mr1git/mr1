@@ -1794,6 +1794,33 @@ class MR1:
                 brief="--brief" in flags,
             )
         if command == "/capability":
+            if positionals and positionals[0] == "call":
+                if len(positionals) != 3 or flags:
+                    return "usage: /capability call <name> <config-json>"
+                capability_name = positionals[1]
+                config_json = positionals[2]
+                try:
+                    config = json.loads(config_json)
+                except json.JSONDecodeError:
+                    return "error: invalid JSON config"
+                if not isinstance(config, dict):
+                    return "error: config must be a JSON object"
+                from mr1.capability_runner import CapabilityRunner
+                runner = CapabilityRunner(scoped_agent_store=self._scoped_agents)
+                try:
+                    result = runner.run_capability(capability_name, config, self._root_agent_id)
+                except ValueError as exc:
+                    return f"error: {exc}"
+                lines = [
+                    f"capability:   {result.capability}",
+                    f"status:       {result.status}",
+                    f"duration_ms:  {result.duration_ms}",
+                    "output:",
+                    json.dumps(result.output, indent=2, sort_keys=True),
+                ]
+                if result.error is not None:
+                    lines.append(f"error:        {result.error}")
+                return "\n".join(lines)
             if len(positionals) != 1:
                 return "usage: /capability <name> [--json] [--example] [--brief]"
             try:

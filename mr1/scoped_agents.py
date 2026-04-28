@@ -65,6 +65,7 @@ class PersistentAgent:
     last_action: Optional[dict[str, Any]] = None
     parent_request: Optional[str] = None
     last_run: Optional[dict[str, Any]] = None
+    step_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +85,7 @@ class PersistentAgent:
             "last_action": dict(self.last_action) if self.last_action is not None else None,
             "parent_request": self.parent_request,
             "last_run": dict(self.last_run) if self.last_run is not None else None,
+            "step_context": dict(self.step_context),
         }
 
     @classmethod
@@ -107,6 +109,7 @@ class PersistentAgent:
             parent_request=data.get("parent_request"),
             last_run=dict(data["last_run"])
             if isinstance(data.get("last_run"), dict) else None,
+            step_context=dict(data.get("step_context") or {}),
         )
 
 
@@ -354,6 +357,16 @@ class PersistentAgentStore:
             with open(tmp, "w", encoding="utf-8") as handle:
                 handle.write(content.rstrip() + "\n")
             tmp.replace(path)
+            return path
+
+    def capability_call_log_path(self, agent_id: str) -> Path:
+        return self.logs_dir(agent_id) / "capability_calls.jsonl"
+
+    def append_capability_call_log(self, agent_id: str, record: dict[str, Any]) -> Path:
+        with self._lock:
+            path = self.capability_call_log_path(agent_id)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
             return path
 
     def append_step_log(self, agent_id: str, record: dict[str, Any]) -> Path:

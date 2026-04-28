@@ -118,6 +118,47 @@ def _write_text_artifact(
     )
 
 
+def _read_file_pure(path_str: str, max_bytes: int) -> dict[str, Any]:
+    """Pure read-file logic; no workflow task or store required.
+
+    Returns keys: state, text, data, artifact_path, artifact_kind, error.
+    """
+    path = _resolve_path(path_str)
+    if not path.exists():
+        return {
+            "state": "failed",
+            "text": "",
+            "data": {"path": str(path)},
+            "artifact_path": None,
+            "artifact_kind": None,
+            "error": f"path does not exist: {path}",
+        }
+    if not path.is_file():
+        return {
+            "state": "failed",
+            "text": "",
+            "data": {"path": str(path)},
+            "artifact_path": None,
+            "artifact_kind": None,
+            "error": f"path is not a file: {path}",
+        }
+    raw = path.read_bytes()
+    captured = raw[:max_bytes]
+    text = _decode_bytes(captured)
+    return {
+        "state": "succeeded",
+        "text": text,
+        "data": {
+            "path": str(path),
+            "size_bytes": path.stat().st_size,
+            "truncated": len(raw) > max_bytes,
+        },
+        "artifact_path": path,
+        "artifact_kind": "text" if _looks_like_text(captured) else "binary",
+        "error": None,
+    }
+
+
 class ReadFileTool:
     def validate_config(self, config: dict[str, Any]) -> None:
         path = config.get("path")
@@ -129,46 +170,28 @@ class ReadFileTool:
 
     def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
         del store, workflow
-        path = _resolve_path(task.tool_config["path"])
-        max_bytes = task.tool_config.get("max_bytes", 65536)
-        if not path.exists():
-            return ToolResult(
-                state="failed",
-                summary=f"read file failed: {path}",
-                text="",
-                data={"path": str(path)},
-                error=f"path does not exist: {path}",
-            )
-        if not path.is_file():
-            return ToolResult(
-                state="failed",
-                summary=f"read file failed: {path}",
-                text="",
-                data={"path": str(path)},
-                error=f"path is not a file: {path}",
-            )
-        raw = path.read_bytes()
-        captured = raw[:max_bytes]
-        text = _decode_bytes(captured)
-        artifact_kind = "text" if _looks_like_text(captured) else "binary"
+        result = _read_file_pure(task.tool_config["path"], task.tool_config.get("max_bytes", 65536))
+        path_display = result["data"]["path"]
+        if result["state"] == "succeeded":
+            summary = f"read file: {path_display}"
+        else:
+            summary = f"read file failed: {path_display}"
+        artifacts = []
+        if result["artifact_path"] is not None:
+            artifacts.append(_artifact(
+                workflow_id=task.workflow_id,
+                task_id=task.task_id,
+                name="file",
+                kind=result["artifact_kind"],
+                path=result["artifact_path"],
+            ))
         return ToolResult(
-            state="succeeded",
-            summary=f"read file: {path}",
-            text=text,
-            data={
-                "path": str(path),
-                "size_bytes": path.stat().st_size,
-                "truncated": len(raw) > max_bytes,
-            },
-            artifacts=[
-                _artifact(
-                    workflow_id=task.workflow_id,
-                    task_id=task.task_id,
-                    name="file",
-                    kind=artifact_kind,
-                    path=path,
-                )
-            ],
+            state=result["state"],
+            summary=summary,
+            text=result["text"],
+            data=result["data"],
+            artifacts=artifacts,
+            error=result["error"],
         )
 
 

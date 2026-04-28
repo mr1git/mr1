@@ -918,6 +918,13 @@ def _format_description_text(description: dict[str, Any]) -> str:
         lines.append(
             f"workflow_task_allowed: {bool(description.get('workflow_task_allowed'))}"
         )
+    if "direct_callable" in description:
+        lines.extend([
+            f"direct_callable: {bool(description.get('direct_callable'))}",
+            f"direct_mode:     {description.get('direct_mode', '-')}",
+            f"callable_by:     {', '.join(description.get('callable_by') or [])}",
+            f"timeout_s:       {description.get('timeout_s', '-')}",
+        ])
     lines.extend([
         "examples:",
         json.dumps(description.get("examples", []), indent=2, sort_keys=True),
@@ -1377,6 +1384,42 @@ def _cmd_capability(
     except ValueError:
         print(f"error: capability not found: {args.name}", file=sys.stderr)
         return 2
+    return 0
+
+
+def _cmd_capability_call(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    from mr1.capability_runner import CapabilityRunner
+    config_path = Path(args.config_file)
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(config, dict):
+        print("error: config file must be a JSON object", file=sys.stderr)
+        return 2
+    runner = CapabilityRunner(scoped_agent_store=scoped_agents)
+    try:
+        result = runner.run_capability(args.name, config, caller_agent_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    lines = [
+        f"capability:   {result.capability}",
+        f"status:       {result.status}",
+        f"duration_ms:  {result.duration_ms}",
+        "output:",
+        json.dumps(result.output, indent=2, sort_keys=True),
+    ]
+    if result.error is not None:
+        lines.append(f"error:        {result.error}")
+    print("\n".join(lines))
     return 0
 
 
@@ -1980,6 +2023,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_capability.add_argument("name")
     add_common_flags(p_capability, include_example=True)
     p_capability.set_defaults(func=_cmd_capability)
+
+    p_capability_call = subs.add_parser(
+        "capability-call",
+        help="Invoke a direct-callable capability once and print the result.",
+    )
+    p_capability_call.add_argument("name", help="Capability name.")
+    p_capability_call.add_argument("config_file", help="Path to a JSON config file.")
+    p_capability_call.set_defaults(func=_cmd_capability_call)
 
     p_tools = subs.add_parser("tools", help="List registered deterministic workflow tools.")
     add_common_flags(p_tools, include_example=False)
