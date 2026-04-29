@@ -80,6 +80,7 @@ from mr1.tools import (
     ToolResult,
     default_tool_registry,
 )
+from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.watchers import (
@@ -407,6 +408,7 @@ def submit_spec_to_disk(
         agent_registry=agent_registry,
     )
     log = WorkflowEventLog(store, default_agent_id=created_by.id)
+    timeline = EventLog(store.root.parent / "events")
     with store.locked():
         store.save_workflow(wf)
         scoped_agents.append_owned_workflow(resolved_owner_agent_id, wf.workflow_id)
@@ -415,6 +417,22 @@ def submit_spec_to_disk(
             agent_id=created_by.id,
             message=f"submitted '{wf.title}' with {len(wf.tasks)} task(s)",
             metadata={"task_count": len(wf.tasks)},
+        )
+        timeline.emit(
+            event_type="workflow_created",
+            actor_id=created_by.id,
+            actor_type=created_by.type,
+            target_id=wf.workflow_id,
+            target_type="workflow",
+            status=wf.status.value,
+            summary=f"workflow created: {wf.title}",
+            workflow_id=wf.workflow_id,
+            record_path=str(store.workflow_json_path(wf.workflow_id)),
+            metadata={
+                "title": wf.title,
+                "owner_agent_id": wf.owner_agent_id,
+                "task_count": len(wf.tasks),
+            },
         )
     return wf.workflow_id
 
@@ -1268,6 +1286,7 @@ class Scheduler:
             self._store.root.parent / "capability_approvals"
         )
         self._audit_writer = CapabilityAuditWriter()
+        self._timeline = EventLog(self._store.root.parent / "events")
 
         self._handles: dict[str, RunHandle] = {}
         self._stop = threading.Event()
@@ -1962,6 +1981,36 @@ class Scheduler:
             metadata=metadata,
             decision=decision,
         )
+        audit_id = self._policy_audit_id(audit_path)
+        self._timeline.emit(
+            event_type="capability_requested",
+            actor_id=request.actor_id,
+            actor_type=request.actor_type,
+            target_id=request.capability_name,
+            target_type="capability",
+            status="requested",
+            summary=f"capability requested: {request.capability_name}",
+            workflow_id=wf.workflow_id,
+            task_id=task.task_id,
+            audit_id=audit_id,
+            record_path=str(audit_path),
+            metadata={"mode": request.invocation_mode},
+        )
+        if decision["allowed"]:
+            self._timeline.emit(
+                event_type="capability_allowed",
+                actor_id=request.actor_id,
+                actor_type=request.actor_type,
+                target_id=request.capability_name,
+                target_type="capability",
+                status="allowed",
+                summary=f"capability allowed: {request.capability_name}",
+                workflow_id=wf.workflow_id,
+                task_id=task.task_id,
+                audit_id=audit_id,
+                record_path=str(audit_path),
+                metadata={"reason": decision["reason"]},
+            )
         return request, metadata, decision, audit_path
 
     def _policy_block_result_payload(
@@ -2006,6 +2055,7 @@ class Scheduler:
         audit_path: Path,
     ) -> None:
         approval_request_id = None
+        approval = None
         if decision["status"] == "requires_approval":
             approval = build_approval_request(
                 request,
@@ -2018,6 +2068,26 @@ class Scheduler:
                     ).get("config_schema", {}),
                 ),
             )
+            approval_request_id = approval.approval_request_id
+        self._timeline.emit(
+            event_type="capability_blocked",
+            actor_id=request.actor_id,
+            actor_type=request.actor_type,
+            target_id=request.capability_name,
+            target_type="capability",
+            status=decision["status"],
+            summary=f"capability blocked: {request.capability_name}",
+            workflow_id=wf.workflow_id,
+            task_id=task.task_id,
+            approval_request_id=approval_request_id,
+            audit_id=self._policy_audit_id(audit_path),
+            record_path=str(audit_path),
+            metadata={
+                "reason": decision["reason"],
+                "decision_status": decision["status"],
+            },
+        )
+        if approval is not None:
             approval_request_id, _ = maybe_route_approval_request(
                 approval,
                 approval_store=self._approval_store,
@@ -2452,10 +2522,39 @@ class Scheduler:
                 wf.finished_at = _now_iso()
             self._scoped_agents.normalize_workflow_ownership(wf)
             self._store.save_workflow(wf)
+            if target is WorkflowStatus.RUNNING:
+                self._timeline.emit(
+                    event_type="workflow_started",
+                    actor_id=self._agent_id,
+                    actor_type="scheduler",
+                    target_id=wf.workflow_id,
+                    target_type="workflow",
+                    status=wf.status.value,
+                    summary=f"workflow started: {wf.title}",
+                    workflow_id=wf.workflow_id,
+                    record_path=str(self._store.workflow_json_path(wf.workflow_id)),
+                    metadata={"title": wf.title},
+                )
             if event_type is not None:
                 self._events.emit(
                     event_type, wf.workflow_id,
                     agent_id=self._agent_id, message=message,
+                )
+                self._timeline.emit(
+                    event_type=(
+                        "workflow_completed"
+                        if target is WorkflowStatus.SUCCEEDED else
+                        "workflow_failed"
+                    ),
+                    actor_id=self._agent_id,
+                    actor_type="scheduler",
+                    target_id=wf.workflow_id,
+                    target_type="workflow",
+                    status=wf.status.value,
+                    summary=message,
+                    workflow_id=wf.workflow_id,
+                    record_path=str(self._store.workflow_json_path(wf.workflow_id)),
+                    metadata={"title": wf.title},
                 )
         if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
             report_path = self._scoped_agents.write_workflow_report(wf, self._store)
@@ -2582,6 +2681,23 @@ class Scheduler:
                 message=message,
                 metadata={"status": TaskStatus.RUNNING.value, "pid": pid} if pid is not None else {"status": TaskStatus.RUNNING.value},
             )
+            self._timeline.emit(
+                event_type="workflow_task_started",
+                actor_id=self._agent_id,
+                actor_type="scheduler",
+                target_id=task.task_id,
+                target_type="task",
+                status=TaskStatus.RUNNING.value,
+                summary=message,
+                workflow_id=wf.workflow_id,
+                task_id=task.task_id,
+                record_path=str(self._store.workflow_json_path(wf.workflow_id)),
+                metadata={
+                    "attempt_id": attempt_id,
+                    "task_kind": task.task_kind,
+                    "pid": pid,
+                },
+            )
             for event_type, event_message, event_metadata in extra_events or []:
                 self._events.emit(
                     event_type,
@@ -2707,6 +2823,27 @@ class Scheduler:
                 agent_id=self._agent_id,
                 message=message,
                 metadata={"status": new_status.value},
+            )
+            self._timeline.emit(
+                event_type=(
+                    "workflow_task_completed"
+                    if new_status in {TaskStatus.SUCCEEDED, TaskStatus.SKIPPED} else
+                    "workflow_task_failed"
+                ),
+                actor_id=self._agent_id,
+                actor_type="scheduler",
+                target_id=task.task_id,
+                target_type="task",
+                status=new_status.value,
+                summary=message,
+                workflow_id=wf.workflow_id,
+                task_id=task.task_id,
+                record_path=result_path or str(self._store.workflow_json_path(wf.workflow_id)),
+                metadata={
+                    "attempt_id": attempt_id,
+                    "task_kind": task.task_kind,
+                    "error_type": error_type,
+                },
             )
             for event_type, event_message, event_metadata in extra_events or []:
                 self._events.emit(
@@ -3034,6 +3171,25 @@ class Scheduler:
             execution_status=target_status.value,
             error=dataflow_error or tool_result.error,
             approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
+        )
+        self._timeline.emit(
+            event_type="capability_executed" if target_status is TaskStatus.SUCCEEDED else "capability_failed",
+            actor_id=request.actor_id,
+            actor_type=request.actor_type,
+            target_id=request.capability_name,
+            target_type="capability",
+            status=target_status.value,
+            summary=(
+                f"capability executed: {request.capability_name}"
+                if target_status is TaskStatus.SUCCEEDED else
+                f"capability failed: {request.capability_name}"
+            ),
+            workflow_id=wf.workflow_id,
+            task_id=task.task_id,
+            approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
+            audit_id=self._policy_audit_id(audit_path),
+            record_path=str(audit_path),
+            metadata={"error": dataflow_error or tool_result.error},
         )
         message = dataflow_error or tool_result.error or tool_result.summary or ""
         event_metadata = {

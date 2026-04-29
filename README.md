@@ -177,6 +177,11 @@ Supported commands in the plain loop, UI bridge, and web UI:
 | `/message read <msg-id>` | Mark one persistent message as read |
 | `/message archive <msg-id>` | Archive one persistent message |
 | `/message send <ag-id> <subject> <body-file>` | Send one root-scoped persistent message |
+| `/timeline recent` | Show recent unified runtime timeline events |
+| `/timeline show <event_id>` | Show one unified timeline event |
+| `/timeline trace <correlation_id>` | Trace one causal chain |
+| `/timeline blocked` | Show currently blocked timeline items |
+| `/timeline approvals` | Show approval lifecycle events |
 | `/agent kazi` | Show one runtime agent profile |
 | `/capabilities` | List all registered capabilities across tools, watchers, and agents |
 | `/capability <name>` | Show one capability contract |
@@ -243,6 +248,11 @@ python -m mr1.workflow_cli message <message_id>
 python -m mr1.workflow_cli message-read <message_id>
 python -m mr1.workflow_cli message-archive <message_id>
 python -m mr1.workflow_cli message-send <ag-id> "subject" path/to/body.txt
+python -m mr1.workflow_cli timeline recent
+python -m mr1.workflow_cli timeline show <event_id>
+python -m mr1.workflow_cli timeline trace <correlation_id>
+python -m mr1.workflow_cli timeline blocked
+python -m mr1.workflow_cli timeline approvals
 python -m mr1.workflow_cli agent kazi
 python -m mr1.workflow_cli agent kazi health
 python -m mr1.workflow_cli result <task_id>

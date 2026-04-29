@@ -39,6 +39,7 @@ from mr1.capability_policy import (
     CapabilityApprovalStore,
 )
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.event_log import EventLog, SystemEvent, bind_correlation_id, cli_correlation_id
 from mr1.inbox_triage import InboxTriagePolicy, InboxTriageResult, InboxTriageRunner
 from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
@@ -251,6 +252,92 @@ def _format_events(events: list) -> str:
             (ev.message or "")[:60],
         ))
     return _render_table(rows)
+
+
+def _format_timeline_events(
+    events: list[SystemEvent],
+    *,
+    json_output: bool = False,
+    brief: bool = False,
+) -> str:
+    if json_output:
+        payload = [event.to_dict() for event in events]
+        if brief:
+            payload = [
+                {
+                    "event_index": item["event_index"],
+                    "timestamp": item["timestamp"],
+                    "event_type": item["event_type"],
+                    "status": item["status"],
+                    "summary": item["summary"],
+                    "correlation_id": item["correlation_id"],
+                }
+                for item in payload
+            ]
+        return json.dumps(payload, indent=2, sort_keys=True)
+    if not events:
+        return "No timeline events."
+    rows = [(
+        "INDEX",
+        "TIMESTAMP",
+        "TYPE",
+        "KIND",
+        "ACTOR",
+        "TARGET",
+        "STATUS",
+        "SEVERITY",
+        "CORRELATION",
+        "SUMMARY",
+    )]
+    for event in events:
+        rows.append((
+            str(event.event_index),
+            _short_ts(event.timestamp),
+            event.event_type,
+            event.event_kind,
+            event.actor_id or "-",
+            event.target_id or "-",
+            event.status,
+            event.severity,
+            (event.correlation_id or "-")[:32],
+            event.summary[:60],
+        ))
+    return _render_table(rows)
+
+
+def _format_timeline_event_detail(
+    event: SystemEvent,
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(event.to_dict(), indent=2, sort_keys=True)
+    return "\n".join([
+        f"event_id:            {event.event_id}",
+        f"event_index:         {event.event_index}",
+        f"event_version:       {event.event_version}",
+        f"timestamp:           {event.timestamp}",
+        f"event_type:          {event.event_type}",
+        f"event_kind:          {event.event_kind}",
+        f"actor_id:            {event.actor_id or '-'}",
+        f"actor_type:          {event.actor_type or '-'}",
+        f"target_id:           {event.target_id or '-'}",
+        f"target_type:         {event.target_type or '-'}",
+        f"status:              {event.status}",
+        f"severity:            {event.severity}",
+        f"summary:             {event.summary}",
+        f"correlation_id:      {event.correlation_id or '-'}",
+        f"parent_event_id:     {event.parent_event_id or '-'}",
+        f"workflow_id:         {event.workflow_id or '-'}",
+        f"task_id:             {event.task_id or '-'}",
+        f"step_id:             {event.step_id or '-'}",
+        f"message_id:          {event.message_id or '-'}",
+        f"approval_request_id: {event.approval_request_id or '-'}",
+        f"audit_id:            {event.audit_id or '-'}",
+        f"record_path:         {event.record_path or '-'}",
+        "metadata:",
+        json.dumps(event.metadata, indent=2, sort_keys=True),
+    ])
 
 
 def _format_watchers(workflows: list[Workflow]) -> str:
@@ -1190,6 +1277,10 @@ def _approval_store_for(store: WorkflowStore) -> CapabilityApprovalStore:
     return CapabilityApprovalStore(store.root.parent / "capability_approvals")
 
 
+def _timeline_for(store: WorkflowStore) -> EventLog:
+    return EventLog(store.root.parent / "events")
+
+
 def _visible_approvals(
     approval_store: CapabilityApprovalStore,
     scoped_agents: PersistentAgentStore,
@@ -1206,6 +1297,65 @@ def _visible_approvals(
         ):
             approvals.append(approval)
     return approvals
+
+
+def _event_visible(
+    event: SystemEvent,
+    *,
+    store: WorkflowStore,
+    scoped_agents: PersistentAgentStore,
+    message_store: MessageStore,
+    caller_agent_id: str,
+) -> bool:
+    if scoped_agents.is_root_agent(caller_agent_id):
+        return True
+    if event.workflow_id is not None:
+        try:
+            _load_scoped_workflow(store, event.workflow_id, scoped_agents, caller_agent_id)
+            return True
+        except WorkflowSpecError:
+            return False
+    if event.approval_request_id is not None:
+        try:
+            _require_visible_approval(
+                _approval_store_for(store),
+                event.approval_request_id,
+                scoped_agents,
+                caller_agent_id,
+            )
+            return True
+        except (ValueError, AgentScopeError):
+            return False
+    if event.message_id is not None:
+        try:
+            _require_message(message_store, event.message_id, caller_agent_id)
+            return True
+        except (ValueError, AgentScopeError):
+            return False
+    if event.target_type == "agent" and event.target_id is not None:
+        return scoped_agents.is_visible(caller_agent_id, event.target_id)
+    if event.actor_id is not None and scoped_agents.load_agent(event.actor_id) is not None:
+        return scoped_agents.is_visible(caller_agent_id, event.actor_id)
+    return True
+
+
+def _visible_timeline_events(
+    store: WorkflowStore,
+    scoped_agents: PersistentAgentStore,
+    message_store: MessageStore,
+    caller_agent_id: str,
+) -> list[SystemEvent]:
+    events = _timeline_for(store).list_events()
+    return [
+        event for event in events
+        if _event_visible(
+            event,
+            store=store,
+            scoped_agents=scoped_agents,
+            message_store=message_store,
+            caller_agent_id=caller_agent_id,
+        )
+    ]
 
 
 def _require_visible_approval(
@@ -1570,6 +1720,173 @@ def _cmd_events(
         limit=args.limit,
     )
     print(_format_events(events))
+    return 0
+
+
+def _cmd_timeline_list(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    message_store = getattr(args, "message_store")
+    events = _visible_timeline_events(
+        store,
+        scoped_agents,
+        message_store,
+        caller_agent_id,
+    )
+    if getattr(args, "limit", None):
+        events = events[-args.limit:]
+    print(_format_timeline_events(events, json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_timeline_recent(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    message_store = getattr(args, "message_store")
+    events = _visible_timeline_events(
+        store,
+        scoped_agents,
+        message_store,
+        caller_agent_id,
+    )
+    limit = getattr(args, "limit", 20)
+    events = sorted(events, key=lambda item: item.event_index, reverse=True)[:limit]
+    print(_format_timeline_events(events, json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_timeline_show(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    message_store = getattr(args, "message_store")
+    event = _timeline_for(store).get_event(args.event_id)
+    if event is None:
+        print(f"error: event not found: {args.event_id}", file=sys.stderr)
+        return 2
+    if not _event_visible(
+        event,
+        store=store,
+        scoped_agents=scoped_agents,
+        message_store=message_store,
+        caller_agent_id=caller_agent_id,
+    ):
+        print("error: access denied: event not in agent scope", file=sys.stderr)
+        return 2
+    print(_format_timeline_event_detail(event, json_output=args.json))
+    return 0
+
+
+def _cmd_timeline_trace(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    message_store = getattr(args, "message_store")
+    events = [
+        event for event in _timeline_for(store).trace_by_correlation(args.correlation_id)
+        if _event_visible(
+            event,
+            store=store,
+            scoped_agents=scoped_agents,
+            message_store=message_store,
+            caller_agent_id=caller_agent_id,
+        )
+    ]
+    print(_format_timeline_events(events, json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_timeline_blocked(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    message_store = getattr(args, "message_store")
+    events = [
+        event for event in _timeline_for(store).blocked_now()
+        if _event_visible(
+            event,
+            store=store,
+            scoped_agents=scoped_agents,
+            message_store=message_store,
+            caller_agent_id=caller_agent_id,
+        )
+    ]
+    print(_format_timeline_events(events, json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_timeline_approvals(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    message_store = getattr(args, "message_store")
+    events = [
+        event for event in _timeline_for(store).approval_history()
+        if _event_visible(
+            event,
+            store=store,
+            scoped_agents=scoped_agents,
+            message_store=message_store,
+            caller_agent_id=caller_agent_id,
+        )
+    ]
+    print(_format_timeline_events(events, json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_timeline_agent(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    message_store = getattr(args, "message_store")
+    try:
+        scoped_agents.get_visible_agent(caller_agent_id, args.agent_id)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    events = [
+        event for event in _timeline_for(store).agent_activity(args.agent_id)
+        if _event_visible(
+            event,
+            store=store,
+            scoped_agents=scoped_agents,
+            message_store=message_store,
+            caller_agent_id=caller_agent_id,
+        )
+    ]
+    print(_format_timeline_events(events, json_output=args.json, brief=args.brief))
+    return 0
+
+
+def _cmd_timeline_workflow(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    try:
+        _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
+    except WorkflowSpecError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    events = _timeline_for(store).workflow_trace(args.workflow_id)
+    print(_format_timeline_events(events, json_output=args.json, brief=args.brief))
     return 0
 
 
@@ -2196,7 +2513,7 @@ def _cmd_message_read(
     message_store = getattr(args, "message_store")
     try:
         _require_message(message_store, args.message_id, caller_agent_id)
-        message = message_store.mark_read(args.message_id)
+        message = message_store.mark_read(args.message_id, actor_id=caller_agent_id)
         if message is None:
             raise ValueError(f"message not found: {args.message_id}")
     except (ValueError, AgentScopeError) as exc:
@@ -2406,6 +2723,47 @@ def _build_parser() -> argparse.ArgumentParser:
     p_events.add_argument("--task", default=None, dest="task")
     p_events.add_argument("--limit", type=int, default=None)
     p_events.set_defaults(func=_cmd_events)
+
+    p_timeline = subs.add_parser("timeline", help="Inspect the unified runtime timeline.")
+    timeline_subs = p_timeline.add_subparsers(dest="timeline_command", required=True)
+
+    p_timeline_list = timeline_subs.add_parser("list", help="List visible timeline events.")
+    p_timeline_list.add_argument("--limit", type=int, default=None)
+    add_common_flags(p_timeline_list, include_example=False)
+    p_timeline_list.set_defaults(func=_cmd_timeline_list)
+
+    p_timeline_recent = timeline_subs.add_parser("recent", help="Show recent timeline events.")
+    p_timeline_recent.add_argument("--limit", type=int, default=20)
+    add_common_flags(p_timeline_recent, include_example=False)
+    p_timeline_recent.set_defaults(func=_cmd_timeline_recent)
+
+    p_timeline_show = timeline_subs.add_parser("show", help="Show one timeline event.")
+    p_timeline_show.add_argument("event_id")
+    add_common_flags(p_timeline_show, include_example=False)
+    p_timeline_show.set_defaults(func=_cmd_timeline_show)
+
+    p_timeline_trace = timeline_subs.add_parser("trace", help="Trace one correlation id.")
+    p_timeline_trace.add_argument("correlation_id")
+    add_common_flags(p_timeline_trace, include_example=False)
+    p_timeline_trace.set_defaults(func=_cmd_timeline_trace)
+
+    p_timeline_blocked = timeline_subs.add_parser("blocked", help="Show currently blocked timeline items.")
+    add_common_flags(p_timeline_blocked, include_example=False)
+    p_timeline_blocked.set_defaults(func=_cmd_timeline_blocked)
+
+    p_timeline_approvals = timeline_subs.add_parser("approvals", help="Show approval lifecycle events.")
+    add_common_flags(p_timeline_approvals, include_example=False)
+    p_timeline_approvals.set_defaults(func=_cmd_timeline_approvals)
+
+    p_timeline_agent = timeline_subs.add_parser("agent", help="Show timeline events related to one agent.")
+    p_timeline_agent.add_argument("agent_id")
+    add_common_flags(p_timeline_agent, include_example=False)
+    p_timeline_agent.set_defaults(func=_cmd_timeline_agent)
+
+    p_timeline_workflow = timeline_subs.add_parser("workflow", help="Show timeline events for one workflow.")
+    p_timeline_workflow.add_argument("workflow_id")
+    add_common_flags(p_timeline_workflow, include_example=False)
+    p_timeline_workflow.set_defaults(func=_cmd_timeline_workflow)
 
     p_watchers = subs.add_parser("watchers", help="List active watcher tasks.")
     p_watchers.set_defaults(func=_cmd_watchers)
@@ -2625,7 +2983,17 @@ def main(
     resolved_caller_agent_id = caller_agent_id or active_scoped_store.root_agent_id
     setattr(args, "workflow_compiler", workflow_compiler)
     setattr(args, "message_store", active_message_store)
-    return args.func(args, active_store, resolved_caller_agent_id, active_scoped_store)
+    command_name = " ".join(
+        item for item in [
+            getattr(args, "command", None),
+            getattr(args, "timeline_command", None),
+            getattr(args, "approvals_command", None),
+            getattr(args, "capability_audit_command", None),
+        ]
+        if item
+    )
+    with bind_correlation_id(cli_correlation_id(resolved_caller_agent_id, command_name or "cli")):
+        return args.func(args, active_store, resolved_caller_agent_id, active_scoped_store)
 
 
 def _format_inline_value(item: ResolvedTaskInput) -> str:

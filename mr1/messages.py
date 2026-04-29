@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from mr1.event_log import EventLog
 from mr1.scoped_agents import PersistentAgentStore
 
 
@@ -114,6 +115,7 @@ class MessageStore:
             root=self._root.parent / "agents"
         )
         self._lock = threading.RLock()
+        self._event_log = EventLog(self._root.parent / "events")
 
     @property
     def root(self) -> Path:
@@ -177,6 +179,26 @@ class MessageStore:
         _validate_message(message)
         with self._lock:
             self._write_message(message)
+        sender = self._scoped_agents.require_agent(from_agent_id)
+        self._event_log.emit(
+            event_type="message_sent",
+            actor_id=from_agent_id,
+            actor_type=sender.agent_type,
+            target_id=to_agent_id,
+            target_type="agent",
+            status="sent",
+            summary=f"message sent: {subject.strip()}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            message_id=message.message_id,
+            record_path=str(self.message_path(message.message_id)),
+            metadata={
+                "kind": kind,
+                "subject": message.subject,
+                "from_agent_id": from_agent_id,
+                "to_agent_id": to_agent_id,
+            },
+        )
         return message
 
     def get_message(self, message_id: str) -> Optional[PersistentMessage]:
@@ -216,7 +238,12 @@ class MessageStore:
         ]
         return sorted(messages, key=lambda item: (item.created_at, item.message_id), reverse=True)
 
-    def mark_read(self, message_id: str) -> Optional[PersistentMessage]:
+    def mark_read(
+        self,
+        message_id: str,
+        *,
+        actor_id: Optional[str] = None,
+    ) -> Optional[PersistentMessage]:
         with self._lock:
             message = self.get_message(message_id)
             if message is None:
@@ -240,6 +267,25 @@ class MessageStore:
                 status="read",
             )
             self._write_message(updated)
+            reader_id = actor_id or updated.to_agent_id
+            reader = self._scoped_agents.load_agent(reader_id)
+            self._event_log.emit(
+                event_type="message_read",
+                actor_id=reader_id,
+                actor_type=reader.agent_type if reader is not None else None,
+                target_id=updated.message_id,
+                target_type="message",
+                status="read",
+                summary=f"message read: {updated.subject}",
+                workflow_id=updated.workflow_id,
+                task_id=updated.task_id,
+                message_id=updated.message_id,
+                record_path=str(self.message_path(updated.message_id)),
+                metadata={
+                    "from_agent_id": updated.from_agent_id,
+                    "to_agent_id": updated.to_agent_id,
+                },
+            )
             return updated
 
     def archive_message(self, message_id: str) -> Optional[PersistentMessage]:

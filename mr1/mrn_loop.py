@@ -20,6 +20,7 @@ from mr1.agents import AgentRuntimeError, parse_agent_json_envelope
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.capability_runner import CapabilityResult, CapabilityRunner
 from mr1.core import Dispatcher, PermissionDenied
+from mr1.event_log import EventLog, bind_correlation_id, mrn_step_correlation_id
 from mr1.kazi_runner import MockRunner
 from mr1.messages import MessageStore
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
@@ -282,6 +283,7 @@ class MRnStepRunner:
             capability_registry=self._capability_registry,
             scoped_agent_store=self._scoped_agents,
         )
+        self._event_log = EventLog(self._workflow_store.root.parent / "events")
         self._workflow_authoring = (
             workflow_authoring_service or
             self._build_default_authoring_service()
@@ -327,34 +329,52 @@ class MRnStepRunner:
         if not (agent.mission and agent.mission.strip()):
             raise ValueError(f"no mission assigned: {agent_id}")
 
+        next_iteration = agent.current_iteration + 1
+        step_id = f"{agent.agent_id}:{next_iteration}"
+        correlation_id = mrn_step_correlation_id(agent.agent_id, next_iteration)
+        self._event_log.emit(
+            event_type="mrn_step_started",
+            actor_id=agent.agent_id,
+            actor_type=agent.agent_type,
+            target_id=agent.agent_id,
+            target_type="agent",
+            status="started",
+            summary="mrn step started",
+            correlation_id=correlation_id,
+            step_id=step_id,
+            record_path=str(self._scoped_agents.step_log_path(agent.agent_id)),
+            metadata={"iteration": next_iteration},
+        )
+
         prompt = self._build_step_prompt(agent)
-        raw = self._reasoner(agent, _SYSTEM_PROMPT, prompt)
-        try:
-            action = self._parse_and_validate_action(raw)
-        except ValueError as exc:
-            corrected_raw = self._reasoner(
-                agent,
-                _SYSTEM_PROMPT,
-                self._build_correction_prompt(prompt, raw, str(exc)),
-            )
+        with bind_correlation_id(correlation_id):
+            raw = self._reasoner(agent, _SYSTEM_PROMPT, prompt)
             try:
-                action = self._parse_and_validate_action(corrected_raw)
-            except ValueError as second_exc:
+                action = self._parse_and_validate_action(raw)
+            except ValueError as exc:
+                corrected_raw = self._reasoner(
+                    agent,
+                    _SYSTEM_PROMPT,
+                    self._build_correction_prompt(prompt, raw, str(exc)),
+                )
+                try:
+                    action = self._parse_and_validate_action(corrected_raw)
+                except ValueError as second_exc:
+                    return self._persist_blocked_step(
+                        agent,
+                        reason=f"invalid mrn action: {second_exc}",
+                        raw_action=corrected_raw,
+                    )
+
+            step_call_count = [0]  # mutable counter, scoped to this step() invocation
+            try:
+                return self._execute_action(agent, action, step_call_count)
+            except (AgentScopeError, WorkflowCompilerFailure, WorkflowSpecError, RuntimeError, ValueError) as exc:
                 return self._persist_blocked_step(
                     agent,
-                    reason=f"invalid mrn action: {second_exc}",
-                    raw_action=corrected_raw,
+                    reason=str(exc),
+                    raw_action=_json_dumps(action),
                 )
-
-        step_call_count = [0]  # mutable counter, scoped to this step() invocation
-        try:
-            return self._execute_action(agent, action, step_call_count)
-        except (AgentScopeError, WorkflowCompilerFailure, WorkflowSpecError, RuntimeError, ValueError) as exc:
-            return self._persist_blocked_step(
-                agent,
-                reason=str(exc),
-                raw_action=_json_dumps(action),
-            )
 
     def _build_step_prompt(self, agent: PersistentAgent) -> str:
         return "\n\n".join([
@@ -742,7 +762,7 @@ class MRnStepRunner:
                 ]),
                 to_agent_id=agent.parent_agent_id,
             )
-        return self._persist_step(
+        result = self._persist_step(
             agent,
             action=action,
             status_after="reporting",
@@ -756,6 +776,8 @@ class MRnStepRunner:
             confirmation_required=True,
             workflow_submitted=False,
         )
+        self._emit_mrn_reported(agent, result)
+        return result
 
     def _build_create_workflow_context(self, agent: PersistentAgent, action: dict[str, Any]) -> str:
         parts = [
@@ -868,7 +890,7 @@ class MRnStepRunner:
                 subject=f"Report from {agent.title}",
                 body="\n".join([content, "", f"Report path: {report_path}"]),
             )
-        return self._persist_step(
+        result = self._persist_step(
             agent,
             action=action,
             status_after=action["next_status"],
@@ -878,6 +900,8 @@ class MRnStepRunner:
             created_parent_message_id=message.message_id if message is not None else None,
             message_to_agent_id=message.to_agent_id if message is not None else None,
         )
+        self._emit_mrn_reported(agent, result)
+        return result
 
     def _execute_send_message(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
         message = self._send_agent_message(
@@ -955,6 +979,7 @@ class MRnStepRunner:
         updated = self._scoped_agents.require_agent(agent.agent_id)
         status_before = updated.run_status
         iteration = updated.current_iteration + 1
+        step_id = f"{updated.agent_id}:{iteration}"
         timestamp = updated.last_step_at = self._now_iso()
         updated.current_iteration = iteration
         updated.run_status = status_after
@@ -1011,6 +1036,25 @@ class MRnStepRunner:
         if workflow_summary is not None:
             log_record["workflow_summary"] = workflow_summary
         self._scoped_agents.append_step_log(updated.agent_id, log_record)
+        self._event_log.emit(
+            event_type="mrn_step_completed",
+            actor_id=updated.agent_id,
+            actor_type=updated.agent_type,
+            target_id=updated.agent_id,
+            target_type="agent",
+            status=status_after,
+            summary=message,
+            step_id=step_id,
+            workflow_id=workflow_id,
+            message_id=message_id,
+            record_path=str(self._scoped_agents.step_log_path(updated.agent_id)),
+            metadata={
+                "iteration": iteration,
+                "action": action["action"],
+                "reason": action["reason"],
+                "error": error,
+            },
+        )
         return MRnStepResult(
             agent_id=updated.agent_id,
             iteration=iteration,
@@ -1080,6 +1124,24 @@ class MRnStepRunner:
             message="step blocked",
             error=reason,
             workflow_summary={"raw_action": _compact(raw_action, limit=400)},
+        )
+
+    def _emit_mrn_reported(self, agent: PersistentAgent, result: MRnStepResult) -> None:
+        if not result.report_path:
+            return
+        self._event_log.emit(
+            event_type="mrn_reported",
+            actor_id=agent.agent_id,
+            actor_type=agent.agent_type,
+            target_id=agent.agent_id,
+            target_type="agent",
+            status="reported",
+            summary="mrn report emitted",
+            step_id=f"{agent.agent_id}:{result.iteration}",
+            workflow_id=result.workflow_id,
+            message_id=result.message_id,
+            record_path=result.report_path,
+            metadata={"report_path": result.report_path},
         )
 
     @staticmethod

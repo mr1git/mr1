@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from mr1.event_log import EventLog
+
 if TYPE_CHECKING:
     from mr1.workflow_models import Workflow
     from mr1.workflow_store import WorkflowStore
@@ -171,6 +173,7 @@ class PersistentAgentStore:
         self._root = Path(root) if root else _DEFAULT_ROOT
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._event_log = EventLog(self._root.parent / "events")
 
     @property
     def root(self) -> Path:
@@ -405,6 +408,21 @@ class PersistentAgentStore:
             security_clearance=child_clearance,
         )
         self.save_agent(agent)
+        self._event_log.emit(
+            event_type="agent_created",
+            actor_id=parent.agent_id,
+            actor_type=parent.agent_type,
+            target_id=agent.agent_id,
+            target_type="agent",
+            status="created",
+            summary=f"agent created: {agent.title}",
+            record_path=str(self.agent_path(agent.agent_id)),
+            metadata={
+                "title": agent.title,
+                "tree_level": agent.tree_level,
+                "parent_agent_id": parent.agent_id,
+            },
+        )
         return agent
 
     def terminate_agent(self, caller_agent_id: str, target_agent_id: str) -> PersistentAgent:
@@ -469,6 +487,20 @@ class PersistentAgentStore:
             for item in sorted(grants_by_path.values(), key=lambda item: item.path)
         ]
         self.save_agent(target)
+        self._event_log.emit(
+            event_type="agent_scope_granted",
+            actor_id=granting_agent_id,
+            actor_type=granter.agent_type,
+            target_id=target.agent_id,
+            target_type="agent",
+            status="granted",
+            summary=f"scope granted to {target.agent_id}",
+            record_path=str(self.agent_path(target.agent_id)),
+            metadata={
+                "path": normalized_path,
+                "reason": grants_by_path[normalized_path].reason,
+            },
+        )
         return grants_by_path[normalized_path]
 
     def revoke_scope(
@@ -495,6 +527,17 @@ class PersistentAgentStore:
             if item.path != normalized_path
         ]
         self.save_agent(target)
+        self._event_log.emit(
+            event_type="agent_scope_revoked",
+            actor_id=granting_agent_id,
+            actor_type=granter.agent_type,
+            target_id=target.agent_id,
+            target_type="agent",
+            status="revoked",
+            summary=f"scope revoked from {target.agent_id}",
+            record_path=str(self.agent_path(target.agent_id)),
+            metadata={"path": normalized_path},
+        )
         return normalized_path
 
     def assign_mission(

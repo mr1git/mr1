@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.workflow_store import WorkflowStore
@@ -651,6 +652,7 @@ class CapabilityApprovalStore:
     def __init__(self, root: Path):
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
+        self._event_log = EventLog(self._root.parent / "events")
 
     def approval_path(self, approval_request_id: str) -> Path:
         return self._root / f"{approval_request_id}.json"
@@ -724,7 +726,26 @@ class CapabilityApprovalStore:
             "used_at": used_at or _now_iso(),
             "used_by_audit_id": audit_id,
         })
-        self.save(updated)
+        path = self.save(updated)
+        self._event_log.emit(
+            event_type="approval_consumed",
+            actor_id=updated.requesting_actor_id,
+            actor_type=updated.original_request.actor_type,
+            target_id=updated.approval_request_id,
+            target_type="approval_request",
+            status="consumed",
+            summary=f"approval consumed: {updated.capability_name}",
+            workflow_id=updated.workflow_id,
+            task_id=updated.task_id,
+            step_id=updated.original_step_id,
+            approval_request_id=updated.approval_request_id,
+            audit_id=audit_id,
+            record_path=str(path),
+            metadata={
+                "capability_name": updated.capability_name,
+                "used_by_audit_id": updated.used_by_audit_id,
+            },
+        )
         return updated
 
     def apply_decision(
@@ -755,6 +776,27 @@ class CapabilityApprovalStore:
         updated_payload["used_at"] = None
         updated_payload["used_by_audit_id"] = None
         updated = CapabilityApprovalRequest.from_dict(updated_payload)
+        path = self.save(updated)
+        decider_type = decider.agent_type
+        self._event_log.emit(
+            event_type="approval_approved" if decision.decision == "approved" else "approval_denied",
+            actor_id=decision.decided_by,
+            actor_type=decider_type,
+            target_id=updated.approval_request_id,
+            target_type="approval_request",
+            status=updated.status,
+            summary=f"approval {updated.status}: {updated.capability_name}",
+            workflow_id=updated.workflow_id,
+            task_id=updated.task_id,
+            step_id=updated.original_step_id,
+            approval_request_id=updated.approval_request_id,
+            record_path=str(path),
+            metadata={
+                "capability_name": updated.capability_name,
+                "approval_scope": decision.approval_scope,
+                "reason": decision.reason,
+            },
+        )
         if decision.decision == "approved" and decision.approval_scope == "grant_scope":
             if not approval.requested_scope_path:
                 raise ValueError("approval decision rejected: grant_scope requires a requested_scope_path")
@@ -764,7 +806,6 @@ class CapabilityApprovalStore:
                 approval.requested_scope_path,
                 reason=decision.reason,
             )
-        self.save(updated)
         return updated
 
 
@@ -1091,6 +1132,26 @@ def maybe_route_approval_request(
                 scoped_agent_store=scoped_agent_store,
             ),
         })
+    path = approval_store.save(approval)
+    approval_store._event_log.emit(
+        event_type="approval_requested",
+        actor_id=approval.requesting_actor_id,
+        actor_type=approval.original_request.actor_type,
+        target_id=approval.approval_request_id,
+        target_type="approval_request",
+        status="pending",
+        summary=f"approval requested: {approval.capability_name}",
+        workflow_id=approval.workflow_id,
+        task_id=approval.task_id,
+        step_id=approval.original_step_id,
+        approval_request_id=approval.approval_request_id,
+        record_path=str(path),
+        metadata={
+            "capability_name": approval.capability_name,
+            "designated_approver_id": approval.designated_approver_id,
+            "requested_scope_path": approval.requested_scope_path,
+        },
+    )
     body = json.dumps(approval.to_dict(), indent=2, sort_keys=True)
     message = message_store.create_message(
         from_agent_id=approval.requesting_actor_id,

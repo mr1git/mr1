@@ -22,6 +22,7 @@ from mr1.capability_policy import (
     build_scope_context,
     capability_audit_index_entry,
 )
+from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.tools import _read_file_pure
@@ -69,6 +70,7 @@ class CapabilityRunner:
             self._agents.root.parent / "capability_approvals"
         )
         self._audit_writer = CapabilityAuditWriter()
+        self._event_log = EventLog(self._agents.root.parent / "events")
 
     def run_capability(
         self,
@@ -124,11 +126,48 @@ class CapabilityRunner:
             timestamp=_now_iso(),
         )
         self._audit_writer.write(audit_path, record)
+        self._event_log.emit(
+            event_type="capability_requested",
+            actor_id=caller_agent_id,
+            actor_type=caller_type,
+            target_id=name,
+            target_type="capability",
+            status="requested",
+            summary=f"capability requested: {name}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            step_id=step_id,
+            audit_id=audit_id,
+            record_path=str(audit_path),
+            metadata={"mode": mode},
+        )
 
         if not decision.allowed:
             approval_request_id = None
+            approval = None
             if decision.status == "requires_approval":
                 approval = build_approval_request(request, metadata, decision)
+                approval_request_id = approval.approval_request_id
+            self._event_log.emit(
+                event_type="capability_blocked",
+                actor_id=caller_agent_id,
+                actor_type=caller_type,
+                target_id=name,
+                target_type="capability",
+                status=decision.status,
+                summary=f"capability blocked: {name}",
+                workflow_id=workflow_id,
+                task_id=task_id,
+                step_id=step_id,
+                approval_request_id=approval_request_id,
+                audit_id=audit_id,
+                record_path=str(audit_path),
+                metadata={
+                    "reason": decision.reason,
+                    "decision_status": decision.status,
+                },
+            )
+            if approval is not None:
                 approval_request_id, _ = self._route_approval(approval)
             output = {
                 "status": decision.status,
@@ -158,6 +197,21 @@ class CapabilityRunner:
                 approval_request_id=approval_request_id,
                 audit_record_path=str(audit_path),
             )
+        self._event_log.emit(
+            event_type="capability_allowed",
+            actor_id=caller_agent_id,
+            actor_type=caller_type,
+            target_id=name,
+            target_type="capability",
+            status="allowed",
+            summary=f"capability allowed: {name}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            step_id=step_id,
+            audit_id=audit_id,
+            record_path=str(audit_path),
+            metadata={"reason": decision.reason},
+        )
 
         meta_timeout = 30
         config_timeout = config.get("timeout_s")
@@ -194,6 +248,29 @@ class CapabilityRunner:
             execution_status=status,
             error=error,
             approval_request_id=approval_request_id,
+        )
+        self._event_log.emit(
+            event_type="capability_executed" if status == "succeeded" else "capability_failed",
+            actor_id=caller_agent_id,
+            actor_type=caller_type,
+            target_id=name,
+            target_type="capability",
+            status=status,
+            summary=(
+                f"capability executed: {name}"
+                if status == "succeeded" else
+                f"capability failed: {name}"
+            ),
+            workflow_id=workflow_id,
+            task_id=task_id,
+            step_id=step_id,
+            approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
+            audit_id=audit_id,
+            record_path=str(audit_path),
+            metadata={
+                "duration_ms": duration_ms,
+                "error": error,
+            },
         )
         return CapabilityResult(
             status=status,
