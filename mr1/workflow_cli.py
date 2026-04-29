@@ -42,6 +42,20 @@ from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.event_log import EventLog, SystemEvent, bind_correlation_id, cli_correlation_id
 from mr1.inbox_triage import InboxTriagePolicy, InboxTriageResult, InboxTriageRunner
 from mr1.messages import MessageStore, PersistentMessage
+from mr1.memory_graph import (
+    MemoryGraph,
+    MemoryGraphStore,
+    agent_summary,
+    capability_stats,
+    file_summary,
+    failure_modes,
+    graph_stats,
+    project_summary,
+    show_node,
+    top_workflow_templates,
+    update_graph_from_events,
+    workflow_template_summary,
+)
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunResult, MRnRunRunner
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
@@ -1175,6 +1189,108 @@ def _format_description_text(description: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_memory_update(result: dict[str, Any], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(result, indent=2, sort_keys=True)
+    rows = [
+        ("FIELD", "VALUE"),
+        ("processed_events", str(result.get("processed_events", 0))),
+        ("last_processed_event_index", str(result.get("last_processed_event_index", 0))),
+        ("nodes_created", str(result.get("nodes_created", 0))),
+        ("nodes_updated", str(result.get("nodes_updated", 0))),
+        ("edges_created", str(result.get("edges_created", 0))),
+        ("edges_updated", str(result.get("edges_updated", 0))),
+    ]
+    return _render_table(rows)
+
+
+def _format_memory_stats(payload: dict[str, Any], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    lines = [
+        f"nodes: {payload.get('node_count', 0)}",
+        f"edges: {payload.get('edge_count', 0)}",
+        f"last_processed_event_index: {payload.get('last_processed_event_index', 0)}",
+        "",
+        "node_types:",
+    ]
+    node_rows = [("TYPE", "COUNT")]
+    for name, count in sorted(dict(payload.get("node_types", {})).items()):
+        node_rows.append((name, str(count)))
+    lines.append(_render_table(node_rows, indent="  "))
+    lines.append("")
+    lines.append("edge_types:")
+    edge_rows = [("TYPE", "COUNT")]
+    for name, count in sorted(dict(payload.get("edge_types", {})).items()):
+        edge_rows.append((name, str(count)))
+    lines.append(_render_table(edge_rows, indent="  "))
+    return "\n".join(lines)
+
+
+def _format_memory_templates(items: list[dict[str, Any]], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(items, indent=2, sort_keys=True)
+    if not items:
+        return "No workflow templates."
+    rows = [("TEMPLATE_ID", "NAME", "CRED", "SUCCESS", "FAIL", "BLOCKED")]
+    for item in items:
+        stats = item.get("stats", {})
+        rows.append((
+            item["node_id"],
+            item["name"][:24],
+            f"{float(stats.get('credibility_score', 0.0)):.3f}",
+            str(int(stats.get("success_count", 0))),
+            str(int(stats.get("failure_count", 0))),
+            str(int(stats.get("blocked_count", 0))),
+        ))
+    return _render_table(rows)
+
+
+def _format_memory_capabilities(items: list[dict[str, Any]], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(items, indent=2, sort_keys=True)
+    if not items:
+        return "No capabilities."
+    rows = [("CAPABILITY_ID", "NAME", "RELIAB", "REQUESTS", "EXEC", "BLOCKED", "FAIL")]
+    for item in items:
+        stats = item.get("stats", {})
+        rows.append((
+            item["node_id"],
+            item["name"][:24],
+            f"{float(stats.get('reliability_score', 0.0)):.3f}",
+            str(int(stats.get("request_count", 0))),
+            str(int(stats.get("execution_count", 0))),
+            str(int(stats.get("blocked_count", 0))),
+            str(int(stats.get("failure_count", 0))),
+        ))
+    return _render_table(rows)
+
+
+def _format_memory_failures(items: list[dict[str, Any]], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(items, indent=2, sort_keys=True)
+    if not items:
+        return "No failure modes."
+    rows = [("FAILURE_ID", "NAME", "COUNT", "STATUS", "TYPE")]
+    for item in items:
+        stats = item.get("stats", {})
+        metadata = item.get("metadata", {})
+        rows.append((
+            item["node_id"],
+            item["name"][:32],
+            str(int(stats.get("occurrence_count", 0))),
+            str(metadata.get("status") or "-"),
+            str(metadata.get("error_type") or "-"),
+        ))
+    return _render_table(rows)
+
+
+def _format_memory_detail(payload: dict[str, Any], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def _config_shape_for_tool(registry: ToolRegistry, tool_type: str) -> str:
     for tool in registry.list_tools():
         if tool.tool_type == tool_type:
@@ -1279,6 +1395,15 @@ def _approval_store_for(store: WorkflowStore) -> CapabilityApprovalStore:
 
 def _timeline_for(store: WorkflowStore) -> EventLog:
     return EventLog(store.root.parent / "events")
+
+
+def _graph_store_for(store: WorkflowStore) -> MemoryGraphStore:
+    return MemoryGraphStore(store.root.parent / "graph")
+
+
+def _load_memory_graph(store: WorkflowStore) -> tuple[MemoryGraph, int]:
+    graph_store = _graph_store_for(store)
+    return graph_store.load_graph(), graph_store.load_cursor()
 
 
 def _visible_approvals(
@@ -2403,6 +2528,173 @@ def _cmd_capability_audit_show(
     return 0
 
 
+def _cmd_memory_update(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        result = update_graph_from_events(_timeline_for(store), _graph_store_for(store))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_update(result.to_dict(), json_output=args.json))
+    return 0
+
+
+def _cmd_memory_stats(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, cursor = _load_memory_graph(store)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_stats(graph_stats(graph, last_processed_event_index=cursor), json_output=args.json))
+    return 0
+
+
+def _cmd_memory_graph_show(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, _ = _load_memory_graph(store)
+        payload = show_node(graph, args.node_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_top_workflows(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, _ = _load_memory_graph(store)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_templates(top_workflow_templates(graph, limit=args.limit), json_output=args.json))
+    return 0
+
+
+def _cmd_memory_capabilities(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, _ = _load_memory_graph(store)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_capabilities(capability_stats(graph, limit=args.limit), json_output=args.json))
+    return 0
+
+
+def _cmd_memory_failures(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, _ = _load_memory_graph(store)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_failures(failure_modes(graph, limit=args.limit), json_output=args.json))
+    return 0
+
+
+def _cmd_memory_agent(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    if not scoped_agents.is_visible(caller_agent_id, args.agent_id):
+        print("error: access denied: agent not in scope", file=sys.stderr)
+        return 2
+    try:
+        graph, _ = _load_memory_graph(store)
+        payload = agent_summary(graph, args.agent_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_project(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, _ = _load_memory_graph(store)
+        payload = project_summary(graph, args.project_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_file(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, _ = _load_memory_graph(store)
+        payload = file_summary(graph, args.file_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_workflow_template(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        graph, _ = _load_memory_graph(store)
+        payload = workflow_template_summary(graph, args.template_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
 def _cmd_inbox(
     args: argparse.Namespace,
     store: WorkflowStore,
@@ -2881,6 +3173,60 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_capability_audit_show, include_example=False)
     p_capability_audit_show.set_defaults(func=_cmd_capability_audit_show)
 
+    p_memory = subs.add_parser("memory", help="Inspect deterministic graph memory.")
+    memory_subs = p_memory.add_subparsers(dest="memory_command", required=True)
+
+    p_memory_update = memory_subs.add_parser("update", help="Update graph memory from timeline events.")
+    add_common_flags(p_memory_update, include_example=False)
+    p_memory_update.set_defaults(func=_cmd_memory_update)
+
+    p_memory_stats = memory_subs.add_parser("stats", help="Show graph memory counts and cursor state.")
+    add_common_flags(p_memory_stats, include_example=False)
+    p_memory_stats.set_defaults(func=_cmd_memory_stats)
+
+    p_memory_graph = memory_subs.add_parser("graph", help="Inspect graph memory views.")
+    memory_graph_subs = p_memory_graph.add_subparsers(dest="memory_graph_command", required=True)
+
+    p_memory_graph_show = memory_graph_subs.add_parser("show", help="Show one graph node and its incident edges.")
+    p_memory_graph_show.add_argument("node_id")
+    add_common_flags(p_memory_graph_show, include_example=False)
+    p_memory_graph_show.set_defaults(func=_cmd_memory_graph_show)
+
+    p_memory_top = memory_graph_subs.add_parser("top-workflows", help="Show top workflow templates.")
+    p_memory_top.add_argument("--limit", type=int, default=10)
+    add_common_flags(p_memory_top, include_example=False)
+    p_memory_top.set_defaults(func=_cmd_memory_top_workflows)
+
+    p_memory_caps = memory_graph_subs.add_parser("capabilities", help="Show capability graph stats.")
+    p_memory_caps.add_argument("--limit", type=int, default=None)
+    add_common_flags(p_memory_caps, include_example=False)
+    p_memory_caps.set_defaults(func=_cmd_memory_capabilities)
+
+    p_memory_failures = memory_graph_subs.add_parser("failures", help="Show common failure modes.")
+    p_memory_failures.add_argument("--limit", type=int, default=10)
+    add_common_flags(p_memory_failures, include_example=False)
+    p_memory_failures.set_defaults(func=_cmd_memory_failures)
+
+    p_memory_agent = memory_graph_subs.add_parser("agent", help="Show one agent graph summary.")
+    p_memory_agent.add_argument("agent_id")
+    add_common_flags(p_memory_agent, include_example=False)
+    p_memory_agent.set_defaults(func=_cmd_memory_agent)
+
+    p_memory_project = memory_graph_subs.add_parser("project", help="Show one project graph summary.")
+    p_memory_project.add_argument("project_id")
+    add_common_flags(p_memory_project, include_example=False)
+    p_memory_project.set_defaults(func=_cmd_memory_project)
+
+    p_memory_file = memory_graph_subs.add_parser("file", help="Show one file graph summary.")
+    p_memory_file.add_argument("file_id")
+    add_common_flags(p_memory_file, include_example=False)
+    p_memory_file.set_defaults(func=_cmd_memory_file)
+
+    p_memory_template = memory_graph_subs.add_parser("workflow-template", help="Show one workflow template summary.")
+    p_memory_template.add_argument("template_id")
+    add_common_flags(p_memory_template, include_example=False)
+    p_memory_template.set_defaults(func=_cmd_memory_workflow_template)
+
     p_inbox = subs.add_parser("inbox", help="List inbox messages for an agent.")
     p_inbox.add_argument("--agent", default=None)
     p_inbox.add_argument("--archived", action="store_true")
@@ -2989,6 +3335,8 @@ def main(
             getattr(args, "timeline_command", None),
             getattr(args, "approvals_command", None),
             getattr(args, "capability_audit_command", None),
+            getattr(args, "memory_command", None),
+            getattr(args, "memory_graph_command", None),
         ]
         if item
     )
