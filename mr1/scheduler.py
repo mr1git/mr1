@@ -26,6 +26,7 @@ Every state change follows the same atomic shape:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import threading
 import time
@@ -44,6 +45,7 @@ from mr1.capability_policy import (
     PolicyEngine,
     build_approval_request,
     build_scope_context,
+    capability_audit_index_entry,
     maybe_route_approval_request,
 )
 from mr1.conditions import (
@@ -1585,6 +1587,11 @@ class Scheduler:
                     execution_result=dict(payload),
                     error=timeout_message,
                 )
+                self._append_policy_audit_index_from_path(
+                    audit_path,
+                    execution_status=TaskStatus.TIMED_OUT.value,
+                    error=timeout_message,
+                )
             self._finish_attempt(
                 wf,
                 task,
@@ -1651,6 +1658,23 @@ class Scheduler:
                     audit_path,
                     execution_result=dict(check_payload),
                 )
+                approval_request_id = None
+                try:
+                    with open(audit_path, "r", encoding="utf-8") as handle:
+                        audit_record = CapabilityAuditRecord.from_dict(json.load(handle))
+                    approval_request_id = audit_record.decision.get("metadata", {}).get("approval_request_id")
+                except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                    approval_request_id = None
+                if isinstance(approval_request_id, str) and approval_request_id:
+                    self._approval_store.mark_used(
+                        approval_request_id,
+                        audit_id=audit_path.stem,
+                    )
+                self._append_policy_audit_index_from_path(
+                    audit_path,
+                    execution_status=TaskStatus.SUCCEEDED.value,
+                    approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
+                )
             self._finish_attempt(
                 wf,
                 task,
@@ -1687,6 +1711,11 @@ class Scheduler:
                     execution_result=dict(check_payload),
                     error=evaluation.message,
                 )
+                self._append_policy_audit_index_from_path(
+                    audit_path,
+                    execution_status=TaskStatus.TIMED_OUT.value,
+                    error=evaluation.message,
+                )
             self._finish_attempt(
                 wf,
                 task,
@@ -1716,6 +1745,11 @@ class Scheduler:
             self._finalize_policy_audit(
                 audit_path,
                 execution_result=dict(check_payload),
+                error=evaluation.message,
+            )
+            self._append_policy_audit_index_from_path(
+                audit_path,
+                execution_status=TaskStatus.FAILED.value,
                 error=evaluation.message,
             )
         self._finish_attempt(
@@ -1830,6 +1864,64 @@ class Scheduler:
         record.error = error
         self._audit_writer.write(audit_path, record)
 
+    def _append_policy_audit_index(
+        self,
+        *,
+        actor_id: str,
+        audit_id: str,
+        audit_path: Path,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+        decision: dict[str, Any],
+        execution_status: str,
+        error: Optional[str] = None,
+        approval_request_id: Optional[str] = None,
+    ) -> None:
+        self._scoped_agents.append_capability_call_log(
+            actor_id,
+            capability_audit_index_entry(
+                audit_id=audit_id,
+                audit_path=audit_path,
+                request=request,
+                metadata=metadata,
+                decision=decision,
+                execution_status=execution_status,
+                error=error,
+                approval_request_id=approval_request_id,
+            ),
+        )
+
+    def _append_policy_audit_index_from_path(
+        self,
+        audit_path: Path,
+        *,
+        execution_status: str,
+        error: Optional[str] = None,
+        approval_request_id: Optional[str] = None,
+    ) -> None:
+        try:
+            with open(audit_path, "r", encoding="utf-8") as handle:
+                record = CapabilityAuditRecord.from_dict(json.load(handle))
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return
+        request = CapabilityRequest.from_dict(record.request)
+        metadata = CapabilityMetadata.from_dict(record.metadata)
+        self._append_policy_audit_index(
+            actor_id=request.actor_id,
+            audit_id=self._policy_audit_id(audit_path),
+            audit_path=audit_path,
+            request=request,
+            metadata=metadata,
+            decision=record.decision,
+            execution_status=execution_status,
+            error=error or record.error,
+            approval_request_id=approval_request_id,
+        )
+
+    def _policy_audit_id(self, audit_path: Path) -> str:
+        digest = hashlib.sha256(str(audit_path).encode("utf-8")).hexdigest()[:16]
+        return f"wf_cap_audit_{digest}"
+
     def _evaluate_task_policy(
         self,
         wf: Workflow,
@@ -1860,6 +1952,7 @@ class Scheduler:
             request,
             metadata,
             config_schema=capability.get("config_schema", {}),
+            approved_request=self._approval_store.active_approval_for_request(request, metadata),
         ).to_dict()
         audit_path = self._policy_audit_path(wf, task, attempt_id)
         self._write_policy_audit(
@@ -1944,6 +2037,16 @@ class Scheduler:
             metadata=metadata,
             decision=decision,
             execution_result=blocked_result,
+        )
+        self._append_policy_audit_index(
+            actor_id=request.actor_id,
+            audit_id=self._policy_audit_id(audit_path),
+            audit_path=audit_path,
+            request=request,
+            metadata=metadata,
+            decision=decision,
+            execution_status=decision["status"],
+            approval_request_id=approval_request_id,
         )
         result_path = str(self._store.write_attempt_result(
             wf.workflow_id,
@@ -2910,6 +3013,27 @@ class Scheduler:
                 "metrics": dict(tool_result.metrics),
             },
             error=dataflow_error or tool_result.error,
+        )
+        approval_request_id = decision.get("metadata", {}).get("approval_request_id")
+        if (
+            target_status is TaskStatus.SUCCEEDED
+            and isinstance(approval_request_id, str)
+            and approval_request_id
+        ):
+            self._approval_store.mark_used(
+                approval_request_id,
+                audit_id=audit_path.stem,
+            )
+        self._append_policy_audit_index(
+            actor_id=request.actor_id,
+            audit_id=self._policy_audit_id(audit_path),
+            audit_path=audit_path,
+            request=request,
+            metadata=metadata,
+            decision=decision,
+            execution_status=target_status.value,
+            error=dataflow_error or tool_result.error,
+            approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
         )
         message = dataflow_error or tool_result.error or tool_result.summary or ""
         event_metadata = {

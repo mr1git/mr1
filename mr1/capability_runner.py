@@ -20,6 +20,7 @@ from mr1.capability_policy import (
     PolicyEngine,
     build_approval_request,
     build_scope_context,
+    capability_audit_index_entry,
 )
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
@@ -109,6 +110,7 @@ class CapabilityRunner:
             request,
             metadata,
             config_schema=meta.get("config_schema", {}),
+            approved_request=self._approval_store.active_approval_for_request(request, metadata),
         )
         audit_id = self._new_audit_id(caller_agent_id)
         audit_path = self._agents.capability_audit_path(caller_agent_id, audit_id)
@@ -136,6 +138,16 @@ class CapabilityRunner:
                 output["approval_request_id"] = approval_request_id
             record.execution_result = dict(output)
             self._audit_writer.write(audit_path, record)
+            self._append_audit_index(
+                actor_id=caller_agent_id,
+                audit_id=audit_id,
+                audit_path=audit_path,
+                request=request,
+                metadata=metadata,
+                decision=decision.to_dict(),
+                execution_status=decision.status,
+                approval_request_id=approval_request_id,
+            )
             return CapabilityResult(
                 status=decision.status,
                 output=output,
@@ -166,6 +178,23 @@ class CapabilityRunner:
         record.execution_result = dict(output)
         record.error = error
         self._audit_writer.write(audit_path, record)
+        approval_request_id = decision.metadata.get("approval_request_id")
+        if status == "succeeded" and isinstance(approval_request_id, str) and approval_request_id:
+            self._approval_store.mark_used(
+                approval_request_id,
+                audit_id=audit_id,
+            )
+        self._append_audit_index(
+            actor_id=caller_agent_id,
+            audit_id=audit_id,
+            audit_path=audit_path,
+            request=request,
+            metadata=metadata,
+            decision=decision.to_dict(),
+            execution_status=status,
+            error=error,
+            approval_request_id=approval_request_id,
+        )
         return CapabilityResult(
             status=status,
             output=output,
@@ -199,6 +228,33 @@ class CapabilityRunner:
             path = self._agents.capability_audit_path(caller_agent_id, candidate)
             suffix += 1
         return candidate
+
+    def _append_audit_index(
+        self,
+        *,
+        actor_id: str,
+        audit_id: str,
+        audit_path: Path,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+        decision: dict[str, Any],
+        execution_status: str,
+        error: Optional[str] = None,
+        approval_request_id: Optional[str] = None,
+    ) -> None:
+        self._agents.append_capability_call_log(
+            actor_id,
+            capability_audit_index_entry(
+                audit_id=audit_id,
+                audit_path=audit_path,
+                request=request,
+                metadata=metadata,
+                decision=decision,
+                execution_status=execution_status,
+                error=error,
+                approval_request_id=approval_request_id,
+            ),
+        )
 
     def _dispatch(
         self,

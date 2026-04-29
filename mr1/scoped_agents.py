@@ -66,7 +66,13 @@ class PersistentAgent:
     parent_request: Optional[str] = None
     last_run: Optional[dict[str, Any]] = None
     step_context: dict[str, Any] = field(default_factory=dict)
+    security_clearance: float = 1.0
     scope_roots: list[str] = field(default_factory=list)
+    scope_grants: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= float(self.security_clearance) <= 1.0:
+            raise ValueError("security_clearance must be between 0.0 and 1.0")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,14 +93,20 @@ class PersistentAgent:
             "parent_request": self.parent_request,
             "last_run": dict(self.last_run) if self.last_run is not None else None,
             "step_context": dict(self.step_context),
+            "security_clearance": float(self.security_clearance),
             "scope_roots": list(self.scope_roots),
+            "scope_grants": [dict(item) for item in self.scope_grants],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PersistentAgent":
+        agent_type = data["agent_type"]
+        security_clearance = data.get("security_clearance")
+        if security_clearance is None and agent_type in {"mr1", "mrn"}:
+            security_clearance = 1.0
         return cls(
             agent_id=data["agent_id"],
-            agent_type=data["agent_type"],
+            agent_type=agent_type,
             title=data["title"],
             tree_level=int(data["tree_level"]),
             parent_agent_id=data.get("parent_agent_id"),
@@ -112,7 +124,41 @@ class PersistentAgent:
             last_run=dict(data["last_run"])
             if isinstance(data.get("last_run"), dict) else None,
             step_context=dict(data.get("step_context") or {}),
+            security_clearance=float(security_clearance or 0.0),
             scope_roots=list(data.get("scope_roots", [])),
+            scope_grants=[
+                dict(item)
+                for item in list(data.get("scope_grants", []))
+                if isinstance(item, dict)
+            ],
+        )
+
+
+@dataclass(frozen=True)
+class ScopeGrant:
+    agent_id: str
+    path: str
+    granted_by: str
+    reason: str
+    timestamp: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "agent_id": self.agent_id,
+            "path": self.path,
+            "granted_by": self.granted_by,
+            "reason": self.reason,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ScopeGrant":
+        return cls(
+            agent_id=str(data["agent_id"]),
+            path=str(data["path"]),
+            granted_by=str(data["granted_by"]),
+            reason=str(data["reason"]),
+            timestamp=str(data["timestamp"]),
         )
 
 
@@ -232,6 +278,7 @@ class PersistentAgentStore:
                 title="MR1",
                 tree_level=1,
                 parent_agent_id=None,
+                security_clearance=1.0,
             )
             self.save_agent(agent)
             tmp = pointer.with_suffix(".tmp")
@@ -249,6 +296,20 @@ class PersistentAgentStore:
     def is_terminated(self, agent_id: str) -> bool:
         return self.require_agent(agent_id).status == "terminated"
 
+    def workspace_root(self) -> Path:
+        return self._root.parent
+
+    def normalized_scope_roots(self, agent_id: str) -> list[str]:
+        from mr1.capability_policy import normalize_path
+
+        agent = self.require_agent(agent_id)
+        return sorted(
+            {
+                str(normalize_path(item))
+                for item in list(agent.scope_roots or [])
+            }
+        )
+
     def descendant_ids(self, agent_id: str) -> set[str]:
         all_agents = {agent.agent_id: agent for agent in self.list_agents()}
         descendants: set[str] = set()
@@ -263,6 +324,36 @@ class PersistentAgentStore:
                 descendants.add(candidate.agent_id)
                 frontier.append(candidate.agent_id)
         return descendants
+
+    def ancestor_ids(self, agent_id: str, *, include_self: bool = False) -> list[str]:
+        lineage: list[str] = []
+        current_id = agent_id if include_self else self.require_agent(agent_id).parent_agent_id
+        while current_id:
+            lineage.append(current_id)
+            current = self.require_agent(current_id)
+            current_id = current.parent_agent_id
+        return lineage
+
+    def is_ancestor(self, maybe_ancestor_id: str, agent_id: str, *, include_self: bool = False) -> bool:
+        if include_self and maybe_ancestor_id == agent_id:
+            return True
+        return maybe_ancestor_id in self.ancestor_ids(agent_id)
+
+    def can_agent_access_path(self, agent_id: str, path: str | Path) -> bool:
+        from mr1.capability_policy import ScopeContext, normalize_path
+
+        normalized = normalize_path(path)
+        if self.is_root_agent(agent_id):
+            scope = ScopeContext(
+                allowed_roots=[self.workspace_root()],
+                workspace_root=self.workspace_root(),
+            )
+            return scope.contains(normalized)
+        scope = ScopeContext(
+            allowed_roots=[Path(item) for item in self.normalized_scope_roots(agent_id)],
+            workspace_root=self.workspace_root(),
+        )
+        return scope.contains(normalized)
 
     def is_visible(self, caller_agent_id: str, target_agent_id: str) -> bool:
         if self.is_root_agent(caller_agent_id):
@@ -287,19 +378,31 @@ class PersistentAgentStore:
             return self.load_agent(target_agent_id) is not None
         return target_agent_id == caller_agent_id or target_agent_id in self.descendant_ids(caller_agent_id)
 
-    def create_child_agent(self, caller_agent_id: str, title: str) -> PersistentAgent:
+    def create_child_agent(
+        self,
+        caller_agent_id: str,
+        title: str,
+        *,
+        security_clearance: Optional[float] = None,
+    ) -> PersistentAgent:
         title = title.strip()
         if not title:
             raise ValueError("agent title must be non-empty")
         parent = self.require_agent(caller_agent_id)
         if parent.status == "terminated":
             raise ValueError(f"agent is terminated: {caller_agent_id}")
+        child_clearance = parent.security_clearance if security_clearance is None else float(security_clearance)
+        if not 0.0 <= child_clearance <= 1.0:
+            raise ValueError("security_clearance must be between 0.0 and 1.0")
+        if child_clearance > parent.security_clearance:
+            raise ValueError("child security_clearance cannot exceed parent.security_clearance")
         agent = PersistentAgent(
             agent_id=new_agent_id(),
             agent_type="mrn",
             title=title,
             tree_level=parent.tree_level + 1,
             parent_agent_id=parent.agent_id,
+            security_clearance=child_clearance,
         )
         self.save_agent(agent)
         return agent
@@ -318,6 +421,81 @@ class PersistentAgentStore:
         if workflow_id not in agent.owned_workflow_ids:
             agent.owned_workflow_ids.append(workflow_id)
             self.save_agent(agent)
+
+    def list_scope_grants(self, agent_id: str) -> list[ScopeGrant]:
+        agent = self.require_agent(agent_id)
+        grants: list[ScopeGrant] = []
+        for item in list(agent.scope_grants or []):
+            try:
+                grants.append(ScopeGrant.from_dict(item))
+            except (KeyError, TypeError, ValueError):
+                continue
+        grants.sort(key=lambda item: (item.path, item.timestamp, item.granted_by))
+        return grants
+
+    def grant_scope(
+        self,
+        granting_agent_id: str,
+        target_agent_id: str,
+        path: str | Path,
+        *,
+        reason: str,
+    ) -> ScopeGrant:
+        from mr1.capability_policy import normalize_path
+
+        granter = self.require_agent(granting_agent_id)
+        if granter.security_clearance < 1.0:
+            raise AgentScopeError("access denied: insufficient security clearance for scope grant")
+        normalized_path = str(normalize_path(path))
+        if not self.can_agent_access_path(granting_agent_id, normalized_path):
+            raise AgentScopeError("access denied: granting agent lacks access to requested scope")
+        if (
+            granting_agent_id == target_agent_id
+            and not self.can_agent_access_path(target_agent_id, normalized_path)
+        ):
+            raise AgentScopeError("access denied: agent cannot self-grant outside current scope")
+        target = self.require_agent(target_agent_id)
+        target.scope_roots = sorted(set(list(target.scope_roots) + [normalized_path]))
+        grants_by_path = {item.path: item for item in self.list_scope_grants(target_agent_id)}
+        grants_by_path[normalized_path] = ScopeGrant(
+            agent_id=target_agent_id,
+            path=normalized_path,
+            granted_by=granting_agent_id,
+            reason=reason.strip() or "scope grant",
+            timestamp=_now_iso(),
+        )
+        target.scope_grants = [
+            item.to_dict()
+            for item in sorted(grants_by_path.values(), key=lambda item: item.path)
+        ]
+        self.save_agent(target)
+        return grants_by_path[normalized_path]
+
+    def revoke_scope(
+        self,
+        granting_agent_id: str,
+        target_agent_id: str,
+        path: str | Path,
+    ) -> str:
+        from mr1.capability_policy import normalize_path
+
+        granter = self.require_agent(granting_agent_id)
+        if granter.security_clearance < 1.0:
+            raise AgentScopeError("access denied: insufficient security clearance for scope revoke")
+        normalized_path = str(normalize_path(path))
+        target = self.require_agent(target_agent_id)
+        target.scope_roots = [
+            item
+            for item in list(target.scope_roots or [])
+            if str(normalize_path(item)) != normalized_path
+        ]
+        target.scope_grants = [
+            item.to_dict()
+            for item in self.list_scope_grants(target_agent_id)
+            if item.path != normalized_path
+        ]
+        self.save_agent(target)
+        return normalized_path
 
     def assign_mission(
         self,

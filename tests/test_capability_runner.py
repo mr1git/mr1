@@ -239,6 +239,9 @@ class TestAuditLog:
         assert audit["decision"]["policy_id"] == "capability-policy-v1"
         assert audit["decision"]["policy_version"] == 1
         assert audit["execution_result"]["text"] == "hi"
+        index_entries = agent_store.capability_call_log_path(root_agent_id).read_text(encoding="utf-8").splitlines()
+        assert len(index_entries) == 1
+        assert json.loads(index_entries[0])["audit_path"] == result.audit_record_path
 
     def test_audit_record_written_for_denied(self, agent_store, root_agent_id):
         runner = CapabilityRunner(scoped_agent_store=agent_store)
@@ -248,6 +251,8 @@ class TestAuditLog:
         audit = _load_audit(result.audit_record_path)
         assert audit["decision"]["status"] == "denied"
         assert audit["execution_result"]["status"] == "denied"
+        index_entries = agent_store.capability_call_log_path(root_agent_id).read_text(encoding="utf-8").splitlines()
+        assert json.loads(index_entries[0])["status"] == "denied"
 
 
 class TestCallerTypeResolution:

@@ -17,11 +17,12 @@ from unittest.mock import patch
 import pytest
 
 from mr1 import workflow_cli
+from mr1.capability_runner import CapabilityRunner
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.kazi_runner import MockRunner, RunStatus
 from mr1.mrn_loop import MRnStepResult
 from mr1.mrn_run import MRnRunResult
-from mr1.scheduler import Scheduler
+from mr1.scheduler import Scheduler, submit_spec_to_disk
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
@@ -492,3 +493,119 @@ class TestSubmitDoesNotStartScheduler:
         # threads should have been created by submit.
         new = after - before
         assert new == set(), f"submit started unexpected threads: {new}"
+
+
+class TestApprovalAndAuditCli:
+    def test_approvals_commands_and_agent_scopes(self, tmp_path, store, capsys):
+        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        root = agent_store.ensure_root_agent()
+        child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.1)
+        target = tmp_path / "secret.txt"
+        target.write_text("secret", encoding="utf-8")
+        runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)
+
+        result = runner.run_capability("read_file", {"path": str(target)}, child.agent_id, step_id="cli-step")
+        approval_id = result.approval_request_id
+
+        rc = workflow_cli.main(
+            ["approvals", "list", "--json"],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+        assert rc == 0
+        approvals_payload = json.loads(capsys.readouterr().out)
+        assert approvals_payload[0]["approval_request_id"] == approval_id
+        assert approvals_payload[0]["status"] == "pending"
+
+        rc = workflow_cli.main(
+            ["approvals", "show", approval_id],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "capability_name:      read_file" in out
+        assert "status:               pending" in out
+
+        rc = workflow_cli.main(
+            ["approvals", "approve", approval_id, "--grant-scope", "--reason", "approved for scope"],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == approval_id
+
+        rc = workflow_cli.main(
+            ["agent-scopes", child.agent_id, "--json"],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+        assert rc == 0
+        scopes_payload = json.loads(capsys.readouterr().out)
+        assert str(target.resolve()) in scopes_payload["scope_roots"]
+        assert scopes_payload["scope_grants"][0]["granted_by"] == root.agent_id
+
+    def test_capability_audit_cli_lists_direct_and_workflow_audits(self, tmp_path, store, capsys):
+        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        root = agent_store.ensure_root_agent()
+        child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.1)
+        runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)
+        scoped_child = agent_store.require_agent(child.agent_id)
+        scoped_child.scope_roots = [str(tmp_path)]
+        agent_store.save_agent(scoped_child)
+
+        direct_file = tmp_path / "direct.txt"
+        direct_file.write_text("direct", encoding="utf-8")
+        direct = runner.run_capability("read_file", {"path": str(direct_file)}, child.agent_id)
+        assert direct.status == "succeeded"
+
+        workflow_dir = tmp_path / "wf_scope"
+        workflow_dir.mkdir()
+        workflow_file = workflow_dir / "wf.txt"
+        workflow_file.write_text("workflow", encoding="utf-8")
+        spec = {
+            "title": "Workflow audit",
+            "tasks": [{
+                "label": "read",
+                "title": "Read",
+                "task_kind": "tool",
+                "tool_type": "read_file",
+                "tool_config": {"path": str(workflow_file)},
+            }],
+        }
+        workflow_id = submit_spec_to_disk(
+            spec,
+            Provenance(type="user", id="cli"),
+            store,
+            owner_agent_id=child.agent_id,
+            scoped_agent_store=agent_store,
+        )
+        scheduler = Scheduler(store, MockRunner(), auto_tick=False, scoped_agent_store=agent_store)
+        try:
+            scheduler.tick()
+        finally:
+            scheduler.shutdown()
+
+        rc = workflow_cli.main(
+            ["capability-audit", "list", "--agent", child.agent_id, "--json"],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert len(payload) == 2
+        audit_ids = {item["audit_id"] for item in payload}
+        assert any(item["workflow_id"] == workflow_id for item in payload)
+        workflow_audit_id = next(item["audit_id"] for item in payload if item["workflow_id"] == workflow_id)
+        assert direct.audit_record_path
+        assert workflow_audit_id in audit_ids
+
+        rc = workflow_cli.main(
+            ["capability-audit", "show", workflow_audit_id],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert f"workflow_id:     {workflow_id}" in out
+        assert "capability_name: read_file" in out

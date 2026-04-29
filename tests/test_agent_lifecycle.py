@@ -47,6 +47,7 @@ class TestRootBootstrap:
         assert root.mode == "manual"
         assert root.run_status == "idle"
         assert root.current_iteration == 0
+        assert root.security_clearance == 1.0
         assert agent_store.root_agent_id_path.exists()
         assert agent_store.agent_path(root.agent_id).exists()
         assert agent_store.memory_path(root.agent_id).exists()
@@ -67,6 +68,7 @@ class TestHierarchy:
 
         assert child.parent_agent_id == root.agent_id
         assert child.tree_level == root.tree_level + 1
+        assert child.security_clearance == root.security_clearance
         assert agent_store.agent_path(child.agent_id).exists()
         assert agent_store.memory_path(child.agent_id).exists()
         assert agent_store.logs_dir(child.agent_id).exists()
@@ -75,6 +77,20 @@ class TestHierarchy:
         reloaded = agent_store.load_agent(child.agent_id)
         assert reloaded is not None
         assert reloaded.to_dict() == child.to_dict()
+
+    def test_child_clearance_cannot_exceed_parent(self, agent_store):
+        root = agent_store.ensure_root_agent()
+        parent = agent_store.create_child_agent(root.agent_id, "parent", security_clearance=0.6)
+
+        with pytest.raises(ValueError, match="security_clearance must be between 0.0 and 1.0"):
+            agent_store.create_child_agent(root.agent_id, "research", security_clearance=1.1)
+
+        with pytest.raises(ValueError, match="child security_clearance cannot exceed parent.security_clearance"):
+            agent_store.create_child_agent(parent.agent_id, "research", security_clearance=0.7)
+
+        child = agent_store.create_child_agent(parent.agent_id, "research", security_clearance=0.5)
+
+        assert child.security_clearance == 0.5
 
     def test_visibility_is_self_and_descendants_only(self, agent_store):
         root = agent_store.ensure_root_agent()

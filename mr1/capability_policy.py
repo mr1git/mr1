@@ -24,6 +24,9 @@ _ALLOWED_FINAL_EFFECTS = frozenset({"executed", "blocked", "skipped"})
 _ALLOWED_INVOCATION_MODES = frozenset({"direct", "workflow"})
 _ALLOWED_ACTOR_TYPES = frozenset({"mr1", "mrn", "kazi", "workflow"})
 _ALLOWED_KINDS = frozenset({"tool", "watcher", "agent"})
+_ALLOWED_APPROVAL_STATUSES = frozenset({"pending", "approved", "denied", "expired", "superseded"})
+_ALLOWED_APPROVAL_DECISIONS = frozenset({"approved", "denied"})
+_ALLOWED_APPROVAL_SCOPES = frozenset({"single_use", "grant_scope"})
 _ALLOWED_ACTOR_THRESHOLDS = {
     "mr1": {"direct": 0.50, "workflow": 1.00},
     "mrn": {"direct": 0.20, "workflow": 1.00},
@@ -267,7 +270,19 @@ class CapabilityApprovalRequest:
     original_step_id: Optional[str] = None
     workflow_id: Optional[str] = None
     task_id: Optional[str] = None
+    status: str = "pending"
+    designated_approver_id: Optional[str] = None
+    message_id: Optional[str] = None
+    decision: Optional[dict[str, Any]] = None
+    decision_history: list[dict[str, Any]] = field(default_factory=list)
+    used_at: Optional[str] = None
+    used_by_audit_id: Optional[str] = None
+    requested_scope_path: Optional[str] = None
     created_at: str = field(default_factory=_now_iso)
+
+    def __post_init__(self) -> None:
+        if self.status not in _ALLOWED_APPROVAL_STATUSES:
+            raise ValueError(f"invalid approval request status '{self.status}'")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -283,6 +298,14 @@ class CapabilityApprovalRequest:
             "original_step_id": self.original_step_id,
             "workflow_id": self.workflow_id,
             "task_id": self.task_id,
+            "status": self.status,
+            "designated_approver_id": self.designated_approver_id,
+            "message_id": self.message_id,
+            "decision": dict(self.decision) if isinstance(self.decision, dict) else None,
+            "decision_history": [dict(item) for item in self.decision_history],
+            "used_at": self.used_at,
+            "used_by_audit_id": self.used_by_audit_id,
+            "requested_scope_path": self.requested_scope_path,
             "created_at": self.created_at,
         }
 
@@ -301,7 +324,56 @@ class CapabilityApprovalRequest:
             original_step_id=data.get("original_step_id"),
             workflow_id=data.get("workflow_id"),
             task_id=data.get("task_id"),
+            status=data.get("status", "pending"),
+            designated_approver_id=data.get("designated_approver_id"),
+            message_id=data.get("message_id"),
+            decision=dict(data["decision"]) if isinstance(data.get("decision"), dict) else None,
+            decision_history=[
+                dict(item)
+                for item in list(data.get("decision_history", []))
+                if isinstance(item, dict)
+            ],
+            used_at=data.get("used_at"),
+            used_by_audit_id=data.get("used_by_audit_id"),
+            requested_scope_path=data.get("requested_scope_path"),
             created_at=data.get("created_at", _now_iso()),
+        )
+
+
+@dataclass(frozen=True)
+class CapabilityApprovalDecision:
+    approval_request_id: str
+    decision: str
+    decided_by: str
+    reason: str
+    timestamp: float
+    approval_scope: str
+
+    def __post_init__(self) -> None:
+        if self.decision not in _ALLOWED_APPROVAL_DECISIONS:
+            raise ValueError(f"invalid approval decision '{self.decision}'")
+        if self.approval_scope not in _ALLOWED_APPROVAL_SCOPES:
+            raise ValueError(f"invalid approval_scope '{self.approval_scope}'")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "approval_request_id": self.approval_request_id,
+            "decision": self.decision,
+            "decided_by": self.decided_by,
+            "reason": self.reason,
+            "timestamp": float(self.timestamp),
+            "approval_scope": self.approval_scope,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CapabilityApprovalDecision":
+        return cls(
+            approval_request_id=data["approval_request_id"],
+            decision=data["decision"],
+            decided_by=data["decided_by"],
+            reason=data["reason"],
+            timestamp=float(data["timestamp"]),
+            approval_scope=data["approval_scope"],
         )
 
 
@@ -586,6 +658,33 @@ class CapabilityApprovalStore:
     def exists(self, approval_request_id: str) -> bool:
         return self.approval_path(approval_request_id).exists()
 
+    def load(self, approval_request_id: str) -> Optional[CapabilityApprovalRequest]:
+        path = self.approval_path(approval_request_id)
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return CapabilityApprovalRequest.from_dict(json.load(handle))
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return None
+
+    def require(self, approval_request_id: str) -> CapabilityApprovalRequest:
+        approval = self.load(approval_request_id)
+        if approval is None:
+            raise ValueError(f"approval request not found: {approval_request_id}")
+        return approval
+
+    def list_requests(self) -> list[CapabilityApprovalRequest]:
+        approvals: list[CapabilityApprovalRequest] = []
+        for path in sorted(self._root.glob("cap_approval_*.json")):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    approvals.append(CapabilityApprovalRequest.from_dict(json.load(handle)))
+            except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                continue
+        approvals.sort(key=lambda item: (item.created_at, item.approval_request_id), reverse=True)
+        return approvals
+
     def save(self, approval: CapabilityApprovalRequest) -> Path:
         path = self.approval_path(approval.approval_request_id)
         tmp = path.with_suffix(".json.tmp")
@@ -593,6 +692,80 @@ class CapabilityApprovalStore:
             json.dump(approval.to_dict(), handle, indent=2, sort_keys=True)
         tmp.replace(path)
         return path
+
+    def active_approval_for_request(
+        self,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+    ) -> Optional[CapabilityApprovalRequest]:
+        approval = self.load(approval_request_id_for(request, metadata))
+        if approval is None or approval.status != "approved" or approval.decision is None:
+            return None
+        decision = CapabilityApprovalDecision.from_dict(dict(approval.decision))
+        if decision.approval_scope != "single_use":
+            return None
+        if approval.used_at:
+            return None
+        return approval
+
+    def mark_used(
+        self,
+        approval_request_id: str,
+        *,
+        audit_id: str,
+        used_at: Optional[str] = None,
+    ) -> CapabilityApprovalRequest:
+        approval = self.require(approval_request_id)
+        if approval.used_at:
+            return approval
+        updated = CapabilityApprovalRequest.from_dict({
+            **approval.to_dict(),
+            "status": "superseded",
+            "used_at": used_at or _now_iso(),
+            "used_by_audit_id": audit_id,
+        })
+        self.save(updated)
+        return updated
+
+    def apply_decision(
+        self,
+        approval_request_id: str,
+        *,
+        decision: CapabilityApprovalDecision,
+        scoped_agent_store: PersistentAgentStore,
+    ) -> CapabilityApprovalRequest:
+        approval = self.require(approval_request_id)
+        if approval.status != "pending":
+            raise ValueError(f"approval request not pending: {approval_request_id}")
+        if approval.designated_approver_id is None:
+            raise ValueError(f"approval request missing designated approver: {approval_request_id}")
+        if not scoped_agent_store.is_ancestor(
+            decision.decided_by,
+            approval.designated_approver_id,
+            include_self=True,
+        ):
+            raise ValueError("approval decision rejected: decider is not designated approver or higher ancestor")
+        decider = scoped_agent_store.require_agent(decision.decided_by)
+        if decider.security_clearance < approval.risk_score:
+            raise ValueError("approval decision rejected: insufficient security clearance")
+        updated_payload = approval.to_dict()
+        updated_payload["decision_history"] = list(approval.decision_history) + [decision.to_dict()]
+        updated_payload["decision"] = decision.to_dict()
+        updated_payload["status"] = "approved" if decision.decision == "approved" else "denied"
+        updated_payload["used_at"] = None
+        updated_payload["used_by_audit_id"] = None
+        updated = CapabilityApprovalRequest.from_dict(updated_payload)
+        if decision.decision == "approved" and decision.approval_scope == "grant_scope":
+            if not approval.requested_scope_path:
+                raise ValueError("approval decision rejected: grant_scope requires a requested_scope_path")
+            scoped_agent_store.grant_scope(
+                decision.decided_by,
+                approval.requesting_actor_id,
+                approval.requested_scope_path,
+                reason=decision.reason,
+            )
+        self.save(updated)
+        return updated
 
 
 class CapabilityAuditWriter:
@@ -616,8 +789,14 @@ class PolicyEngine:
         metadata: CapabilityMetadata,
         *,
         config_schema: Optional[dict[str, Any]] = None,
+        approved_request: Optional[CapabilityApprovalRequest] = None,
     ) -> CapabilityDecision:
         schema = dict(config_schema or {})
+        approved_override = self._approved_override_matches(
+            approved_request,
+            request=request,
+            metadata=metadata,
+        )
         missing_field = self._missing_required_arg(request.args, schema)
         if missing_field is not None:
             return self._decision(
@@ -649,7 +828,7 @@ class PolicyEngine:
                 risk_score=metadata.risk_score,
             )
         max_risk = thresholds[request.invocation_mode]
-        if metadata.risk_score > max_risk:
+        if metadata.risk_score > max_risk and not approved_override:
             return self._decision(
                 allowed=False,
                 status="denied",
@@ -659,13 +838,44 @@ class PolicyEngine:
             )
         scope_decision = self._check_scope(request, metadata)
         if scope_decision is not None:
+            if approved_override and scope_decision.status == "requires_approval":
+                return self._decision(
+                    allowed=True,
+                    status="allowed",
+                    reason="approved_override",
+                    risk_score=metadata.risk_score,
+                    metadata_payload={"approval_request_id": approved_request.approval_request_id},
+                )
             return scope_decision
         return self._decision(
             allowed=True,
             status="allowed",
-            reason="allowed",
+            reason="approved_override" if approved_override else "allowed",
             risk_score=metadata.risk_score,
+            metadata_payload=(
+                {"approval_request_id": approved_request.approval_request_id}
+                if approved_override and approved_request is not None else
+                None
+            ),
         )
+
+    def _approved_override_matches(
+        self,
+        approved_request: Optional[CapabilityApprovalRequest],
+        *,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+    ) -> bool:
+        if approved_request is None or approved_request.status != "approved":
+            return False
+        if approved_request.approval_request_id != approval_request_id_for(request, metadata):
+            return False
+        if approved_request.used_at:
+            return False
+        if approved_request.decision is None:
+            return False
+        decision = CapabilityApprovalDecision.from_dict(dict(approved_request.decision))
+        return decision.approval_scope == "single_use"
 
     def _missing_required_arg(
         self,
@@ -751,6 +961,12 @@ def build_approval_request(
     decision: CapabilityDecision,
 ) -> CapabilityApprovalRequest:
     approval_request_id = approval_request_id_for(request, metadata)
+    requested_scope_path = None
+    for field in metadata.path_arg_fields:
+        value = decision.metadata.get(field)
+        if isinstance(value, str) and value:
+            requested_scope_path = str(normalize_path(value))
+            break
     return CapabilityApprovalRequest(
         approval_request_id=approval_request_id,
         requesting_actor_id=request.actor_id,
@@ -764,7 +980,58 @@ def build_approval_request(
         original_step_id=request.step_id,
         workflow_id=request.workflow_id,
         task_id=request.task_id,
+        requested_scope_path=requested_scope_path,
     )
+
+
+def capability_audit_index_entry(
+    *,
+    audit_id: str,
+    audit_path: Path,
+    request: CapabilityRequest,
+    metadata: CapabilityMetadata,
+    decision: dict[str, Any],
+    execution_status: str,
+    error: Optional[str] = None,
+    approval_request_id: Optional[str] = None,
+) -> dict[str, Any]:
+    return {
+        "audit_id": audit_id,
+        "audit_path": str(audit_path),
+        "actor_id": request.actor_id,
+        "capability_name": request.capability_name,
+        "risk_score": metadata.risk_score,
+        "status": execution_status,
+        "decision_status": decision.get("status"),
+        "args_summary": normalize_args_for_policy(request.args, metadata),
+        "scope_roots": sorted(str(root) for root in request.scope.allowed_roots),
+        "reason": error or decision.get("reason"),
+        "workflow_id": request.workflow_id,
+        "task_id": request.task_id,
+        "step_id": request.step_id,
+        "approval_request_id": approval_request_id,
+    }
+
+
+def find_approver(
+    actor_id: str,
+    risk_score: float,
+    *,
+    scoped_agent_store: PersistentAgentStore,
+) -> str:
+    for ancestor_id in scoped_agent_store.ancestor_ids(actor_id):
+        ancestor = scoped_agent_store.require_agent(ancestor_id)
+        if ancestor.security_clearance >= risk_score:
+            return ancestor.agent_id
+    return scoped_agent_store.root_agent_id
+
+
+def approval_request_matches(
+    approval: CapabilityApprovalRequest,
+    request: CapabilityRequest,
+    metadata: CapabilityMetadata,
+) -> bool:
+    return approval.approval_request_id == approval_request_id_for(request, metadata)
 
 
 def maybe_route_approval_request(
@@ -774,19 +1041,69 @@ def maybe_route_approval_request(
     message_store: MessageStore,
     scoped_agent_store: PersistentAgentStore,
 ) -> tuple[str, bool]:
-    already_exists = approval_store.exists(approval.approval_request_id)
-    approval_store.save(approval)
-    if already_exists:
-        return approval.approval_request_id, False
-    root_agent_id = scoped_agent_store.root_agent_id
+    existing = approval_store.load(approval.approval_request_id)
+    if existing is not None:
+        if existing.status == "pending":
+            return existing.approval_request_id, False
+        if existing.status == "approved" and existing.decision is not None:
+            decision = CapabilityApprovalDecision.from_dict(dict(existing.decision))
+            if decision.approval_scope == "single_use" and existing.used_at is not None:
+                approval = CapabilityApprovalRequest.from_dict({
+                    **existing.to_dict(),
+                    "status": "pending",
+                    "designated_approver_id": find_approver(
+                        approval.requesting_actor_id,
+                        approval.risk_score,
+                        scoped_agent_store=scoped_agent_store,
+                    ),
+                    "message_id": None,
+                    "decision": None,
+                    "used_at": None,
+                    "used_by_audit_id": None,
+                })
+            else:
+                return existing.approval_request_id, False
+        elif existing.status == "denied":
+            return existing.approval_request_id, False
+        elif existing.status in {"superseded", "expired"}:
+            approval = CapabilityApprovalRequest.from_dict({
+                **existing.to_dict(),
+                "status": "pending",
+                "designated_approver_id": find_approver(
+                    approval.requesting_actor_id,
+                    approval.risk_score,
+                    scoped_agent_store=scoped_agent_store,
+                ),
+                "message_id": None,
+                "decision": None,
+                "used_at": None,
+                "used_by_audit_id": None,
+            })
+        else:
+            return existing.approval_request_id, False
+    else:
+        approval = CapabilityApprovalRequest.from_dict({
+            **approval.to_dict(),
+            "status": "pending",
+            "designated_approver_id": find_approver(
+                approval.requesting_actor_id,
+                approval.risk_score,
+                scoped_agent_store=scoped_agent_store,
+            ),
+        })
     body = json.dumps(approval.to_dict(), indent=2, sort_keys=True)
-    message_store.create_message(
+    message = message_store.create_message(
         from_agent_id=approval.requesting_actor_id,
-        to_agent_id=root_agent_id,
+        to_agent_id=approval.designated_approver_id or scoped_agent_store.root_agent_id,
         kind="request",
         subject=f"Capability approval requested: {approval.capability_name}",
         body=body,
         workflow_id=approval.workflow_id,
         task_id=approval.task_id,
     )
+    approval = CapabilityApprovalRequest.from_dict({
+        **approval.to_dict(),
+        "message_id": message.message_id,
+    })
+    approval_store.save(approval)
     return approval.approval_request_id, True

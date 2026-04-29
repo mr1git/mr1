@@ -25,6 +25,7 @@ Sub-commands:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import sys
 from pathlib import Path
@@ -32,6 +33,11 @@ from typing import Any, Optional
 
 from mr1.agents import AgentRegistry, default_agent_registry, run_agent_health
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
+from mr1.capability_policy import (
+    CapabilityApprovalDecision,
+    CapabilityApprovalRequest,
+    CapabilityApprovalStore,
+)
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.inbox_triage import InboxTriagePolicy, InboxTriageResult, InboxTriageRunner
 from mr1.messages import MessageStore, PersistentMessage
@@ -630,6 +636,7 @@ def _format_agent(
         f"type:         {agent.agent_type}",
         f"title:        {agent.title}",
         f"status:       {agent.status}",
+        f"clearance:    {agent.security_clearance:.2f}",
         f"mission:      {_compact_text(agent.mission)}",
         f"mode:         {agent.mode}",
         f"run_status:   {agent.run_status}",
@@ -649,6 +656,7 @@ def _format_agent(
     ]
     if agent.owned_workflow_ids:
         lines.append(f"owned_ids:    {', '.join(agent.owned_workflow_ids)}")
+    lines.append(f"scope_roots:  {', '.join(agent.scope_roots) or '-'}")
     lines.append("reports:")
     for path in reports or []:
         lines.append(f"  {path.name}")
@@ -814,6 +822,151 @@ def _format_message_detail(
         f"archived_at:  {message.archived_at or '-'}",
         "body:",
         message.body,
+    ])
+
+
+def _format_scope_grants(
+    agent: PersistentAgent,
+    *,
+    json_output: bool = False,
+) -> str:
+    grants = list(agent.scope_grants or [])
+    payload = {
+        "agent_id": agent.agent_id,
+        "security_clearance": agent.security_clearance,
+        "scope_roots": list(agent.scope_roots),
+        "scope_grants": grants,
+    }
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    lines = [
+        f"agent_id:            {agent.agent_id}",
+        f"security_clearance:  {agent.security_clearance:.2f}",
+        "scope_roots:",
+    ]
+    for item in agent.scope_roots:
+        lines.append(f"  {item}")
+    if not agent.scope_roots:
+        lines.append("  none")
+    lines.append("scope_grants:")
+    for item in grants:
+        lines.append(
+            "  "
+            + f"path={item.get('path', '-')} "
+            + f"granted_by={item.get('granted_by', '-')} "
+            + f"timestamp={item.get('timestamp', '-')}"
+        )
+    if not grants:
+        lines.append("  none")
+    return "\n".join(lines)
+
+
+def _format_approval(
+    approval: CapabilityApprovalRequest,
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(approval.to_dict(), indent=2, sort_keys=True)
+    lines = [
+        f"approval_request_id:  {approval.approval_request_id}",
+        f"status:               {approval.status}",
+        f"capability_name:      {approval.capability_name}",
+        f"actor_id:             {approval.requesting_actor_id}",
+        f"designated_approver:  {approval.designated_approver_id or '-'}",
+        f"risk_score:           {approval.risk_score:.2f}",
+        f"reason:               {approval.reason}",
+        f"workflow_id:          {approval.workflow_id or '-'}",
+        f"task_id:              {approval.task_id or '-'}",
+        f"step_id:              {approval.original_step_id or '-'}",
+        f"message_id:           {approval.message_id or '-'}",
+        f"requested_scope_path: {approval.requested_scope_path or '-'}",
+        f"used_at:              {approval.used_at or '-'}",
+        f"used_by_audit_id:     {approval.used_by_audit_id or '-'}",
+        "args_summary:",
+        json.dumps(approval.args, indent=2, sort_keys=True),
+        "scope_roots:",
+        json.dumps(approval.scope_summary.get("allowed_roots", []), indent=2, sort_keys=True),
+        "decision:",
+        json.dumps(approval.decision, indent=2, sort_keys=True),
+    ]
+    return "\n".join(lines)
+
+
+def _format_approvals_table(
+    approvals: list[CapabilityApprovalRequest],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps([item.to_dict() for item in approvals], indent=2, sort_keys=True)
+    if not approvals:
+        return "No approval requests."
+    rows = [("APPROVAL_ID", "STATUS", "CAPABILITY", "ACTOR", "APPROVER", "RISK")]
+    for item in approvals:
+        rows.append((
+            item.approval_request_id,
+            item.status,
+            item.capability_name,
+            item.requesting_actor_id,
+            item.designated_approver_id or "-",
+            f"{item.risk_score:.2f}",
+        ))
+    return _render_table(rows)
+
+
+def _format_capability_audit_table(
+    items: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(items, indent=2, sort_keys=True)
+    if not items:
+        return "No capability audits."
+    rows = [("AUDIT_ID", "ACTOR", "CAPABILITY", "STATUS", "RISK", "WORKFLOW", "TASK")]
+    for item in items:
+        rows.append((
+            str(item.get("audit_id", "-")),
+            str(item.get("actor_id", "-")),
+            str(item.get("capability_name", "-")),
+            str(item.get("status", "-")),
+            str(item.get("risk_score", "-")),
+            str(item.get("workflow_id") or "-"),
+            str(item.get("task_id") or "-"),
+        ))
+    return _render_table(rows)
+
+
+def _format_capability_audit_detail(
+    index_entry: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    json_output: bool = False,
+) -> str:
+    payload = {
+        "index": dict(index_entry),
+        "record": dict(record),
+    }
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    return "\n".join([
+        f"audit_id:        {index_entry.get('audit_id')}",
+        f"audit_path:      {index_entry.get('audit_path')}",
+        f"actor_id:        {index_entry.get('actor_id')}",
+        f"capability_name: {index_entry.get('capability_name')}",
+        f"status:          {index_entry.get('status')}",
+        f"risk_score:      {index_entry.get('risk_score')}",
+        f"reason:          {index_entry.get('reason')}",
+        f"workflow_id:     {index_entry.get('workflow_id') or '-'}",
+        f"task_id:         {index_entry.get('task_id') or '-'}",
+        f"step_id:         {index_entry.get('step_id') or '-'}",
+        "args_summary:",
+        json.dumps(index_entry.get("args_summary"), indent=2, sort_keys=True),
+        "scope_roots:",
+        json.dumps(index_entry.get("scope_roots"), indent=2, sort_keys=True),
+        "record:",
+        json.dumps(record, indent=2, sort_keys=True),
     ])
 
 
@@ -1031,6 +1184,90 @@ def _load_text_file(path_str: str) -> tuple[Optional[str], Optional[str]]:
     if not payload.strip():
         return None, "request file must not be empty"
     return payload, None
+
+
+def _approval_store_for(store: WorkflowStore) -> CapabilityApprovalStore:
+    return CapabilityApprovalStore(store.root.parent / "capability_approvals")
+
+
+def _visible_approvals(
+    approval_store: CapabilityApprovalStore,
+    scoped_agents: PersistentAgentStore,
+    caller_agent_id: str,
+) -> list[CapabilityApprovalRequest]:
+    visible_ids = {agent.agent_id for agent in scoped_agents.list_visible_agents(caller_agent_id)}
+    if scoped_agents.is_root_agent(caller_agent_id):
+        visible_ids = {agent.agent_id for agent in scoped_agents.list_agents()}
+    approvals = []
+    for approval in approval_store.list_requests():
+        if (
+            approval.requesting_actor_id in visible_ids
+            or (approval.designated_approver_id or "") in visible_ids
+        ):
+            approvals.append(approval)
+    return approvals
+
+
+def _require_visible_approval(
+    approval_store: CapabilityApprovalStore,
+    approval_request_id: str,
+    scoped_agents: PersistentAgentStore,
+    caller_agent_id: str,
+) -> CapabilityApprovalRequest:
+    approval = approval_store.require(approval_request_id)
+    visible = {
+        item.approval_request_id
+        for item in _visible_approvals(approval_store, scoped_agents, caller_agent_id)
+    }
+    if approval.approval_request_id not in visible:
+        raise AgentScopeError("access denied: approval not in agent scope")
+    return approval
+
+
+def _audit_entries_for_agent(agent_store: PersistentAgentStore, agent_id: str) -> list[dict[str, Any]]:
+    path = agent_store.capability_call_log_path(agent_id)
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            entries.append(payload)
+    return entries
+
+
+def _visible_audit_entries(
+    scoped_agents: PersistentAgentStore,
+    caller_agent_id: str,
+    target_agent_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    agent_ids: list[str]
+    if target_agent_id is not None:
+        scoped_agents.get_visible_agent(caller_agent_id, target_agent_id)
+        agent_ids = [target_agent_id]
+    else:
+        agent_ids = [agent.agent_id for agent in scoped_agents.list_visible_agents(caller_agent_id)]
+    entries: list[dict[str, Any]] = []
+    for agent_id in agent_ids:
+        entries.extend(_audit_entries_for_agent(scoped_agents, agent_id))
+    entries.sort(key=lambda item: (str(item.get("audit_id")), str(item.get("audit_path"))), reverse=True)
+    return entries
+
+
+def _find_visible_audit_entry(
+    scoped_agents: PersistentAgentStore,
+    caller_agent_id: str,
+    audit_id: str,
+) -> dict[str, Any]:
+    for item in _visible_audit_entries(scoped_agents, caller_agent_id):
+        if item.get("audit_id") == audit_id:
+            return item
+    raise ValueError(f"capability audit not found: {audit_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1933,159 @@ def _cmd_agent_run(
     return 0
 
 
+def _cmd_agent_grant_scope(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    try:
+        scoped_agents.get_visible_agent(caller_agent_id, args.agent_id)
+        grant = scoped_agents.grant_scope(
+            caller_agent_id,
+            args.agent_id,
+            args.path,
+            reason=args.reason,
+        )
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(grant.path)
+    return 0
+
+
+def _cmd_agent_revoke_scope(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    try:
+        scoped_agents.get_visible_agent(caller_agent_id, args.agent_id)
+        path = scoped_agents.revoke_scope(caller_agent_id, args.agent_id, args.path)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(path)
+    return 0
+
+
+def _cmd_agent_scopes(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    try:
+        agent = scoped_agents.get_visible_agent(caller_agent_id, args.agent_id)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_scope_grants(agent, json_output=args.json))
+    return 0
+
+
+def _cmd_approvals_list(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    approvals = _visible_approvals(_approval_store_for(store), scoped_agents, caller_agent_id)
+    print(_format_approvals_table(approvals, json_output=args.json))
+    return 0
+
+
+def _cmd_approvals_show(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    try:
+        approval = _require_visible_approval(
+            _approval_store_for(store),
+            args.approval_request_id,
+            scoped_agents,
+            caller_agent_id,
+        )
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_approval(approval, json_output=args.json))
+    return 0
+
+
+def _cmd_approvals_decide(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    approval_store = _approval_store_for(store)
+    try:
+        _require_visible_approval(
+            approval_store,
+            args.approval_request_id,
+            scoped_agents,
+            caller_agent_id,
+        )
+        decision = CapabilityApprovalDecision(
+            approval_request_id=args.approval_request_id,
+            decision=args.decision,
+            decided_by=caller_agent_id,
+            reason=args.reason,
+            timestamp=datetime.now(timezone.utc).timestamp(),
+            approval_scope="grant_scope" if getattr(args, "grant_scope", False) else "single_use",
+        )
+        approval = approval_store.apply_decision(
+            args.approval_request_id,
+            decision=decision,
+            scoped_agent_store=scoped_agents,
+        )
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(approval.approval_request_id)
+    return 0
+
+
+def _cmd_capability_audit_list(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    try:
+        entries = _visible_audit_entries(scoped_agents, caller_agent_id, args.agent_id)
+    except (ValueError, AgentScopeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_capability_audit_table(entries, json_output=args.json))
+    return 0
+
+
+def _cmd_capability_audit_show(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store
+    try:
+        index_entry = _find_visible_audit_entry(scoped_agents, caller_agent_id, args.audit_id)
+        record = json.loads(Path(index_entry["audit_path"]).read_text(encoding="utf-8"))
+    except (ValueError, AgentScopeError, OSError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_capability_audit_detail(index_entry, record, json_output=args.json))
+    return 0
+
+
 def _cmd_inbox(
     args: argparse.Namespace,
     store: WorkflowStore,
@@ -2080,6 +2470,58 @@ def _build_parser() -> argparse.ArgumentParser:
     p_agent_run.add_argument("--no-confirm-workflows", action="store_true")
     p_agent_run.add_argument("--max-runtime-s", type=int, default=None)
     p_agent_run.set_defaults(func=_cmd_agent_run)
+
+    p_agent_grant_scope = subs.add_parser("agent-grant-scope", help="Grant one normalized scope root to an agent.")
+    p_agent_grant_scope.add_argument("agent_id")
+    p_agent_grant_scope.add_argument("path")
+    p_agent_grant_scope.add_argument("--reason", default="scope grant")
+    p_agent_grant_scope.set_defaults(func=_cmd_agent_grant_scope)
+
+    p_agent_revoke_scope = subs.add_parser("agent-revoke-scope", help="Revoke one normalized scope root from an agent.")
+    p_agent_revoke_scope.add_argument("agent_id")
+    p_agent_revoke_scope.add_argument("path")
+    p_agent_revoke_scope.set_defaults(func=_cmd_agent_revoke_scope)
+
+    p_agent_scopes = subs.add_parser("agent-scopes", help="Show effective scope roots and grant provenance for an agent.")
+    p_agent_scopes.add_argument("agent_id")
+    add_common_flags(p_agent_scopes, include_example=False)
+    p_agent_scopes.set_defaults(func=_cmd_agent_scopes)
+
+    p_approvals = subs.add_parser("approvals", help="List capability approval requests.")
+    approvals_subs = p_approvals.add_subparsers(dest="approvals_command", required=True)
+
+    p_approvals_list = approvals_subs.add_parser("list", help="List visible approval requests.")
+    add_common_flags(p_approvals_list, include_example=False)
+    p_approvals_list.set_defaults(func=_cmd_approvals_list)
+
+    p_approvals_show = approvals_subs.add_parser("show", help="Show one approval request.")
+    p_approvals_show.add_argument("approval_request_id")
+    add_common_flags(p_approvals_show, include_example=False)
+    p_approvals_show.set_defaults(func=_cmd_approvals_show)
+
+    p_approvals_approve = approvals_subs.add_parser("approve", help="Approve one pending approval request.")
+    p_approvals_approve.add_argument("approval_request_id")
+    p_approvals_approve.add_argument("--grant-scope", action="store_true")
+    p_approvals_approve.add_argument("--reason", default="approved")
+    p_approvals_approve.set_defaults(func=_cmd_approvals_decide, decision="approved")
+
+    p_approvals_deny = approvals_subs.add_parser("deny", help="Deny one pending approval request.")
+    p_approvals_deny.add_argument("approval_request_id")
+    p_approvals_deny.add_argument("--reason", default="denied")
+    p_approvals_deny.set_defaults(func=_cmd_approvals_decide, decision="denied", grant_scope=False)
+
+    p_capability_audit = subs.add_parser("capability-audit", help="Inspect indexed capability audit records.")
+    capability_audit_subs = p_capability_audit.add_subparsers(dest="capability_audit_command", required=True)
+
+    p_capability_audit_list = capability_audit_subs.add_parser("list", help="List visible capability audits.")
+    p_capability_audit_list.add_argument("--agent", dest="agent_id", default=None)
+    add_common_flags(p_capability_audit_list, include_example=False)
+    p_capability_audit_list.set_defaults(func=_cmd_capability_audit_list)
+
+    p_capability_audit_show = capability_audit_subs.add_parser("show", help="Show one capability audit record.")
+    p_capability_audit_show.add_argument("audit_id")
+    add_common_flags(p_capability_audit_show, include_example=False)
+    p_capability_audit_show.set_defaults(func=_cmd_capability_audit_show)
 
     p_inbox = subs.add_parser("inbox", help="List inbox messages for an agent.")
     p_inbox.add_argument("--agent", default=None)
