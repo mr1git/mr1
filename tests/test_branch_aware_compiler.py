@@ -45,7 +45,7 @@ def _single_branch_spec() -> dict:
                 "title": "Check",
                 "task_kind": "tool",
                 "tool_type": "shell_command",
-                "tool_config": {"argv": ["python3", "--version"]},
+                "tool_config": {"argv": ["python3", "--version"], "cwd": "."},
             },
             {
                 "label": "success_path",
@@ -81,7 +81,7 @@ def _join_spec() -> dict:
                 "title": "Check",
                 "task_kind": "tool",
                 "tool_type": "shell_command",
-                "tool_config": {"argv": ["python3", "--version"]},
+                "tool_config": {"argv": ["python3", "--version"], "cwd": "."},
             },
             {
                 "label": "success_path",
@@ -139,7 +139,7 @@ def _collision_spec() -> dict:
                 "title": "Source",
                 "task_kind": "tool",
                 "tool_type": "shell_command",
-                "tool_config": {"argv": ["python3", "--version"]},
+                "tool_config": {"argv": ["python3", "--version"], "cwd": "."},
             },
             {
                 "label": "check-contains-one",
@@ -189,7 +189,7 @@ def _plain_spec() -> dict:
                 "title": "Read notes",
                 "task_kind": "tool",
                 "tool_type": "shell_command",
-                "tool_config": {"argv": ["python3", "--version"]},
+                "tool_config": {"argv": ["python3", "--version"], "cwd": "."},
             },
             {
                 "label": "summarize",

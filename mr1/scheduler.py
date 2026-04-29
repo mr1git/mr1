@@ -26,6 +26,7 @@ Every state change follows the same atomic shape:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import json
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mr1.agents import AgentRegistry, default_agent_registry
+from mr1.capabilities import CapabilityRegistry, default_capability_registry
+from mr1.capability_policy import (
+    CapabilityApprovalStore,
+    CapabilityAuditRecord,
+    CapabilityAuditWriter,
+    CapabilityMetadata,
+    CapabilityRequest,
+    PolicyEngine,
+    build_approval_request,
+    build_scope_context,
+    maybe_route_approval_request,
+)
 from mr1.conditions import (
     ConditionEvaluation,
     SUPPORTED_DEPENDENCY_POLICIES,
@@ -1220,12 +1233,14 @@ class Scheduler:
         event_log: Optional[WorkflowEventLog] = None,
         watcher_registry: Optional[WatcherRegistry] = None,
         tool_registry: Optional[ToolRegistry] = None,
+        capability_registry: Optional[CapabilityRegistry] = None,
         concurrency: int = 4,
         auto_tick: bool = True,
         tick_interval_s: float = 1.0,
         agent_id: str = "scheduler",
         scoped_agent_store: Optional[PersistentAgentStore] = None,
         message_store: Optional[MessageStore] = None,
+        workspace_root: Optional[Path] = None,
     ):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
@@ -1234,6 +1249,7 @@ class Scheduler:
         self._events = event_log or WorkflowEventLog(store, default_agent_id=agent_id)
         self._watchers = watcher_registry or default_watcher_registry()
         self._tools = tool_registry or default_tool_registry()
+        self._capabilities = capability_registry or default_capability_registry()
         self._scoped_agents = scoped_agent_store or PersistentAgentStore(
             root=self._store.root.parent / "agents"
         )
@@ -1241,9 +1257,15 @@ class Scheduler:
             root=self._store.root.parent / "messages",
             scoped_agent_store=self._scoped_agents,
         )
+        self._workspace_root = Path(workspace_root) if workspace_root else self._store.root.parent
         self._concurrency = concurrency
         self._tick_interval_s = tick_interval_s
         self._agent_id = agent_id
+        self._policy_engine = PolicyEngine()
+        self._approval_store = CapabilityApprovalStore(
+            self._store.root.parent / "capability_approvals"
+        )
+        self._audit_writer = CapabilityAuditWriter()
 
         self._handles: dict[str, RunHandle] = {}
         self._stop = threading.Event()
@@ -1542,6 +1564,7 @@ class Scheduler:
         return changed
 
     def _poll_running_watcher(self, wf: Workflow, task: Task) -> bool:
+        audit_path = self._current_attempt_policy_audit_path(task)
         timeout_message = self._watcher_timeout_message(task)
         if timeout_message is not None:
             checked_at = _now_iso()
@@ -1556,6 +1579,12 @@ class Scheduler:
                 task.current_attempt,
                 payload,
             ))
+            if audit_path is not None:
+                self._finalize_policy_audit(
+                    audit_path,
+                    execution_result=dict(payload),
+                    error=timeout_message,
+                )
             self._finish_attempt(
                 wf,
                 task,
@@ -1617,6 +1646,11 @@ class Scheduler:
                 task.current_attempt,
                 check_payload,
             ))
+            if audit_path is not None:
+                self._finalize_policy_audit(
+                    audit_path,
+                    execution_result=dict(check_payload),
+                )
             self._finish_attempt(
                 wf,
                 task,
@@ -1647,6 +1681,12 @@ class Scheduler:
                 task.current_attempt,
                 check_payload,
             ))
+            if audit_path is not None:
+                self._finalize_policy_audit(
+                    audit_path,
+                    execution_result=dict(check_payload),
+                    error=evaluation.message,
+                )
             self._finish_attempt(
                 wf,
                 task,
@@ -1672,6 +1712,12 @@ class Scheduler:
             task.current_attempt,
             check_payload,
         ))
+        if audit_path is not None:
+            self._finalize_policy_audit(
+                audit_path,
+                execution_result=dict(check_payload),
+                error=evaluation.message,
+            )
         self._finish_attempt(
             wf,
             task,
@@ -1712,6 +1758,231 @@ class Scheduler:
         if elapsed_s < max_wait_s:
             return None
         return f"watcher exceeded max_wait_s={int(max_wait_s)}"
+
+    def _workflow_actor_type(self, wf: Workflow) -> str:
+        owner = self._scoped_agents.load_agent(wf.owner_agent_id or "")
+        if owner is None:
+            return "mr1"
+        return "mr1" if owner.agent_type == "mr1" else "mrn"
+
+    def _capability_name_for_task(self, task: Task) -> str:
+        if task.task_kind == "tool":
+            return task.tool_type or ""
+        if task.task_kind == "watcher":
+            return task.watcher_type or ""
+        raise ValueError(f"task is not a policy-managed capability: {task.task_id}")
+
+    def _capability_args_for_task(self, task: Task) -> dict[str, Any]:
+        if task.task_kind == "tool":
+            return dict(task.tool_config)
+        if task.task_kind == "watcher":
+            return dict(task.watch_config)
+        raise ValueError(f"task is not a policy-managed capability: {task.task_id}")
+
+    def _current_attempt_policy_audit_path(self, task: Task) -> Optional[Path]:
+        if task.current_attempt <= 0 or task.current_attempt > len(task.attempts):
+            return None
+        attempt = task.attempts[task.current_attempt - 1]
+        return Path(attempt.policy_audit_path) if attempt.policy_audit_path else None
+
+    def _policy_audit_path(self, wf: Workflow, task: Task, attempt_id: int) -> Path:
+        return self._store.task_attempt_dir(
+            wf.workflow_id,
+            task.task_id,
+            attempt_id,
+        ) / "capability_audit.json"
+
+    def _write_policy_audit(
+        self,
+        audit_path: Path,
+        *,
+        capability_name: str,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+        decision: dict[str, Any],
+        execution_result: Optional[dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Path:
+        record = CapabilityAuditRecord(
+            capability_name=capability_name,
+            request=request.to_dict(),
+            metadata=metadata.to_dict(),
+            decision=dict(decision),
+            execution_result=execution_result,
+            error=error,
+            timestamp=_now_iso(),
+        )
+        return self._audit_writer.write(audit_path, record)
+
+    def _finalize_policy_audit(
+        self,
+        audit_path: Path,
+        *,
+        execution_result: dict[str, Any],
+        error: Optional[str] = None,
+    ) -> None:
+        try:
+            with open(audit_path, "r", encoding="utf-8") as handle:
+                record = CapabilityAuditRecord.from_dict(json.load(handle))
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return
+        record.execution_result = dict(execution_result)
+        record.error = error
+        self._audit_writer.write(audit_path, record)
+
+    def _evaluate_task_policy(
+        self,
+        wf: Workflow,
+        task: Task,
+        attempt_id: int,
+    ) -> tuple[CapabilityRequest, CapabilityMetadata, dict[str, Any], Path]:
+        capability_name = self._capability_name_for_task(task)
+        capability = self._capabilities.describe_capability(capability_name)
+        metadata = CapabilityMetadata.from_dict(capability)
+        request = CapabilityRequest(
+            actor_id=wf.owner_agent_id or self._scoped_agents.root_agent_id,
+            actor_type=self._workflow_actor_type(wf),
+            invocation_mode="workflow",
+            capability_name=capability_name,
+            args=self._capability_args_for_task(task),
+            scope=build_scope_context(
+                actor_id=wf.owner_agent_id or self._scoped_agents.root_agent_id,
+                workspace_root=self._workspace_root,
+                scoped_agent_store=self._scoped_agents,
+                workflow_store=self._store,
+                workflow_id=wf.workflow_id,
+                task_id=task.task_id,
+            ),
+            workflow_id=wf.workflow_id,
+            task_id=task.task_id,
+        )
+        decision = self._policy_engine.evaluate(
+            request,
+            metadata,
+            config_schema=capability.get("config_schema", {}),
+        ).to_dict()
+        audit_path = self._policy_audit_path(wf, task, attempt_id)
+        self._write_policy_audit(
+            audit_path,
+            capability_name=capability_name,
+            request=request,
+            metadata=metadata,
+            decision=decision,
+        )
+        return request, metadata, decision, audit_path
+
+    def _policy_block_result_payload(
+        self,
+        wf: Workflow,
+        task: Task,
+        request: CapabilityRequest,
+        decision: dict[str, Any],
+        *,
+        approval_request_id: Optional[str] = None,
+        audit_path: Optional[Path] = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "task_id": task.task_id,
+            "workflow_id": wf.workflow_id,
+            "attempt_id": task.current_attempt,
+            "status": TaskStatus.FAILED.value,
+            "summary": decision["reason"],
+            "text": "",
+            "data": {
+                "request": request.to_dict(),
+                "decision": dict(decision),
+                "approval_request_id": approval_request_id,
+            },
+            "metrics": {},
+            "error": decision["reason"],
+            "error_type": "policy_block",
+            "failure_type": "policy_block",
+            "retryable": False,
+        }
+        if audit_path is not None:
+            payload["audit_record_path"] = str(audit_path)
+        return payload
+
+    def _handle_policy_block_for_task(
+        self,
+        wf: Workflow,
+        task: Task,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+        decision: dict[str, Any],
+        audit_path: Path,
+    ) -> None:
+        approval_request_id = None
+        if decision["status"] == "requires_approval":
+            approval = build_approval_request(
+                request,
+                metadata,
+                self._policy_engine.evaluate(
+                    request,
+                    metadata,
+                    config_schema=self._capabilities.describe_capability(
+                        request.capability_name
+                    ).get("config_schema", {}),
+                ),
+            )
+            approval_request_id, _ = maybe_route_approval_request(
+                approval,
+                approval_store=self._approval_store,
+                message_store=self._message_store,
+                scoped_agent_store=self._scoped_agents,
+            )
+        blocked_result = {
+            "status": decision["status"],
+            "reason": decision["reason"],
+        }
+        if approval_request_id is not None:
+            blocked_result["approval_request_id"] = approval_request_id
+        self._write_policy_audit(
+            audit_path,
+            capability_name=request.capability_name,
+            request=request,
+            metadata=metadata,
+            decision=decision,
+            execution_result=blocked_result,
+        )
+        result_path = str(self._store.write_attempt_result(
+            wf.workflow_id,
+            task.task_id,
+            task.current_attempt,
+            self._policy_block_result_payload(
+                wf,
+                task,
+                request,
+                decision,
+                approval_request_id=approval_request_id,
+                audit_path=audit_path,
+            ),
+        ))
+        extra_event_type = ev.TOOL_FAILED if task.task_kind == "tool" else ev.WATCHER_FAILED
+        extra_metadata: dict[str, Any] = {
+            "policy_status": decision["status"],
+            "reason": decision["reason"],
+            "failure_type": "policy_block",
+            "retryable": False,
+        }
+        if approval_request_id is not None:
+            extra_metadata["approval_request_id"] = approval_request_id
+        self._finish_attempt(
+            wf,
+            task,
+            TaskStatus.FAILED,
+            event=ev.TASK_FAILED,
+            message=decision["reason"],
+            error=decision["reason"],
+            error_type="policy_block",
+            result_path=result_path,
+            result_summary=decision["reason"],
+            extra_events=[(
+                extra_event_type,
+                decision["reason"],
+                extra_metadata,
+            )],
+        )
 
     def _watcher_result_payload(
         self,
@@ -2139,6 +2410,7 @@ class Scheduler:
         pid: Optional[int] = None,
         watch_started: bool = False,
         tool_started: bool = False,
+        policy_audit_path: Optional[str] = None,
         extra_events: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
     ) -> int:
         attempt_id = task.current_attempt or (task.attempt_count + 1)
@@ -2188,6 +2460,7 @@ class Scheduler:
                 status=TaskStatus.RUNNING,
                 stdout_path=str(stdout_path),
                 stderr_path=str(stderr_path),
+                policy_audit_path=policy_audit_path,
             ))
             self._store.save_workflow(wf)
             self._events.task_attempt_started(
@@ -2354,12 +2627,15 @@ class Scheduler:
             if task.status is not TaskStatus.READY:
                 continue
             if task.task_kind == "watcher":
-                task.current_attempt = task.attempt_count + 1
+                attempt_id = task.attempt_count + 1
+                audit_path = self._policy_audit_path(wf, task, attempt_id)
+                task.current_attempt = attempt_id
                 self._begin_attempt(
                     wf,
                     task,
                     message="watcher started",
                     watch_started=True,
+                    policy_audit_path=str(audit_path),
                     extra_events=[(
                         ev.WATCHER_STARTED,
                         "watcher started",
@@ -2369,14 +2645,31 @@ class Scheduler:
                         },
                     )],
                 )
+                request, metadata, decision, audit_path = self._evaluate_task_policy(
+                    wf,
+                    task,
+                    attempt_id,
+                )
+                if not decision["allowed"]:
+                    self._handle_policy_block_for_task(
+                        wf,
+                        task,
+                        request,
+                        metadata,
+                        decision,
+                        audit_path,
+                    )
                 continue
             if task.task_kind == "tool":
-                task.current_attempt = task.attempt_count + 1
+                attempt_id = task.attempt_count + 1
+                audit_path = self._policy_audit_path(wf, task, attempt_id)
+                task.current_attempt = attempt_id
                 self._begin_attempt(
                     wf,
                     task,
                     message="tool started",
                     tool_started=True,
+                    policy_audit_path=str(audit_path),
                     extra_events=[(
                         ev.TOOL_STARTED,
                         "tool started",
@@ -2386,7 +2679,22 @@ class Scheduler:
                         },
                     )],
                 )
-                self._run_tool_task(wf, task)
+                request, metadata, decision, audit_path = self._evaluate_task_policy(
+                    wf,
+                    task,
+                    attempt_id,
+                )
+                if not decision["allowed"]:
+                    self._handle_policy_block_for_task(
+                        wf,
+                        task,
+                        request,
+                        metadata,
+                        decision,
+                        audit_path,
+                    )
+                    continue
+                self._run_tool_task(wf, task, request, metadata, decision, audit_path)
                 continue
             if slots <= 0:
                 break
@@ -2487,7 +2795,15 @@ class Scheduler:
                 )
         return False
 
-    def _run_tool_task(self, wf: Workflow, task: Task) -> None:
+    def _run_tool_task(
+        self,
+        wf: Workflow,
+        task: Task,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+        decision: dict[str, Any],
+        audit_path: Path,
+    ) -> None:
         try:
             tool_result = self._tools.run(task, self._store, wf)
         except Exception as exc:
@@ -2575,8 +2891,26 @@ class Scheduler:
                 "metrics": tool_result.metrics,
                 "error": dataflow_error or tool_result.error,
                 "error_type": error_type,
+                "failure_type": None,
+                "retryable": None,
+                "audit_record_path": str(audit_path),
             },
         ))
+        self._write_policy_audit(
+            audit_path,
+            capability_name=request.capability_name,
+            request=request,
+            metadata=metadata,
+            decision=decision,
+            execution_result={
+                "status": target_status.value,
+                "summary": tool_result.summary,
+                "text": tool_result.text,
+                "data": dict(tool_result.data),
+                "metrics": dict(tool_result.metrics),
+            },
+            error=dataflow_error or tool_result.error,
+        )
         message = dataflow_error or tool_result.error or tool_result.summary or ""
         event_metadata = {
             "tool_type": task.tool_type,

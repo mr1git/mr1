@@ -562,9 +562,10 @@ class FakeCapabilityRunner:
             error=None,
             duration_ms=5,
             capability="read_file",
+            decision={"status": "allowed"},
         )
         self._raises = raises
-        self.calls: list[tuple[str, dict, str]] = []
+        self.calls: list[tuple[str, dict, str, str | None]] = []
 
     def run_capability(
         self,
@@ -572,8 +573,10 @@ class FakeCapabilityRunner:
         config: dict,
         caller_agent_id: str,
         mode: str = "direct",
+        *,
+        step_id: str | None = None,
     ) -> CapabilityResult:
-        self.calls.append((name, config, caller_agent_id))
+        self.calls.append((name, config, caller_agent_id, step_id))
         if self._raises:
             raise ValueError(self._raises)
         return CapabilityResult(
@@ -582,6 +585,7 @@ class FakeCapabilityRunner:
             error=self._result.error,
             duration_ms=self._result.duration_ms,
             capability=name,
+            decision=dict(self._result.decision),
         )
 
 
@@ -625,10 +629,11 @@ def test_call_capability_parse_and_validate(workflow_store, agent_store):
     assert result.capability_result is not None
     assert result.capability_result["status"] == "succeeded"
     assert len(fake_runner.calls) == 1
-    name, config, caller = fake_runner.calls[0]
+    name, config, caller, step_id = fake_runner.calls[0]
     assert name == "read_file"
     assert config == {"path": "/tmp/x"}
     assert caller == child.agent_id
+    assert step_id is not None
 
 
 def test_call_capability_store_as_persists_output_to_step_context(
@@ -644,6 +649,7 @@ def test_call_capability_store_as_persists_output_to_step_context(
             error=None,
             duration_ms=1,
             capability="file_exists",
+            decision={"status": "allowed"},
         )
     )
     runner = MRnStepRunner(
@@ -673,6 +679,7 @@ def test_call_capability_store_as_skipped_on_failure(workflow_store, agent_store
             error="path does not exist",
             duration_ms=1,
             capability="read_file",
+            decision={"status": "allowed"},
         )
     )
     runner = MRnStepRunner(
@@ -717,42 +724,22 @@ def test_step_context_included_in_scoped_prompt(workflow_store, agent_store):
     assert "step_context" in context_text
     assert "key1" in context_text
 
-
-def test_call_capability_limit_raises_when_count_already_at_max(
-    workflow_store, agent_store
-):
-    root = agent_store.ensure_root_agent()
-    child = agent_store.create_child_agent(root.agent_id, "research")
-    agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
-    fake_runner = FakeCapabilityRunner()
-    step_runner = MRnStepRunner(
-        workflow_store=workflow_store,
-        scoped_agent_store=agent_store,
-        reasoner=FakeReasoner(_call_cap_action("read_file")),
-        capability_runner=fake_runner,
-    )
-    action = {
-        "action": "call_capability",
-        "reason": "test",
-        "capability": "read_file",
-        "config": {},
-        "store_as": None,
-        "next_status": "working",
-    }
-    # Counter already at the limit — next call must be blocked
-    step_call_count = [2]
-
-    with pytest.raises(ValueError, match="direct call limit exceeded"):
-        step_runner._execute_call_capability(child, action, step_call_count)
-
-
 def test_call_capability_preflight_error_produces_blocked_step(
     workflow_store, agent_store
 ):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
     agent_store.assign_mission(root.agent_id, child.agent_id, "Check files")
-    fake_runner = FakeCapabilityRunner(raises="capability not callable in direct mode: write_file")
+    fake_runner = FakeCapabilityRunner(
+        result=CapabilityResult(
+            status="denied",
+            output={"status": "denied", "reason": "capability_not_allowed_in_direct_mode"},
+            error=None,
+            duration_ms=0,
+            capability="write_file",
+            decision={"status": "denied"},
+        )
+    )
     runner = MRnStepRunner(
         workflow_store=workflow_store,
         scoped_agent_store=agent_store,
@@ -762,6 +749,6 @@ def test_call_capability_preflight_error_produces_blocked_step(
 
     result = runner.step(child.agent_id)
 
-    assert result.action == "invalid"
-    assert result.status_after == "blocked"
-    assert "write_file" in (result.error or "")
+    assert result.action == "call_capability"
+    assert result.status_after == "working"
+    assert result.capability_result["status"] == "denied"

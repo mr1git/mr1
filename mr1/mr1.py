@@ -785,6 +785,7 @@ class MR1:
             agent_id="MR1",
             scoped_agent_store=self._scoped_agents,
             message_store=self._message_store,
+            workspace_root=Path.cwd(),
         )
         self._workflow_authoring = workflow_authoring_service or WorkflowAuthoringService(
             self._scheduler,
@@ -1806,7 +1807,11 @@ class MR1:
                 if not isinstance(config, dict):
                     return "error: config must be a JSON object"
                 from mr1.capability_runner import CapabilityRunner
-                runner = CapabilityRunner(scoped_agent_store=self._scoped_agents)
+                runner = CapabilityRunner(
+                    scoped_agent_store=self._scoped_agents,
+                    message_store=self._message_store,
+                    workspace_root=self._workflow_store.root.parent,
+                )
                 try:
                     result = runner.run_capability(capability_name, config, self._root_agent_id)
                 except ValueError as exc:

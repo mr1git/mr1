@@ -68,19 +68,10 @@ class TestCapabilityRegistry:
         }
         assert description["outputs"]["result.data.stdout"] == "captured stdout text"
         assert description["outputs"]["artifact.stdout"] == "artifact path for stdout when present"
-        assert set(description) == {
-            "name",
-            "type",
-            "description",
-            "inputs",
-            "outputs",
-            "examples",
-            "config_schema",
-            "callable_by",
-            "direct_callable",
-            "direct_mode",
-            "timeout_s",
-        }
+        assert description["config_schema"]["cwd"]["required"] is True
+        assert description["direct_allowed"] is False
+        assert description["workflow_allowed"] is True
+        assert description["path_arg_fields"] == ["cwd"]
 
     def test_output_keys_are_explicit_supported_reference_roots(self):
         registry = default_capability_registry()
@@ -108,50 +99,52 @@ class TestCapabilityRegistry:
 
 
 class TestDirectCallMetadata:
-    def test_all_capabilities_have_direct_call_fields(self):
+    def test_all_capabilities_have_policy_fields(self):
         registry = default_capability_registry()
 
         for description in registry.describe_all():
             name = description["name"]
-            assert "callable_by" in description, name
-            assert "direct_callable" in description, name
-            assert "direct_mode" in description, name
-            assert "timeout_s" in description, name
-            assert isinstance(description["callable_by"], list), name
-            assert isinstance(description["direct_callable"], bool), name
-            assert isinstance(description["direct_mode"], str), name
-            assert isinstance(description["timeout_s"], int), name
+            assert "risk_score" in description, name
+            assert "direct_allowed" in description, name
+            assert "workflow_allowed" in description, name
+            assert "requires_scope" in description, name
+            assert "is_filesystem" in description, name
+            assert "path_arg_fields" in description, name
+            assert isinstance(description["direct_allowed"], bool), name
+            assert isinstance(description["workflow_allowed"], bool), name
+            assert isinstance(description["path_arg_fields"], list), name
 
-    def test_direct_callable_rollout_matches_spec(self):
+    def test_policy_rollout_matches_spec(self):
         registry = default_capability_registry()
         enabled = {
-            "read_file": ("read_only", ["workflow", "mr1", "mrn"]),
-            "file_exists": ("read_only", ["workflow", "mr1", "mrn"]),
-            "time_reached": ("read_only", ["workflow", "mr1", "mrn"]),
-            "condition_script": ("safe_exec", ["workflow", "mr1", "mrn"]),
+            "read_file": (True, True, True, ["path"]),
+            "file_exists": (True, True, True, ["path"]),
+            "time_reached": (True, True, False, []),
+            "condition_script": (True, True, True, ["path"]),
         }
 
-        for name, (mode, callers) in enabled.items():
+        for name, (direct_allowed, workflow_allowed, requires_scope, path_fields) in enabled.items():
             desc = registry.describe_capability(name)
-            assert desc["direct_callable"] is True, name
-            assert desc["direct_mode"] == mode, name
-            assert sorted(desc["callable_by"]) == sorted(callers), name
+            assert desc["direct_allowed"] is direct_allowed, name
+            assert desc["workflow_allowed"] is workflow_allowed, name
+            assert desc["requires_scope"] is requires_scope, name
+            assert desc["path_arg_fields"] == path_fields, name
 
     def test_workflow_only_capabilities_not_direct_callable(self):
         registry = default_capability_registry()
 
         for name in ("write_file", "shell_command", "manual_event"):
             desc = registry.describe_capability(name)
-            assert desc["direct_callable"] is False, name
-            assert desc["callable_by"] == ["workflow"], name
-            assert desc["direct_mode"] == "restricted", name
+            assert desc["direct_allowed"] is False, name
+            assert desc["workflow_allowed"] is True, name
 
     def test_agents_not_directly_callable(self):
         registry = default_capability_registry()
 
         for desc in registry.describe_all():
             if desc["type"] == "agent":
-                assert desc["direct_callable"] is False, desc["name"]
+                assert desc["direct_allowed"] is False, desc["name"]
+                assert desc["workflow_allowed"] is False, desc["name"]
 
 
 class TestCapabilityCli:
@@ -217,7 +210,7 @@ class TestCapabilityCli:
 
     def test_capability_call_cli_disallowed_raises_error(self, tmp_path, store, capsys):
         config_path = tmp_path / "cfg.json"
-        config_path.write_text(json.dumps({"path": "/tmp/x"}), encoding="utf-8")
+        config_path.write_text(json.dumps({"path": "/tmp/x", "content": "x"}), encoding="utf-8")
         scoped = __import__("mr1.scoped_agents", fromlist=["PersistentAgentStore"]).PersistentAgentStore(
             root=tmp_path / "agents"
         )
@@ -228,18 +221,19 @@ class TestCapabilityCli:
             scoped_agent_store=scoped,
         )
 
-        assert rc == 2
-        assert "error:" in capsys.readouterr().err
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "status:       denied" in out
 
     def test_capability_text_output_shows_direct_call_metadata(self, store, capsys):
         rc = workflow_cli.main(["capability", "read_file"], store=store)
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "direct_callable: True" in out
-        assert "direct_mode:     read_only" in out
-        assert "callable_by:" in out
-        assert "timeout_s:" in out
+        assert "risk_score:" in out
+        assert "direct_allowed:  True" in out
+        assert "workflow_allowed:True" in out
+        assert "path_arg_fields: path" in out
 
 
 class TestCapabilityBuiltins:
@@ -275,11 +269,11 @@ class TestCapabilityBuiltins:
 
     def test_mr1_capability_call_builtin_disallowed(self, tmp_path):
         mr1 = _build_mr1(tmp_path)
-        config_json = json.dumps({"path": "/x"})
+        config_json = json.dumps({"path": "/x", "content": "x"})
 
         output = mr1._handle_builtin(f"/capability call write_file '{config_json}'")
 
-        assert output.startswith("error:")
+        assert "status:       denied" in output
 
     def test_mr1_capability_call_builtin_usage_on_wrong_args(self, tmp_path):
         mr1 = _build_mr1(tmp_path)

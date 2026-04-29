@@ -66,6 +66,7 @@ class PersistentAgent:
     parent_request: Optional[str] = None
     last_run: Optional[dict[str, Any]] = None
     step_context: dict[str, Any] = field(default_factory=dict)
+    scope_roots: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +87,7 @@ class PersistentAgent:
             "parent_request": self.parent_request,
             "last_run": dict(self.last_run) if self.last_run is not None else None,
             "step_context": dict(self.step_context),
+            "scope_roots": list(self.scope_roots),
         }
 
     @classmethod
@@ -110,6 +112,7 @@ class PersistentAgent:
             last_run=dict(data["last_run"])
             if isinstance(data.get("last_run"), dict) else None,
             step_context=dict(data.get("step_context") or {}),
+            scope_roots=list(data.get("scope_roots", [])),
         )
 
 
@@ -361,6 +364,14 @@ class PersistentAgentStore:
 
     def capability_call_log_path(self, agent_id: str) -> Path:
         return self.logs_dir(agent_id) / "capability_calls.jsonl"
+
+    def capability_audits_dir(self, agent_id: str) -> Path:
+        path = self.logs_dir(agent_id) / "capability_audits"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def capability_audit_path(self, agent_id: str, audit_id: str) -> Path:
+        return self.capability_audits_dir(agent_id) / f"{audit_id}.json"
 
     def append_capability_call_log(self, agent_id: str, record: dict[str, Any]) -> Path:
         with self._lock:

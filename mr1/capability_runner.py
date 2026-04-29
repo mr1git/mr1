@@ -1,19 +1,27 @@
 """
-Direct synchronous capability invocation.
-
-A narrow read-only / safe-exec surface alongside workflow tasks.
-Workflows remain the durable engine; this path is for one-shot checks only.
-Direct calls never wait, retry, stream, schedule, or create workflow artifacts.
+Direct synchronous capability invocation with deterministic policy enforcement.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
+from mr1.capability_policy import (
+    CapabilityApprovalStore,
+    CapabilityAuditRecord,
+    CapabilityAuditWriter,
+    CapabilityMetadata,
+    CapabilityRequest,
+    PolicyEngine,
+    build_approval_request,
+    build_scope_context,
+)
+from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.tools import _read_file_pure
 from mr1.watchers import (
@@ -23,13 +31,20 @@ from mr1.watchers import (
 )
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 @dataclass
 class CapabilityResult:
-    status: str  # "succeeded" | "failed"
+    status: str  # succeeded | failed | denied | requires_approval
     output: dict[str, Any]
     error: Optional[str]
     duration_ms: int
     capability: str
+    decision: dict[str, Any] = field(default_factory=dict)
+    approval_request_id: Optional[str] = None
+    audit_record_path: Optional[str] = None
 
 
 class CapabilityRunner:
@@ -38,9 +53,21 @@ class CapabilityRunner:
         *,
         capability_registry: Optional[CapabilityRegistry] = None,
         scoped_agent_store: Optional[PersistentAgentStore] = None,
+        message_store: Optional[MessageStore] = None,
+        workspace_root: Optional[Path] = None,
     ):
         self._registry = capability_registry or default_capability_registry()
         self._agents = scoped_agent_store or PersistentAgentStore()
+        self._workspace_root = Path(workspace_root) if workspace_root else self._agents.root.parent
+        self._message_store = message_store or MessageStore(
+            root=self._agents.root.parent / "messages",
+            scoped_agent_store=self._agents,
+        )
+        self._policy_engine = PolicyEngine()
+        self._approval_store = CapabilityApprovalStore(
+            self._agents.root.parent / "capability_approvals"
+        )
+        self._audit_writer = CapabilityAuditWriter()
 
     def run_capability(
         self,
@@ -48,51 +75,130 @@ class CapabilityRunner:
         config: dict[str, Any],
         caller_agent_id: str,
         mode: str = "direct",
+        *,
+        step_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> CapabilityResult:
-        # --- Preflight checks raise deterministic errors ---
         try:
             meta = self._registry.describe_capability(name)
         except ValueError:
             raise ValueError(f"capability not found: {name}")
-
-        if not meta.get("direct_callable", False):
-            raise ValueError(f"capability not callable in direct mode: {name}")
-
         caller_type = self._resolve_caller_type(caller_agent_id)
-        if caller_type not in meta.get("callable_by", []):
+        if caller_type not in {"mr1", "mrn"}:
             raise ValueError("access denied")
+        metadata = CapabilityMetadata.from_dict(meta)
+        request = CapabilityRequest(
+            actor_id=caller_agent_id,
+            actor_type=caller_type,
+            invocation_mode=mode,
+            capability_name=name,
+            args=dict(config),
+            scope=build_scope_context(
+                actor_id=caller_agent_id,
+                workspace_root=self._workspace_root,
+                scoped_agent_store=self._agents,
+                workflow_id=workflow_id,
+                task_id=task_id,
+            ),
+            step_id=step_id,
+            workflow_id=workflow_id,
+            task_id=task_id,
+        )
+        decision = self._policy_engine.evaluate(
+            request,
+            metadata,
+            config_schema=meta.get("config_schema", {}),
+        )
+        audit_id = self._new_audit_id(caller_agent_id)
+        audit_path = self._agents.capability_audit_path(caller_agent_id, audit_id)
+        record = CapabilityAuditRecord(
+            capability_name=name,
+            request=request.to_dict(),
+            metadata=metadata.to_dict(),
+            decision=decision.to_dict(),
+            execution_result=None,
+            error=None,
+            timestamp=_now_iso(),
+        )
+        self._audit_writer.write(audit_path, record)
 
-        # Effective timeout: min(config timeout, metadata ceiling)
-        meta_timeout = int(meta.get("timeout_s", 30))
+        if not decision.allowed:
+            approval_request_id = None
+            if decision.status == "requires_approval":
+                approval = build_approval_request(request, metadata, decision)
+                approval_request_id, _ = self._route_approval(approval)
+            output = {
+                "status": decision.status,
+                "reason": decision.reason,
+            }
+            if approval_request_id is not None:
+                output["approval_request_id"] = approval_request_id
+            record.execution_result = dict(output)
+            self._audit_writer.write(audit_path, record)
+            return CapabilityResult(
+                status=decision.status,
+                output=output,
+                error=None,
+                duration_ms=0,
+                capability=name,
+                decision=decision.to_dict(),
+                approval_request_id=approval_request_id,
+                audit_record_path=str(audit_path),
+            )
+
+        meta_timeout = 30
         config_timeout = config.get("timeout_s")
         if isinstance(config_timeout, int) and config_timeout > 0:
-            effective_timeout = min(config_timeout, meta_timeout)
-        else:
-            effective_timeout = meta_timeout
-
-        # --- Runtime dispatch ---
+            meta_timeout = config_timeout
         started = time.monotonic()
+        output: dict[str, Any] = {}
+        error: Optional[str] = None
+        status = "succeeded"
         try:
-            output, error = self._dispatch(name, config, effective_timeout)
-            status = "failed" if error is not None else "succeeded"
+            output, error = self._dispatch(name, config, meta_timeout)
+            if error is not None:
+                status = "failed"
         except Exception as exc:
-            output = {}
             error = str(exc)
             status = "failed"
         duration_ms = int((time.monotonic() - started) * 1000)
-
-        result = CapabilityResult(
+        record.execution_result = dict(output)
+        record.error = error
+        self._audit_writer.write(audit_path, record)
+        return CapabilityResult(
             status=status,
             output=output,
             error=error,
             duration_ms=duration_ms,
             capability=name,
+            decision=decision.to_dict(),
+            audit_record_path=str(audit_path),
         )
-        self._write_audit_log(caller_agent_id, name, config, result)
-        return result
 
     def _resolve_caller_type(self, caller_agent_id: str) -> str:
         return "mr1" if self._agents.is_root_agent(caller_agent_id) else "mrn"
+
+    def _route_approval(self, approval) -> tuple[str, bool]:
+        from mr1.capability_policy import maybe_route_approval_request
+
+        return maybe_route_approval_request(
+            approval,
+            approval_store=self._approval_store,
+            message_store=self._message_store,
+            scoped_agent_store=self._agents,
+        )
+
+    def _new_audit_id(self, caller_agent_id: str) -> str:
+        base = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        candidate = f"cap_audit_{base}"
+        path = self._agents.capability_audit_path(caller_agent_id, candidate)
+        suffix = 1
+        while path.exists():
+            candidate = f"cap_audit_{base}_{suffix}"
+            path = self._agents.capability_audit_path(caller_agent_id, candidate)
+            suffix += 1
+        return candidate
 
     def _dispatch(
         self,
@@ -146,25 +252,3 @@ class CapabilityRunner:
             return output, None
 
         raise ValueError(f"capability not found: {name}")
-
-    def _write_audit_log(
-        self,
-        agent_id: str,
-        name: str,
-        config: dict[str, Any],
-        result: CapabilityResult,
-    ) -> None:
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "agent_id": agent_id,
-            "capability": name,
-            "config": config,
-            "result": result.output,
-            "result_status": result.status,
-            "duration_ms": result.duration_ms,
-            "error": result.error,
-        }
-        try:
-            self._agents.append_capability_call_log(agent_id, record)
-        except OSError:
-            pass

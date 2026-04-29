@@ -918,12 +918,15 @@ def _format_description_text(description: dict[str, Any]) -> str:
         lines.append(
             f"workflow_task_allowed: {bool(description.get('workflow_task_allowed'))}"
         )
-    if "direct_callable" in description:
+    if "risk_score" in description:
         lines.extend([
-            f"direct_callable: {bool(description.get('direct_callable'))}",
-            f"direct_mode:     {description.get('direct_mode', '-')}",
-            f"callable_by:     {', '.join(description.get('callable_by') or [])}",
-            f"timeout_s:       {description.get('timeout_s', '-')}",
+            f"risk_score:      {description.get('risk_score')}",
+            f"direct_allowed:  {bool(description.get('direct_allowed'))}",
+            f"workflow_allowed:{bool(description.get('workflow_allowed'))}",
+            f"requires_scope:  {bool(description.get('requires_scope'))}",
+            f"is_filesystem:   {bool(description.get('is_filesystem'))}",
+            f"is_execution:    {bool(description.get('is_execution'))}",
+            f"path_arg_fields: {', '.join(description.get('path_arg_fields') or []) or '-'}",
         ])
     lines.extend([
         "examples:",
@@ -1393,7 +1396,6 @@ def _cmd_capability_call(
     caller_agent_id: str,
     scoped_agents: PersistentAgentStore,
 ) -> int:
-    del store
     from mr1.capability_runner import CapabilityRunner
     config_path = Path(args.config_file)
     try:
@@ -1404,7 +1406,10 @@ def _cmd_capability_call(
     if not isinstance(config, dict):
         print("error: config file must be a JSON object", file=sys.stderr)
         return 2
-    runner = CapabilityRunner(scoped_agent_store=scoped_agents)
+    runner = CapabilityRunner(
+        scoped_agent_store=scoped_agents,
+        workspace_root=store.root.parent,
+    )
     try:
         result = runner.run_capability(args.name, config, caller_agent_id)
     except ValueError as exc:

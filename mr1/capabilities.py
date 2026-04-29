@@ -11,44 +11,9 @@ from copy import deepcopy
 from typing import Any, Optional
 
 from mr1.agents import AgentRegistry, default_agent_registry
+from mr1.capability_policy import metadata_for_capability
 from mr1.tools import ToolRegistry, default_tool_registry
 from mr1.watchers import WatcherRegistry, default_watcher_registry
-
-
-_DIRECT_CALL_DEFAULTS: dict[str, Any] = {
-    "callable_by": ["workflow"],
-    "direct_callable": False,
-    "direct_mode": "restricted",
-    "timeout_s": 30,
-}
-
-# Per-capability overrides applied during registration.
-_DIRECT_CALL_OVERRIDES: dict[str, dict[str, Any]] = {
-    "read_file": {
-        "callable_by": ["workflow", "mr1", "mrn"],
-        "direct_callable": True,
-        "direct_mode": "read_only",
-        "timeout_s": 10,
-    },
-    "file_exists": {
-        "callable_by": ["workflow", "mr1", "mrn"],
-        "direct_callable": True,
-        "direct_mode": "read_only",
-        "timeout_s": 5,
-    },
-    "time_reached": {
-        "callable_by": ["workflow", "mr1", "mrn"],
-        "direct_callable": True,
-        "direct_mode": "read_only",
-        "timeout_s": 5,
-    },
-    "condition_script": {
-        "callable_by": ["workflow", "mr1", "mrn"],
-        "direct_callable": True,
-        "direct_mode": "safe_exec",
-        "timeout_s": 30,
-    },
-}
 
 
 class CapabilityRegistry:
@@ -95,19 +60,8 @@ class CapabilityRegistry:
         name = normalized["name"]
         if name in self._capabilities:
             raise ValueError(f"duplicate capability name '{name}'")
-        overrides = _DIRECT_CALL_OVERRIDES.get(name, {})
-        normalized["callable_by"] = list(
-            overrides.get("callable_by", _DIRECT_CALL_DEFAULTS["callable_by"])
-        )
-        normalized["direct_callable"] = bool(
-            overrides.get("direct_callable", _DIRECT_CALL_DEFAULTS["direct_callable"])
-        )
-        normalized["direct_mode"] = overrides.get(
-            "direct_mode", _DIRECT_CALL_DEFAULTS["direct_mode"]
-        )
-        normalized["timeout_s"] = int(
-            overrides.get("timeout_s", _DIRECT_CALL_DEFAULTS["timeout_s"])
-        )
+        policy_metadata = metadata_for_capability(name, normalized["type"])
+        normalized.update(policy_metadata.to_dict())
         self._capabilities[name] = normalized
 
     def list_capabilities(self) -> list[str]:

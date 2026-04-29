@@ -525,7 +525,7 @@ class TestStep:
                             "title": "Python version",
                             "task_kind": "tool",
                             "tool_type": "shell_command",
-                            "tool_config": {"argv": ["python3", "--version"]},
+                            "tool_config": {"argv": ["python3", "--version"], "cwd": str(tmp_path)},
                         },
                         {
                             "label": "summarize",
@@ -577,7 +577,7 @@ class TestStep:
                             "title": "Python version",
                             "task_kind": "tool",
                             "tool_type": "shell_command",
-                            "tool_config": {"argv": ["python3", "--version"]},
+                            "tool_config": {"argv": ["python3", "--version"], "cwd": str(tmp_path)},
                         },
                         {
                             "label": "summarize",
@@ -647,7 +647,7 @@ class TestStep:
                             "title": "Python version",
                             "task_kind": "tool",
                             "tool_type": "shell_command",
-                            "tool_config": {"argv": ["python3", "--version"]},
+                            "tool_config": {"argv": ["python3", "--version"], "cwd": str(tmp_path)},
                         },
                         {
                             "label": "summarize",
@@ -712,7 +712,7 @@ class TestStep:
                             "title": "Python version",
                             "task_kind": "tool",
                             "tool_type": "shell_command",
-                            "tool_config": {"argv": ["python3", "--version"]},
+                            "tool_config": {"argv": ["python3", "--version"], "cwd": str(tmp_path)},
                         },
                         {
                             "label": "summarize",

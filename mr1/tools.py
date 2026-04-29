@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
+from mr1.capability_policy import normalize_path
 from mr1.dataflow import Artifact, new_artifact_id
 from mr1.workflow_models import Task, Workflow
 from mr1.workflow_store import WorkflowStore
@@ -54,10 +55,7 @@ class ToolDefinition:
 
 
 def _resolve_path(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    return path.resolve()
+    return normalize_path(raw_path)
 
 
 def _looks_like_text(data: bytes) -> bool:
@@ -262,14 +260,13 @@ class ShellCommandTool:
         if any(not isinstance(item, str) or not item for item in argv):
             raise ToolConfigError("shell_command argv must be a non-empty list of strings")
         cwd = config.get("cwd")
-        if cwd is not None:
-            if not isinstance(cwd, str) or not cwd.strip():
-                raise ToolConfigError("shell_command cwd must be a non-empty string")
-            cwd_path = _resolve_path(cwd)
-            if not cwd_path.exists():
-                raise ToolConfigError(f"shell_command cwd does not exist: {cwd_path}")
-            if not cwd_path.is_dir():
-                raise ToolConfigError(f"shell_command cwd is not a directory: {cwd_path}")
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise ToolConfigError("shell_command requires non-empty tool_config.cwd")
+        cwd_path = _resolve_path(cwd)
+        if not cwd_path.exists():
+            raise ToolConfigError(f"shell_command cwd does not exist: {cwd_path}")
+        if not cwd_path.is_dir():
+            raise ToolConfigError(f"shell_command cwd is not a directory: {cwd_path}")
         timeout_s = config.get("timeout_s", 30)
         if not isinstance(timeout_s, int) or timeout_s < 1 or timeout_s > 300:
             raise ToolConfigError("shell_command timeout_s must be an integer between 1 and 300")
@@ -286,7 +283,7 @@ class ShellCommandTool:
     def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
         del workflow
         argv = list(task.tool_config["argv"])
-        cwd = _resolve_path(task.tool_config.get("cwd", "."))
+        cwd = _resolve_path(task.tool_config["cwd"])
         timeout_s = task.tool_config.get("timeout_s", 30)
         capture_max_bytes = task.tool_config.get("capture_max_bytes", 65536)
         env_overrides = dict(task.tool_config.get("env", {}))
@@ -533,7 +530,7 @@ def default_tool_registry() -> ToolRegistry:
             config_shape='{"argv": ["python", "--version"], "cwd": ".", "timeout_s": 10, "capture_max_bytes": 65536, "env": {}}',
             config_schema={
                 "argv": {"type": "list[string]", "required": True},
-                "cwd": {"type": "string", "required": False, "default": "."},
+                "cwd": {"type": "string", "required": True},
                 "timeout_s": {"type": "int", "required": False, "default": 30},
                 "capture_max_bytes": {"type": "int", "required": False, "default": 65536},
                 "env": {"type": "object[string,string]", "required": False, "default": {}},
@@ -559,6 +556,7 @@ def default_tool_registry() -> ToolRegistry:
                     "tool_type": "shell_command",
                     "tool_config": {
                         "argv": ["python3", "--version"],
+                        "cwd": ".",
                     },
                 }
             ],

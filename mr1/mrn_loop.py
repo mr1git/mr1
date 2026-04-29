@@ -36,7 +36,6 @@ from mr1.workflow_store import WorkflowStore
 _PKG_ROOT = Path(__file__).resolve().parent
 _MRN_CONFIG_PATH = _PKG_ROOT / "agents" / "mrn.yml"
 _DEFAULT_TIMEOUT_S = 300
-_MAX_DIRECT_CALLS_PER_STEP = 2
 ALLOWED_MRN_ACTIONS = frozenset({
     "create_workflow",
     "inspect_workflow",
@@ -96,7 +95,6 @@ Rules:
 - You may request workflow creation, but runtime validation decides whether submission is allowed.
 - If you do not have enough information, use "ask_parent" or "idle".
 - For call_capability, set "capability" to a direct-callable capability name; optionally set "config" and "store_as".
-- Direct calls are capped at 2 per step.
 """
 
 ReasonerFn = Callable[[PersistentAgent, str, str], str]
@@ -624,25 +622,23 @@ class MRnStepRunner:
         action: dict[str, Any],
         step_call_count: list[int],
     ) -> MRnStepResult:
-        if step_call_count[0] >= _MAX_DIRECT_CALLS_PER_STEP:
-            raise ValueError(
-                f"direct call limit exceeded: max {_MAX_DIRECT_CALLS_PER_STEP} per step"
-            )
         step_call_count[0] += 1
 
         capability_name = action["capability"].strip()
         config = dict(action.get("config") or {})
         store_as = action.get("store_as")
+        step_id = f"{agent.agent_id}:{agent.current_iteration + 1}"
 
         result = self._capability_runner.run_capability(
             capability_name,
             config,
             agent.agent_id,
             mode="direct",
+            step_id=step_id,
         )
 
         stored_as = None
-        if store_as and result.status == "succeeded":
+        if store_as and result.status in {"succeeded", "denied", "requires_approval"}:
             agent_ctx = self._scoped_agents.require_agent(agent.agent_id)
             agent_ctx.step_context[store_as] = result.output
             self._scoped_agents.save_agent(agent_ctx)
@@ -659,6 +655,9 @@ class MRnStepRunner:
                 "error": result.error,
                 "duration_ms": result.duration_ms,
                 "capability": result.capability,
+                "decision": dict(result.decision),
+                "approval_request_id": result.approval_request_id,
+                "audit_record_path": result.audit_record_path,
             },
             stored_as=stored_as,
         )

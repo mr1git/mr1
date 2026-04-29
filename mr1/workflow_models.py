@@ -136,6 +136,7 @@ class TaskAttempt:
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     result_path: Optional[str] = None
+    policy_audit_path: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -155,6 +156,7 @@ class TaskAttempt:
             stdout_path=data.get("stdout_path"),
             stderr_path=data.get("stderr_path"),
             result_path=data.get("result_path"),
+            policy_audit_path=data.get("policy_audit_path"),
         )
 
 

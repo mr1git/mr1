@@ -76,9 +76,11 @@ class TestToolValidation:
         with pytest.raises(ToolConfigError, match="argv"):
             registry.validate_spec("shell_command", {"argv": ["python", 1]})
         with pytest.raises(ToolConfigError, match="cwd"):
+            registry.validate_spec("shell_command", {"argv": ["python"]})
+        with pytest.raises(ToolConfigError, match="cwd"):
             registry.validate_spec("shell_command", {"argv": ["python"], "cwd": str(tmp_path / "missing")})
         with pytest.raises(ToolConfigError, match="timeout_s"):
-            registry.validate_spec("shell_command", {"argv": ["python"], "timeout_s": 301})
+            registry.validate_spec("shell_command", {"argv": ["python"], "cwd": ".", "timeout_s": 301})
 
     def test_read_file_missing_path_is_runtime_failure(self, scheduler, store, tmp_path):
         missing = tmp_path / "missing.txt"
@@ -242,7 +244,7 @@ class TestShellCommandTool:
                 "title": "Python version",
                 "task_kind": "tool",
                 "tool_type": "shell_command",
-                "tool_config": {"argv": [sys.executable, "--version"]},
+                "tool_config": {"argv": [sys.executable, "--version"], "cwd": str(store.root.parent)},
             }),
             PROV,
         )
@@ -271,6 +273,7 @@ class TestShellCommandTool:
                         "-c",
                         "import sys; print('bad'); sys.stderr.write('err\\n'); sys.exit(5)",
                     ],
+                    "cwd": str(store.root.parent),
                 },
             }),
             PROV,
@@ -299,6 +302,7 @@ class TestShellCommandTool:
                         "-c",
                         "import sys,time; print('slow', flush=True); sys.stderr.write('wait\\n'); sys.stderr.flush(); time.sleep(2)",
                     ],
+                    "cwd": str(store.root.parent),
                     "timeout_s": 1,
                 },
             }),
@@ -327,6 +331,7 @@ class TestShellCommandTool:
                         "-c",
                         "import sys; print('A'*200); sys.stderr.write('B'*200)",
                     ],
+                    "cwd": str(store.root.parent),
                     "capture_max_bytes": 32,
                 },
             }),
@@ -441,7 +446,7 @@ class TestToolDataflowIntegration:
                         "title": "Shell",
                         "task_kind": "tool",
                         "tool_type": "shell_command",
-                        "tool_config": {"argv": [sys.executable, "--version"]},
+                        "tool_config": {"argv": [sys.executable, "--version"], "cwd": str(store.root.parent)},
                     },
                     {
                         "label": "consume",
@@ -475,7 +480,7 @@ class TestToolDataflowIntegration:
                         "title": "Shell",
                         "task_kind": "tool",
                         "tool_type": "shell_command",
-                        "tool_config": {"argv": [sys.executable, "--version"]},
+                        "tool_config": {"argv": [sys.executable, "--version"], "cwd": str(store.root.parent)},
                     },
                     {
                         "label": "consume",
@@ -508,7 +513,7 @@ class TestToolDataflowIntegration:
                         "title": "Shell",
                         "task_kind": "tool",
                         "tool_type": "shell_command",
-                        "tool_config": {"argv": [sys.executable, "--version"]},
+                        "tool_config": {"argv": [sys.executable, "--version"], "cwd": str(store.root.parent)},
                     },
                     {
                         "label": "consume",

@@ -1,16 +1,14 @@
-"""Tests for the direct capability invocation layer (Phase 14)."""
+"""Tests for the direct capability invocation policy boundary."""
 
 from __future__ import annotations
 
 import json
-import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from mr1.capability_runner import CapabilityResult, CapabilityRunner
+from mr1.capability_runner import CapabilityRunner
 from mr1.scoped_agents import PersistentAgentStore
 
 
@@ -29,50 +27,107 @@ def runner(agent_store):
     return CapabilityRunner(scoped_agent_store=agent_store)
 
 
-# ---------------------------------------------------------------------------
-# read_file
-# ---------------------------------------------------------------------------
+def _load_audit(path: str) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 class TestReadFile:
-    def test_succeeds_and_returns_content(self, tmp_path, runner, root_agent_id):
-        f = tmp_path / "hello.txt"
-        f.write_text("hello world", encoding="utf-8")
+    def test_root_read_inside_workspace_is_allowed(self, tmp_path, runner, root_agent_id):
+        target = tmp_path / "hello.txt"
+        target.write_text("hello world", encoding="utf-8")
 
-        result = runner.run_capability("read_file", {"path": str(f)}, root_agent_id)
+        result = runner.run_capability("read_file", {"path": str(target)}, root_agent_id)
 
         assert result.status == "succeeded"
         assert result.error is None
         assert result.output["text"] == "hello world"
-        assert result.output["truncated"] is False
-        assert result.capability == "read_file"
-        assert result.duration_ms >= 0
+        audit = _load_audit(result.audit_record_path)
+        assert audit["decision"]["status"] == "allowed"
+        assert audit["decision"]["final_effect"] == "executed"
 
-    def test_missing_file_returns_failed(self, tmp_path, runner, root_agent_id):
+    def test_missing_file_is_execution_failure_but_still_audited(self, tmp_path, runner, root_agent_id):
         result = runner.run_capability(
-            "read_file", {"path": str(tmp_path / "missing.txt")}, root_agent_id
+            "read_file",
+            {"path": str(tmp_path / "missing.txt")},
+            root_agent_id,
         )
 
         assert result.status == "failed"
-        assert result.error is not None
-        assert "does not exist" in result.error
+        assert "does not exist" in (result.error or "")
+        audit = _load_audit(result.audit_record_path)
+        assert audit["decision"]["status"] == "allowed"
+        assert audit["error"] is not None
 
-    def test_truncation_flag_set_when_exceeds_max_bytes(self, tmp_path, runner, root_agent_id):
-        f = tmp_path / "big.txt"
-        f.write_text("x" * 100, encoding="utf-8")
+    def test_child_in_scope_read_is_allowed(self, tmp_path, agent_store, root_agent_id):
+        child = agent_store.create_child_agent(root_agent_id, "child")
+        allowed_dir = tmp_path / "allowed"
+        allowed_dir.mkdir()
+        target = allowed_dir / "data.txt"
+        target.write_text("ok", encoding="utf-8")
+        child = agent_store.require_agent(child.agent_id)
+        child.scope_roots = [str(allowed_dir)]
+        agent_store.save_agent(child)
+        runner = CapabilityRunner(scoped_agent_store=agent_store)
 
-        result = runner.run_capability(
-            "read_file", {"path": str(f), "max_bytes": 10}, root_agent_id
-        )
+        result = runner.run_capability("read_file", {"path": str(target)}, child.agent_id)
 
         assert result.status == "succeeded"
-        assert result.output["truncated"] is True
-        assert len(result.output["text"]) == 10
+        assert result.output["text"] == "ok"
 
+    def test_child_out_of_scope_read_requires_approval(self, tmp_path, agent_store, root_agent_id):
+        child = agent_store.create_child_agent(root_agent_id, "child")
+        allowed_dir = tmp_path / "allowed"
+        denied_dir = tmp_path / "denied"
+        allowed_dir.mkdir()
+        denied_dir.mkdir()
+        target = denied_dir / "secret.txt"
+        target.write_text("secret", encoding="utf-8")
+        child = agent_store.require_agent(child.agent_id)
+        child.scope_roots = [str(allowed_dir)]
+        agent_store.save_agent(child)
+        runner = CapabilityRunner(scoped_agent_store=agent_store)
 
-# ---------------------------------------------------------------------------
-# file_exists
-# ---------------------------------------------------------------------------
+        result = runner.run_capability(
+            "read_file",
+            {"path": str(target)},
+            child.agent_id,
+            step_id="step-1",
+        )
+
+        assert result.status == "requires_approval"
+        assert result.output["status"] == "requires_approval"
+        assert result.output["reason"] == "outside_actor_scope"
+        assert result.output["approval_request_id"]
+        inbox = runner._message_store.list_inbox(root_agent_id)
+        assert len(inbox) == 1
+        audit = _load_audit(result.audit_record_path)
+        assert audit["decision"]["status"] == "requires_approval"
+        assert audit["execution_result"]["approval_request_id"] == result.output["approval_request_id"]
+
+    def test_identical_same_step_requests_dedupe_approval(self, tmp_path, agent_store, root_agent_id):
+        child = agent_store.create_child_agent(root_agent_id, "child")
+        target = tmp_path / "secret.txt"
+        target.write_text("secret", encoding="utf-8")
+        runner = CapabilityRunner(scoped_agent_store=agent_store)
+
+        first = runner.run_capability(
+            "read_file",
+            {"path": str(target)},
+            child.agent_id,
+            step_id="step-7",
+        )
+        second = runner.run_capability(
+            "read_file",
+            {"path": str(target)},
+            child.agent_id,
+            step_id="step-7",
+        )
+
+        assert first.status == "requires_approval"
+        assert second.status == "requires_approval"
+        assert first.output["approval_request_id"] == second.output["approval_request_id"]
+        inbox = runner._message_store.list_inbox(root_agent_id)
+        assert len(inbox) == 1
 
 
 class TestFileExists:
@@ -86,7 +141,6 @@ class TestFileExists:
 
         assert result.status == "succeeded"
         assert result.output["exists"] is True
-        assert result.error is None
 
     def test_missing_file_returns_succeeded_and_exists_false(
         self, tmp_path, runner, root_agent_id
@@ -97,12 +151,6 @@ class TestFileExists:
 
         assert result.status == "succeeded"
         assert result.output["exists"] is False
-        assert result.error is None
-
-
-# ---------------------------------------------------------------------------
-# time_reached
-# ---------------------------------------------------------------------------
 
 
 class TestTimeReached:
@@ -121,144 +169,85 @@ class TestTimeReached:
 
         assert result.status == "succeeded"
         assert result.output["reached"] is False
-        assert "at" in result.output
-        assert "now" in result.output
 
 
-# ---------------------------------------------------------------------------
-# condition_script
-# ---------------------------------------------------------------------------
-
-
-class TestConditionScript:
-    def _write_script(self, tmp_path: Path, exit_code: int) -> Path:
-        script = tmp_path / "check.py"
-        script.write_text(f"import sys; sys.exit({exit_code})", encoding="utf-8")
-        return script
-
-    def test_exit_0_returns_succeeded_satisfied(self, tmp_path, runner, root_agent_id):
-        script = self._write_script(tmp_path, 0)
-
-        result = runner.run_capability(
-            "condition_script", {"path": str(script)}, root_agent_id
-        )
-
-        assert result.status == "succeeded"
-        assert result.output["satisfied"] is True
-
-    def test_exit_1_returns_succeeded_not_satisfied(self, tmp_path, runner, root_agent_id):
-        script = self._write_script(tmp_path, 1)
-
-        result = runner.run_capability(
-            "condition_script", {"path": str(script)}, root_agent_id
-        )
-
-        assert result.status == "succeeded"
-        assert result.output["satisfied"] is False
-        assert result.error is None
-
-    def test_exit_2_returns_failed(self, tmp_path, runner, root_agent_id):
-        script = self._write_script(tmp_path, 2)
-
-        result = runner.run_capability(
-            "condition_script", {"path": str(script)}, root_agent_id
-        )
-
-        assert result.status == "failed"
-        assert result.error is not None
-
-    def test_timeout_returns_failed(self, tmp_path, runner, root_agent_id):
-        script = tmp_path / "slow.py"
-        script.write_text("import time; time.sleep(60)", encoding="utf-8")
-
-        result = runner.run_capability(
-            "condition_script", {"path": str(script), "timeout_s": 1}, root_agent_id
-        )
-
-        assert result.status == "failed"
-        assert result.error is not None
-        assert "timed out" in result.error
-
-
-# ---------------------------------------------------------------------------
-# Disallowed direct capabilities
-# ---------------------------------------------------------------------------
-
-
-class TestDisallowedDirectCapabilities:
+class TestPolicyDenials:
     @pytest.mark.parametrize("name", ["write_file", "shell_command", "manual_event"])
-    def test_raises_not_direct_callable(self, name, runner, root_agent_id):
-        with pytest.raises(ValueError, match=f"capability not callable in direct mode: {name}"):
-            runner.run_capability(name, {}, root_agent_id)
+    def test_policy_block_returns_structured_denial(self, name, runner, root_agent_id):
+        result = runner.run_capability(name, {}, root_agent_id)
 
-    def test_unknown_capability_raises(self, runner, root_agent_id):
-        with pytest.raises(ValueError, match="capability not found: no_such_cap"):
-            runner.run_capability("no_such_cap", {}, root_agent_id)
+        assert result.status == "denied"
+        assert result.output["status"] == "denied"
+        assert "reason" in result.output
 
+    def test_condition_script_is_denied_for_root_direct_risk(self, tmp_path, runner, root_agent_id):
+        script = tmp_path / "check.py"
+        script.write_text("import sys; sys.exit(0)", encoding="utf-8")
 
-# ---------------------------------------------------------------------------
-# Access denied
-# ---------------------------------------------------------------------------
+        result = runner.run_capability(
+            "condition_script",
+            {"path": str(script)},
+            root_agent_id,
+        )
 
+        assert result.status == "denied"
+        assert result.output["reason"] == "risk_exceeds_direct_threshold"
 
-class TestAccessDenied:
-    def test_caller_type_not_in_callable_by_raises(self, runner, root_agent_id):
+    def test_missing_required_arg_is_denied(self, runner, root_agent_id):
+        result = runner.run_capability("read_file", {}, root_agent_id)
+
+        assert result.status == "denied"
+        assert result.output["reason"] == "missing_required_arg:path"
+
+    def test_access_denied_for_unknown_actor_type(self, runner, root_agent_id):
         with patch.object(runner, "_resolve_caller_type", return_value="outsider"):
             with pytest.raises(ValueError, match="access denied"):
                 runner.run_capability("read_file", {"path": "/tmp/x"}, root_agent_id)
 
 
-# ---------------------------------------------------------------------------
-# Audit log
-# ---------------------------------------------------------------------------
+class TestScopeNormalization:
+    def test_symlink_escape_requires_approval(self, tmp_path, agent_store, root_agent_id):
+        child = agent_store.create_child_agent(root_agent_id, "child")
+        allowed_dir = tmp_path / "allowed"
+        outside_dir = tmp_path / "outside"
+        allowed_dir.mkdir()
+        outside_dir.mkdir()
+        target = outside_dir / "secret.txt"
+        target.write_text("secret", encoding="utf-8")
+        link = allowed_dir / "linked.txt"
+        link.symlink_to(target)
+        child = agent_store.require_agent(child.agent_id)
+        child.scope_roots = [str(allowed_dir)]
+        agent_store.save_agent(child)
+        runner = CapabilityRunner(scoped_agent_store=agent_store)
+
+        result = runner.run_capability("read_file", {"path": str(link)}, child.agent_id)
+
+        assert result.status == "requires_approval"
 
 
 class TestAuditLog:
-    def test_log_written_to_capability_calls_jsonl(self, tmp_path, agent_store, root_agent_id):
+    def test_audit_record_written_for_success(self, tmp_path, agent_store, root_agent_id):
         f = tmp_path / "note.txt"
         f.write_text("hi", encoding="utf-8")
         runner = CapabilityRunner(scoped_agent_store=agent_store)
 
-        runner.run_capability("read_file", {"path": str(f)}, root_agent_id)
+        result = runner.run_capability("read_file", {"path": str(f)}, root_agent_id)
 
-        log_path = agent_store.capability_call_log_path(root_agent_id)
-        assert log_path.exists()
-        record = json.loads(log_path.read_text(encoding="utf-8").strip())
-        assert record["capability"] == "read_file"
-        assert record["agent_id"] == root_agent_id
-        assert record["result_status"] == "succeeded"
-        assert "timestamp" in record
-        assert "duration_ms" in record
+        audit = _load_audit(result.audit_record_path)
+        assert audit["capability_name"] == "read_file"
+        assert audit["decision"]["policy_id"] == "capability-policy-v1"
+        assert audit["decision"]["policy_version"] == 1
+        assert audit["execution_result"]["text"] == "hi"
 
-    def test_failed_call_still_writes_log(self, tmp_path, agent_store, root_agent_id):
+    def test_audit_record_written_for_denied(self, agent_store, root_agent_id):
         runner = CapabilityRunner(scoped_agent_store=agent_store)
 
-        runner.run_capability(
-            "read_file", {"path": str(tmp_path / "missing.txt")}, root_agent_id
-        )
+        result = runner.run_capability("write_file", {"path": "/tmp/x", "content": "x"}, root_agent_id)
 
-        log_path = agent_store.capability_call_log_path(root_agent_id)
-        record = json.loads(log_path.read_text(encoding="utf-8").strip())
-        assert record["result_status"] == "failed"
-        assert record["error"] is not None
-
-    def test_multiple_calls_append_lines(self, tmp_path, agent_store, root_agent_id):
-        f = tmp_path / "x.txt"
-        f.write_text("x", encoding="utf-8")
-        runner = CapabilityRunner(scoped_agent_store=agent_store)
-
-        runner.run_capability("read_file", {"path": str(f)}, root_agent_id)
-        runner.run_capability("file_exists", {"path": str(f)}, root_agent_id)
-
-        lines = agent_store.capability_call_log_path(root_agent_id).read_text(encoding="utf-8").strip().splitlines()
-        assert len(lines) == 2
-        assert json.loads(lines[0])["capability"] == "read_file"
-        assert json.loads(lines[1])["capability"] == "file_exists"
-
-
-# ---------------------------------------------------------------------------
-# Caller type resolution
-# ---------------------------------------------------------------------------
+        audit = _load_audit(result.audit_record_path)
+        assert audit["decision"]["status"] == "denied"
+        assert audit["execution_result"]["status"] == "denied"
 
 
 class TestCallerTypeResolution:

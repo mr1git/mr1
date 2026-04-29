@@ -58,7 +58,7 @@ def _three_step_spec(tmp_path) -> dict:
                 "title": "Python version",
                 "task_kind": "tool",
                 "tool_type": "shell_command",
-                "tool_config": {"argv": ["python3", "--version"]},
+                "tool_config": {"argv": ["python3", "--version"], "cwd": str(tmp_path)},
             },
             {
                 "label": "summarize",
@@ -92,7 +92,7 @@ def _complex_spec(tmp_path) -> dict:
                 "title": "Python version",
                 "task_kind": "tool",
                 "tool_type": "shell_command",
-                "tool_config": {"argv": ["python3", "--version"]},
+                "tool_config": {"argv": ["python3", "--version"], "cwd": str(tmp_path)},
             },
             {
                 "label": "summarize",
