@@ -39,6 +39,7 @@ from mr1.capability_policy import (
     CapabilityApprovalStore,
 )
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
+from mr1.doctor import create_snapshot, filter_doctor_report, inspect_snapshot, list_snapshots, run_doctor
 from mr1.event_log import EventLog, SystemEvent, bind_correlation_id, cli_correlation_id
 from mr1.inbox_triage import InboxTriagePolicy, InboxTriageResult, InboxTriageRunner
 from mr1.messages import MessageStore, PersistentMessage
@@ -1504,6 +1505,107 @@ def _format_memory_insight_effectiveness(
     return _render_table(rows)
 
 
+def _format_doctor_report(
+    report: Any,
+    *,
+    json_output: bool = False,
+    errors_only: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(report.to_dict(), indent=2, sort_keys=True)
+    display_report = filter_doctor_report(report, errors_only=errors_only)
+    if not display_report.checks:
+        return "No matching doctor checks."
+    rows = [("STATUS", "CATEGORY", "CHECK", "SUMMARY")]
+    for item in display_report.checks:
+        rows.append((
+            item.status.upper(),
+            item.category,
+            item.title,
+            item.summary,
+        ))
+    recommendations: list[str] = []
+    seen: set[str] = set()
+    for item in display_report.checks:
+        for recommendation in item.recommendations:
+            if recommendation in seen:
+                continue
+            seen.add(recommendation)
+            recommendations.append(recommendation)
+    lines = [_render_table(rows)]
+    if recommendations:
+        lines.append("")
+        lines.append("Recommendations:")
+        for recommendation in recommendations:
+            lines.append(f"- {recommendation}")
+    return "\n".join(lines)
+
+
+def _ordered_snapshot_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    ordered: dict[str, Any] = {}
+    for key in (
+        "snapshot_id",
+        "created_at",
+        "source_root",
+        "doctor_status_at_creation",
+        "latest_event_index",
+        "file_count",
+        "total_bytes",
+        "included_paths",
+        "errors",
+    ):
+        if key in payload:
+            ordered[key] = payload[key]
+    for key in sorted(set(payload) - set(ordered)):
+        ordered[key] = payload[key]
+    return ordered
+
+
+def _format_snapshot_manifest(payload: dict[str, Any], *, json_output: bool = False) -> str:
+    ordered = _ordered_snapshot_manifest(payload)
+    if json_output:
+        return json.dumps(ordered, indent=2, sort_keys=True)
+    lines = [
+        f"snapshot_id:               {ordered.get('snapshot_id', '-')}",
+        f"created_at:                {ordered.get('created_at', '-')}",
+        f"source_root:               {ordered.get('source_root', '-')}",
+        f"doctor_status_at_creation: {ordered.get('doctor_status_at_creation', '-')}",
+        f"latest_event_index:        {ordered.get('latest_event_index', '-')}",
+        f"file_count:                {ordered.get('file_count', '-')}",
+        f"total_bytes:               {ordered.get('total_bytes', '-')}",
+        "included_paths:",
+    ]
+    included = ordered.get("included_paths") or []
+    if included:
+        for item in included:
+            lines.append(f"  - {item}")
+    else:
+        lines.append("  -")
+    lines.append("errors:")
+    errors = ordered.get("errors") or []
+    if errors:
+        for item in errors:
+            lines.append(f"  - {item}")
+    else:
+        lines.append("  -")
+    return "\n".join(lines)
+
+
+def _format_snapshot_list(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "No snapshots."
+    rows = [("SNAPSHOT_ID", "CREATED_AT", "DOCTOR_STATUS", "FILES", "BYTES")]
+    for item in items:
+        rows.append((
+            str(item.get("snapshot_id", "-")),
+            str(item.get("created_at", "-")),
+            str(item.get("doctor_status_at_creation", "-")),
+            str(item.get("file_count", "-")),
+            str(item.get("total_bytes", "-")),
+        ))
+    return _render_table(rows)
+
+
 def _config_shape_for_tool(registry: ToolRegistry, tool_type: str) -> str:
     for tool in registry.list_tools():
         if tool.tool_type == tool_type:
@@ -1616,6 +1718,10 @@ def _graph_store_for(store: WorkflowStore) -> MemoryGraphStore:
 
 def _insight_store_for(store: WorkflowStore) -> InsightStore:
     return InsightStore(store.root.parent / "insights")
+
+
+def _runtime_root_for(store: WorkflowStore) -> Path:
+    return store.root.parent
 
 
 def _load_memory_graph(store: WorkflowStore) -> tuple[MemoryGraph, int]:
@@ -3253,6 +3359,71 @@ def _cmd_memory_feedback_insight(
     return 0
 
 
+def _cmd_doctor(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        report = run_doctor(_runtime_root_for(store), categories=list(args.categories or []))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_doctor_report(report, json_output=args.json, errors_only=bool(args.errors_only)))
+    return 0
+
+
+def _cmd_snapshot_create(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        manifest = create_snapshot(
+            _runtime_root_for(store),
+            fail_on_error=bool(args.fail_on_error),
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_snapshot_manifest(manifest))
+    return 0
+
+
+def _cmd_snapshot_list(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del args, caller_agent_id, scoped_agents
+    print(_format_snapshot_list(list_snapshots(_runtime_root_for(store))))
+    return 0
+
+
+def _cmd_snapshot_inspect(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        payload = inspect_snapshot(_runtime_root_for(store), args.snapshot_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_snapshot_manifest(payload, json_output=bool(args.json)))
+    return 0
+
+
 def _cmd_memory_maintenance_spec(
     args: argparse.Namespace,
     store: WorkflowStore,
@@ -3618,6 +3789,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_events.add_argument("--task", default=None, dest="task")
     p_events.add_argument("--limit", type=int, default=None)
     p_events.set_defaults(func=_cmd_events)
+
+    p_doctor = subs.add_parser("doctor", help="Run deterministic runtime health checks.")
+    p_doctor.add_argument("--category", action="append", dest="categories", default=[])
+    p_doctor.add_argument("--errors-only", action="store_true")
+    add_common_flags(p_doctor, include_example=False)
+    p_doctor.set_defaults(func=_cmd_doctor)
+
+    p_snapshot = subs.add_parser("snapshot", help="Create and inspect runtime snapshots.")
+    snapshot_subs = p_snapshot.add_subparsers(dest="snapshot_command", required=True)
+
+    p_snapshot_create = snapshot_subs.add_parser("create", help="Create a read-only runtime snapshot.")
+    p_snapshot_create.add_argument("--fail-on-error", action="store_true")
+    p_snapshot_create.set_defaults(func=_cmd_snapshot_create)
+
+    p_snapshot_list = snapshot_subs.add_parser("list", help="List complete runtime snapshots.")
+    p_snapshot_list.set_defaults(func=_cmd_snapshot_list)
+
+    p_snapshot_inspect = snapshot_subs.add_parser("inspect", help="Inspect one runtime snapshot manifest.")
+    p_snapshot_inspect.add_argument("snapshot_id")
+    p_snapshot_inspect.add_argument("--json", action="store_true", dest="json")
+    p_snapshot_inspect.set_defaults(func=_cmd_snapshot_inspect)
 
     p_timeline = subs.add_parser("timeline", help="Inspect the unified runtime timeline.")
     timeline_subs = p_timeline.add_subparsers(dest="timeline_command", required=True)
@@ -4043,6 +4235,7 @@ def main(
     command_name = " ".join(
         item for item in [
             getattr(args, "command", None),
+            getattr(args, "snapshot_command", None),
             getattr(args, "timeline_command", None),
             getattr(args, "approvals_command", None),
             getattr(args, "capability_audit_command", None),
