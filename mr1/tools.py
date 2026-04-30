@@ -17,6 +17,14 @@ from typing import Any, Optional, Protocol
 
 from mr1.capability_policy import normalize_path
 from mr1.dataflow import Artifact, new_artifact_id
+from mr1.memory_queries import (
+    memory_graph_agent_summary,
+    memory_graph_capabilities,
+    memory_graph_failures,
+    memory_graph_top_workflows,
+    memory_insight_show,
+    memory_insights_search,
+)
 from mr1.workflow_models import Task, Workflow
 from mr1.workflow_store import WorkflowStore
 
@@ -383,6 +391,212 @@ class ShellCommandTool:
             )
 
 
+class MemoryInsightsSearchTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        query = config.get("query")
+        if query is not None and not isinstance(query, str):
+            raise ToolConfigError("memory_insights_search query must be a string")
+        types = config.get("types")
+        if types is not None:
+            if not isinstance(types, list) or any(not isinstance(item, str) or not item.strip() for item in types):
+                raise ToolConfigError("memory_insights_search types must be a list of non-empty strings")
+        status = config.get("status")
+        if status is not None and (not isinstance(status, str) or not status.strip()):
+            raise ToolConfigError("memory_insights_search status must be a non-empty string")
+        limit = config.get("limit")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+            raise ToolConfigError("memory_insights_search limit must be an integer >= 0")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del workflow
+        result = memory_insights_search(
+            store.root.parent,
+            query=task.tool_config.get("query"),
+            types=task.tool_config.get("types"),
+            status=task.tool_config.get("status"),
+            limit=task.tool_config.get("limit"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary=f"found {result['count']} insight(s)",
+            text="",
+            data=result,
+        )
+
+
+class MemoryInsightShowTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        insight_id = config.get("insight_id")
+        if not isinstance(insight_id, str) or not insight_id.strip():
+            raise ToolConfigError("memory_insight_show requires tool_config.insight_id")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del workflow
+        result = memory_insight_show(
+            store.root.parent,
+            insight_id=task.tool_config.get("insight_id"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary="memory insight loaded" if result["found"] else "memory insight not found",
+            text="",
+            data=result,
+        )
+
+
+class MemoryGraphTopWorkflowsTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        limit = config.get("limit")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+            raise ToolConfigError("memory_graph_top_workflows limit must be an integer >= 0")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del workflow
+        result = memory_graph_top_workflows(
+            store.root.parent,
+            limit=task.tool_config.get("limit"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary=f"found {result['count']} workflow template(s)",
+            text="",
+            data=result,
+        )
+
+
+class MemoryGraphCapabilitiesTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        limit = config.get("limit")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+            raise ToolConfigError("memory_graph_capabilities limit must be an integer >= 0")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del workflow
+        result = memory_graph_capabilities(
+            store.root.parent,
+            limit=task.tool_config.get("limit"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary=f"found {result['count']} capability node(s)",
+            text="",
+            data=result,
+        )
+
+
+class MemoryGraphFailuresTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        limit = config.get("limit")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+            raise ToolConfigError("memory_graph_failures limit must be an integer >= 0")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del workflow
+        result = memory_graph_failures(
+            store.root.parent,
+            limit=task.tool_config.get("limit"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary=f"found {result['count']} failure mode(s)",
+            text="",
+            data=result,
+        )
+
+
+class MemoryGraphAgentSummaryTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        agent_id = config.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ToolConfigError("memory_graph_agent_summary requires tool_config.agent_id")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del workflow
+        result = memory_graph_agent_summary(
+            store.root.parent,
+            agent_id=task.tool_config.get("agent_id"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary="agent summary loaded" if result["found"] else "agent summary not found",
+            text="",
+            data=result,
+        )
+
+
+class MemoryGraphUpdateTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        if not isinstance(config, dict):
+            raise ToolConfigError("memory_graph_update tool_config must be a JSON object")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        from mr1.event_log import EventLog
+        from mr1.memory_feedback import run_memory_graph_update
+        from mr1.memory_graph import MemoryGraphStore
+
+        del task, workflow
+        result = run_memory_graph_update(
+            event_log=EventLog(store.root.parent / "events"),
+            graph_store=MemoryGraphStore(store.root.parent / "graph"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary=f"processed {result['processed_events']} event(s) into graph memory",
+            text="",
+            data=result,
+        )
+
+
+class MemoryCurateTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        if not isinstance(config, dict):
+            raise ToolConfigError("memory_curate tool_config must be a JSON object")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        from mr1.event_log import EventLog
+        from mr1.memory_curator import InsightStore
+        from mr1.memory_feedback import run_memory_curate
+        from mr1.memory_graph import MemoryGraphStore
+
+        del workflow
+        result = run_memory_curate(
+            event_log=EventLog(store.root.parent / "events"),
+            graph_store=MemoryGraphStore(store.root.parent / "graph"),
+            insight_store=InsightStore(store.root.parent / "insights"),
+            trigger_reason=f"workflow:{task.workflow_id}:memory_curate",
+        )
+        return ToolResult(
+            state="succeeded",
+            summary=f"memory curate run status: {result['status']}",
+            text="",
+            data=result,
+        )
+
+
+class MemoryFeedbackUpdateTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        if not isinstance(config, dict):
+            raise ToolConfigError("memory_feedback_update tool_config must be a JSON object")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        from mr1.event_log import EventLog
+        from mr1.memory_curator import InsightStore
+        from mr1.memory_feedback import update_insight_feedback
+
+        del task, workflow
+        result = update_insight_feedback(
+            event_log=EventLog(store.root.parent / "events"),
+            insight_store=InsightStore(store.root.parent / "insights"),
+            workflow_store=store,
+        ).to_dict()
+        return ToolResult(
+            state="succeeded",
+            summary=f"created {result['feedback_created']} insight feedback record(s)",
+            text="",
+            data=result,
+        )
+
+
 class ToolRegistry:
     def __init__(self):
         self._definitions: dict[str, ToolDefinition] = {}
@@ -558,6 +772,219 @@ def default_tool_registry() -> ToolRegistry:
                         "argv": ["python3", "--version"],
                         "cwd": ".",
                     },
+                }
+            ],
+        )
+        registry.register(
+            "memory_insights_search",
+            MemoryInsightsSearchTool(),
+            description="Search curated MR1 memory insights using deterministic substring matching and ranking.",
+            config_shape='{"query": "file access approval friction", "types": ["capability_friction"], "status": "active", "limit": 5}',
+            config_schema={
+                "query": {"type": "string", "required": False},
+                "types": {"type": "list[string]", "required": False},
+                "status": {"type": "string", "required": False, "default": "active"},
+                "limit": {"type": "int", "required": False, "default": 5},
+            },
+            outputs={
+                "result.data.items": "compact matching insight records",
+                "result.data.count": "number of returned insights",
+                "result.data.query": "normalized search query",
+                "result.data.types": "requested insight type filters",
+                "result.data.status": "status filter used",
+                "result.data.limit": "applied result limit",
+            },
+            examples=[
+                {
+                    "label": "search_memory_insights",
+                    "title": "Search memory insights",
+                    "task_kind": "tool",
+                    "tool_type": "memory_insights_search",
+                    "tool_config": {
+                        "query": "file access approval friction",
+                        "limit": 5,
+                    },
+                }
+            ],
+        )
+        registry.register(
+            "memory_insight_show",
+            MemoryInsightShowTool(),
+            description="Show one curated MR1 memory insight by id.",
+            config_shape='{"insight_id": "insight:capability_friction:capability:read_file"}',
+            config_schema={
+                "insight_id": {"type": "string", "required": False},
+            },
+            outputs={
+                "result.data.found": "true when the requested insight exists",
+                "result.data.insight": "full insight object or null when not found",
+            },
+            examples=[
+                {
+                    "label": "show_memory_insight",
+                    "title": "Show memory insight",
+                    "task_kind": "tool",
+                    "tool_type": "memory_insight_show",
+                    "tool_config": {
+                        "insight_id": "insight:capability_friction:capability:read_file",
+                    },
+                }
+            ],
+        )
+        registry.register(
+            "memory_graph_top_workflows",
+            MemoryGraphTopWorkflowsTool(),
+            description="List top workflow templates from deterministic graph memory.",
+            config_shape='{"limit": 5}',
+            config_schema={
+                "limit": {"type": "int", "required": False, "default": 5},
+            },
+            outputs={
+                "result.data.items": "workflow template summaries ordered by credibility",
+                "result.data.count": "number of returned workflow templates",
+            },
+            examples=[
+                {
+                    "label": "top_workflow_templates",
+                    "title": "Top workflow templates",
+                    "task_kind": "tool",
+                    "tool_type": "memory_graph_top_workflows",
+                    "tool_config": {"limit": 5},
+                }
+            ],
+        )
+        registry.register(
+            "memory_graph_capabilities",
+            MemoryGraphCapabilitiesTool(),
+            description="List capability usage statistics from deterministic graph memory.",
+            config_shape='{"limit": 10}',
+            config_schema={
+                "limit": {"type": "int", "required": False, "default": 10},
+            },
+            outputs={
+                "result.data.items": "capability node summaries ordered by request count",
+                "result.data.count": "number of returned capability summaries",
+            },
+            examples=[
+                {
+                    "label": "memory_capabilities",
+                    "title": "Memory capability stats",
+                    "task_kind": "tool",
+                    "tool_type": "memory_graph_capabilities",
+                    "tool_config": {"limit": 10},
+                }
+            ],
+        )
+        registry.register(
+            "memory_graph_failures",
+            MemoryGraphFailuresTool(),
+            description="List common failure modes from deterministic graph memory.",
+            config_shape='{"limit": 10}',
+            config_schema={
+                "limit": {"type": "int", "required": False, "default": 10},
+            },
+            outputs={
+                "result.data.items": "failure mode node summaries ordered by occurrence count",
+                "result.data.count": "number of returned failure summaries",
+            },
+            examples=[
+                {
+                    "label": "memory_failures",
+                    "title": "Memory failure stats",
+                    "task_kind": "tool",
+                    "tool_type": "memory_graph_failures",
+                    "tool_config": {"limit": 10},
+                }
+            ],
+        )
+        registry.register(
+            "memory_graph_agent_summary",
+            MemoryGraphAgentSummaryTool(),
+            description="Show one agent summary from deterministic graph memory.",
+            config_shape='{"agent_id": "ag-123"}',
+            config_schema={
+                "agent_id": {"type": "string", "required": False},
+            },
+            outputs={
+                "result.data.found": "true when the agent exists in graph memory",
+                "result.data.summary": "full graph summary object or null when not found",
+            },
+            examples=[
+                {
+                    "label": "memory_agent_summary",
+                    "title": "Memory agent summary",
+                    "task_kind": "tool",
+                    "tool_type": "memory_graph_agent_summary",
+                    "tool_config": {"agent_id": "ag-123"},
+                }
+            ],
+        )
+        registry.register(
+            "memory_graph_update",
+            MemoryGraphUpdateTool(),
+            description="Update deterministic graph memory from timeline events.",
+            config_shape='{}',
+            config_schema={},
+            outputs={
+                "result.data.processed_events": "number of timeline events processed",
+                "result.data.last_processed_event_index": "last processed graph cursor index",
+                "result.data.nodes_created": "number of graph nodes created",
+                "result.data.nodes_updated": "number of graph nodes updated",
+                "result.data.edges_created": "number of graph edges created",
+                "result.data.edges_updated": "number of graph edges updated",
+            },
+            examples=[
+                {
+                    "label": "memory_graph_update",
+                    "title": "Update graph memory",
+                    "task_kind": "tool",
+                    "tool_type": "memory_graph_update",
+                    "tool_config": {},
+                }
+            ],
+        )
+        registry.register(
+            "memory_curate",
+            MemoryCurateTool(),
+            description="Run one bounded memory curation pass.",
+            config_shape='{}',
+            config_schema={},
+            outputs={
+                "result.data.status": "curation run status",
+                "result.data.run_id": "curation run id",
+                "result.data.output_insight_ids": "curated insight ids written by the run",
+                "result.data.errors": "non-fatal or fatal curation errors",
+            },
+            examples=[
+                {
+                    "label": "memory_curate",
+                    "title": "Curate memory insights",
+                    "task_kind": "tool",
+                    "tool_type": "memory_curate",
+                    "tool_config": {},
+                }
+            ],
+        )
+        registry.register(
+            "memory_feedback_update",
+            MemoryFeedbackUpdateTool(),
+            description="Evaluate workflow outcomes against memory insights and update feedback stats.",
+            config_shape='{}',
+            config_schema={},
+            outputs={
+                "result.data.processed_events": "number of relevant events processed",
+                "result.data.feedback_created": "number of feedback records created",
+                "result.data.insights_updated": "number of insights updated",
+                "result.data.last_evaluated_event_index": "last feedback cursor index",
+                "result.data.errors": "non-fatal feedback processing errors",
+            },
+            examples=[
+                {
+                    "label": "memory_feedback_update",
+                    "title": "Update insight feedback",
+                    "task_kind": "tool",
+                    "tool_type": "memory_feedback_update",
+                    "tool_config": {},
                 }
             ],
         )

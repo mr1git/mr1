@@ -14,7 +14,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from mr1.agents import (
     AgentRuntimeError,
@@ -41,6 +41,9 @@ from mr1.memory_graph import (
 
 
 CuratorFn = Callable[[str, str], str]
+
+if TYPE_CHECKING:
+    from mr1.memory_feedback import InsightFeedback
 
 IMPORTANT_EVENT_TYPES = frozenset({
     "workflow_failed",
@@ -174,6 +177,44 @@ def _normalized_text(value: Any) -> str:
     return " ".join(str(value or "").strip().split()).lower()
 
 
+def default_insight_stats() -> dict[str, Any]:
+    return {
+        "used_count": 0,
+        "positive_outcome_count": 0,
+        "negative_outcome_count": 0,
+        "neutral_outcome_count": 0,
+        "effectiveness_score": 0.0,
+        "last_used_at": None,
+        "last_feedback_at": None,
+    }
+
+
+def _normalize_insight_stats(value: Any) -> dict[str, Any]:
+    stats = default_insight_stats()
+    if not isinstance(value, dict):
+        return stats
+    for key in (
+        "used_count",
+        "positive_outcome_count",
+        "negative_outcome_count",
+        "neutral_outcome_count",
+    ):
+        raw = value.get(key, stats[key])
+        try:
+            stats[key] = max(0, int(raw))
+        except (TypeError, ValueError):
+            stats[key] = default_insight_stats()[key]
+    try:
+        score = float(value.get("effectiveness_score", 0.0))
+    except (TypeError, ValueError):
+        score = 0.0
+    stats["effectiveness_score"] = max(0.0, min(1.0, score))
+    for key in ("last_used_at", "last_feedback_at"):
+        raw = value.get(key)
+        stats[key] = raw if isinstance(raw, str) and raw.strip() else None
+    return stats
+
+
 def _snippet(text: str, *, limit: int = 240) -> str:
     compact = " ".join(str(text).split())
     if len(compact) > limit:
@@ -285,6 +326,7 @@ class MemoryInsight:
     created_at: str
     updated_at: str
     status: str
+    stats: dict[str, Any] = field(default_factory=default_insight_stats)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -296,6 +338,8 @@ class MemoryInsight:
             raise ValueError(f"invalid status '{self.status}'")
         if not 0.0 <= float(self.confidence) <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0")
+        if not isinstance(self.stats, dict):
+            raise ValueError("stats must be a dict")
         if not isinstance(self.metadata, dict):
             raise ValueError("metadata must be a dict")
         if not isinstance(self.evidence, list) or not self.evidence:
@@ -304,6 +348,7 @@ class MemoryInsight:
             raise ValueError("evidence must contain EvidenceRef values")
         if any(not isinstance(item, str) or not item for item in self.related_nodes):
             raise ValueError("related_nodes must contain non-empty strings")
+        self.stats = _normalize_insight_stats(self.stats)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -319,6 +364,7 @@ class MemoryInsight:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "status": self.status,
+            "stats": dict(self.stats),
             "metadata": dict(self.metadata),
         }
 
@@ -337,6 +383,7 @@ class MemoryInsight:
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             status=data["status"],
+            stats=_normalize_insight_stats(data.get("stats")),
             metadata=dict(data.get("metadata", {})),
         )
 
@@ -474,6 +521,14 @@ class InsightStore:
     def runs_path(self) -> Path:
         return self._root / "curation_runs.jsonl"
 
+    @property
+    def feedback_path(self) -> Path:
+        return self._root / "feedback.jsonl"
+
+    @property
+    def feedback_cursor_path(self) -> Path:
+        return self._root / "feedback_cursor.json"
+
     def load_cursor(self) -> int:
         if not self.cursor_path.exists():
             return 0
@@ -538,6 +593,62 @@ class InsightStore:
             raise ValueError(f"corrupt curation run log: {self.runs_path}") from exc
         runs.sort(key=lambda item: (item.started_at, item.run_id), reverse=True)
         return runs if limit is None else runs[:limit]
+
+    def load_feedback_cursor(self) -> int:
+        if not self.feedback_cursor_path.exists():
+            return 0
+        try:
+            payload = json.loads(self.feedback_cursor_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("feedback cursor payload must be an object")
+            value = int(payload["last_evaluated_event_index"])
+            if value < 0:
+                raise ValueError("feedback cursor must be >= 0")
+            return value
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"corrupt feedback cursor file: {self.feedback_cursor_path}") from exc
+
+    def save_feedback_cursor(self, last_evaluated_event_index: int) -> None:
+        self._write_json_file(
+            self.feedback_cursor_path,
+            {"last_evaluated_event_index": int(last_evaluated_event_index)},
+        )
+
+    def feedback_exists(self, feedback_id: str) -> bool:
+        return any(item.feedback_id == feedback_id for item in self.load_feedback())
+
+    def append_feedback(self, feedback: "InsightFeedback") -> None:
+        with open(self.feedback_path, "a", encoding="utf-8") as handle:
+            handle.write(_canonical_json(feedback.to_dict()) + "\n")
+
+    def load_feedback(
+        self,
+        *,
+        limit: Optional[int] = None,
+        insight_id: Optional[str] = None,
+    ) -> list["InsightFeedback"]:
+        if not self.feedback_path.exists():
+            return []
+        from mr1.memory_feedback import InsightFeedback
+
+        items: list[InsightFeedback] = []
+        try:
+            with open(self.feedback_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        continue
+                    item = InsightFeedback.from_dict(payload)
+                    if insight_id is not None and item.insight_id != insight_id:
+                        continue
+                    items.append(item)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"corrupt insight feedback log: {self.feedback_path}") from exc
+        items.sort(key=lambda item: (item.created_at, item.feedback_id), reverse=True)
+        return items if limit is None else items[:limit]
 
     def _write_json_file(self, path: Path, payload: Any) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1143,6 +1254,6 @@ def _upsert_insight(
         created_at=existing.created_at,
         updated_at=candidate.updated_at,
         status=preserved_status,
+        stats=dict(existing.stats),
         metadata=dict(candidate.metadata),
     )
-

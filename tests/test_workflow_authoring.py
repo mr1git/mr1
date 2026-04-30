@@ -257,6 +257,7 @@ class TestCompilerAgentBackend:
             "risks": ["summary may omit nuance"],
             "needs_confirmation": True,
             "confidence": "medium",
+            "memory_refs_used": [],
         }))
         root_agent_id = scheduler._scoped_agents.root_agent_id
         service = WorkflowAuthoringService(

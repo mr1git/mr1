@@ -723,6 +723,15 @@ class MRnStepRunner:
                 created_by=Provenance(type="agent", id=agent.agent_id),
                 caller_agent_id=agent.agent_id,
                 owner_agent_id=agent.agent_id,
+                workflow_metadata=(
+                    {
+                        "compiled_with_memory": compiled.compiled_with_memory,
+                        "memory_refs_used": list(compiled.envelope.memory_refs_used),
+                        "memory_tools_used": list(compiled.memory_tools_used or []),
+                        "memory_context_summary": compiled.memory_context_summary,
+                    }
+                    if client is not None else None
+                ),
             )
             created_workflow = self._workflow_store.load_workflow(submission.workflow_id)
             return self._persist_step(

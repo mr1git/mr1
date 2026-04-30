@@ -177,6 +177,7 @@ class TestWorkflow:
             title="Demo",
             status=WorkflowStatus.RUNNING,
             created_by=Provenance(type="user", id="cli"),
+            metadata={"compiled_with_memory": True, "memory_refs_used": ["insight:x"]},
             tasks={t.task_id: t},
             label_to_task_id={"a": t.task_id},
         )
@@ -185,6 +186,7 @@ class TestWorkflow:
         assert wf2.to_dict() == data
         assert wf2.task_by_label("a") is not None
         assert wf2.task_by_label("a").title == "Task A"
+        assert wf2.metadata == {"compiled_with_memory": True, "memory_refs_used": ["insight:x"]}
 
     def test_missing_label_returns_none(self):
         wf = Workflow(workflow_id="wf-1", title="x")

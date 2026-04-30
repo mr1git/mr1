@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from mr1.kazi_runner import MockRunner
+from mr1.memory_curator import EvidenceRef, InsightStore, MemoryInsight
+from mr1.memory_graph import MemoryGraph, MemoryGraphStore, MemoryNode, agent_node_id
 from mr1.mr1 import MR1, MR1Process, StateManager
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.scheduler import Scheduler, WorkflowSpecError, submit_spec_to_disk
@@ -46,6 +48,7 @@ def _envelope(
     risks: list[str] | None = None,
     needs_confirmation: bool = False,
     confidence: str = "high",
+    memory_refs_used: list[str] | None = None,
 ) -> str:
     return json.dumps({
         "preview": preview,
@@ -54,6 +57,7 @@ def _envelope(
         "risks": risks or [],
         "needs_confirmation": needs_confirmation,
         "confidence": confidence,
+        "memory_refs_used": memory_refs_used or [],
     })
 
 
@@ -67,6 +71,35 @@ class FakeCompiler:
         if not self._responses:
             raise AssertionError("no compiler responses configured")
         return self._responses.pop(0)
+
+
+def _seed_memory(tmp_path):
+    InsightStore(tmp_path / "insights").save_insights({
+        "insight:capability_friction:capability:read_file": MemoryInsight(
+            insight_id="insight:capability_friction:capability:read_file",
+            insight_type="capability_friction",
+            title="read_file friction",
+            summary="Use narrower read scopes",
+            confidence=0.9,
+            severity="WARNING",
+            recommended_action="consider narrowing scope",
+            evidence=[EvidenceRef(source_type="query", source_id="query:test", reason="fixture")],
+            related_nodes=["capability:read_file"],
+            created_at="2026-04-20T00:00:00+00:00",
+            updated_at="2026-04-20T00:00:00+00:00",
+            status="active",
+            metadata={"capability_id": "capability:read_file"},
+        )
+    })
+    MemoryGraphStore(tmp_path / "graph").save_graph(MemoryGraph(
+        nodes={
+            agent_node_id("ag-root"): MemoryNode(
+                node_id=agent_node_id("ag-root"),
+                node_type="Agent",
+                name="MR1",
+            )
+        }
+    ))
 
 
 @pytest.fixture
@@ -159,13 +192,19 @@ def test_submit_if_valid_submits_through_scoped_owner_path(tmp_path, workflow_st
     child = agent_store.create_child_agent(root.agent_id, "research")
     compiler = FakeCompiler(_envelope(_spec(tmp_path)))
 
-    def _submitter(spec: dict, caller_agent_id: str, owner_agent_id: str) -> tuple[str, str]:
+    def _submitter(
+        spec: dict,
+        caller_agent_id: str,
+        owner_agent_id: str,
+        workflow_metadata: dict | None,
+    ) -> tuple[str, str]:
         workflow_id = submit_spec_to_disk(
             spec,
             Provenance(type="user", id="cli"),
             workflow_store,
             owner_agent_id=owner_agent_id,
             caller_agent_id=caller_agent_id,
+            workflow_metadata=workflow_metadata,
             scoped_agent_store=agent_store,
         )
         return workflow_id, workflow_id
@@ -196,13 +235,19 @@ def test_compiler_cannot_submit_outside_caller_scope(tmp_path, workflow_store, a
     right = agent_store.create_child_agent(root.agent_id, "right")
     compiler = FakeCompiler(_envelope(_spec(tmp_path)))
 
-    def _submitter(spec: dict, caller_agent_id: str, owner_agent_id: str) -> tuple[str, str]:
+    def _submitter(
+        spec: dict,
+        caller_agent_id: str,
+        owner_agent_id: str,
+        workflow_metadata: dict | None,
+    ) -> tuple[str, str]:
         workflow_id = submit_spec_to_disk(
             spec,
             Provenance(type="user", id="cli"),
             workflow_store,
             owner_agent_id=owner_agent_id,
             caller_agent_id=caller_agent_id,
+            workflow_metadata=workflow_metadata,
             scoped_agent_store=agent_store,
         )
         return workflow_id, workflow_id
@@ -252,3 +297,151 @@ def test_compiler_preview_is_preserved_and_show_json_returns_spec(tmp_path):
 
     raw_json = mr1_instance.step("show json")
     assert raw_json == json.dumps(mr1_instance._state.pending_workflow["spec"], indent=2)
+
+
+def test_preview_pending_draft_preserves_memory_fields(tmp_path):
+    compiler = FakeCompiler(_envelope(
+        _spec(tmp_path),
+        needs_confirmation=True,
+        memory_refs_used=["insight:capability_friction:capability:read_file"],
+    ))
+    mr1_instance = MR1(
+        workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+        workflow_runner=MockRunner(),
+        workflow_auto_tick=False,
+        workflow_authoring_backend="compiler_agent",
+        workflow_compiler=compiler,
+    )
+    mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+    mr1_instance._process = MagicMock(spec=MR1Process)
+    mr1_instance._process.alive = True
+
+    mr1_instance.step("read notes and summarize them")
+
+    pending = mr1_instance._state.pending_workflow
+    assert pending is not None
+    assert pending["memory_refs_used"] == ["insight:capability_friction:capability:read_file"]
+
+
+def test_compile_includes_memory_payload_when_enabled(tmp_path, agent_store):
+    _seed_memory(tmp_path)
+    root = agent_store.ensure_root_agent()
+    compiler = FakeCompiler(_envelope(_spec(tmp_path)))
+    client = WorkflowCompilerClient(compiler=compiler, scoped_agent_store=agent_store)
+
+    result = client.compile(
+        "read notes and summarize them",
+        "test context",
+        root.agent_id,
+        root.agent_id,
+        "preview_only",
+        use_memory=True,
+        memory_limit=3,
+    )
+
+    payload = json.loads(compiler.prompts[0][1])
+    assert payload["memory"]["enabled"] is True
+    assert payload["memory"]["memory_limit"] == 3
+    assert payload["memory"]["tools_used"] == [
+        "memory_insights_search",
+        "memory_graph_top_workflows",
+        "memory_graph_capabilities",
+        "memory_graph_failures",
+        "memory_graph_agent_summary",
+    ]
+    assert result.compiled_with_memory is True
+
+
+def test_compile_omits_memory_payload_when_disabled(tmp_path, agent_store):
+    root = agent_store.ensure_root_agent()
+    compiler = FakeCompiler(_envelope(_spec(tmp_path)))
+    client = WorkflowCompilerClient(compiler=compiler, scoped_agent_store=agent_store)
+
+    client.compile(
+        "read notes and summarize them",
+        "test context",
+        root.agent_id,
+        root.agent_id,
+        "preview_only",
+        use_memory=False,
+    )
+
+    payload = json.loads(compiler.prompts[0][1])
+    assert payload["memory"]["enabled"] is False
+    assert payload["memory"]["prefetched_context"] == {}
+
+
+def test_unknown_memory_refs_produce_warnings_without_failure(tmp_path, agent_store):
+    root = agent_store.ensure_root_agent()
+    compiler = FakeCompiler(json.dumps({
+        "preview": "Read notes, then summarize them.",
+        "spec": _spec(tmp_path),
+        "assumptions": [],
+        "risks": [],
+        "needs_confirmation": False,
+        "confidence": "high",
+        "memory_refs_used": ["insight:missing"],
+    }))
+    client = WorkflowCompilerClient(compiler=compiler, scoped_agent_store=agent_store)
+
+    result = client.compile(
+        "read notes and summarize them",
+        "test context",
+        root.agent_id,
+        root.agent_id,
+        "preview_only",
+    )
+
+    assert result.envelope.memory_refs_used == ["insight:missing"]
+    assert result.memory_ref_warnings == ["unknown memory ref: insight:missing"]
+
+
+def test_submit_if_valid_persists_workflow_memory_metadata(tmp_path, workflow_store, agent_store):
+    _seed_memory(tmp_path)
+    root = agent_store.ensure_root_agent()
+    compiler = FakeCompiler(json.dumps({
+        "preview": "Read notes, then summarize them.",
+        "spec": _spec(tmp_path),
+        "assumptions": [],
+        "risks": [],
+        "needs_confirmation": False,
+        "confidence": "high",
+        "memory_refs_used": ["insight:capability_friction:capability:read_file"],
+    }))
+
+    def _submitter(
+        spec: dict,
+        caller_agent_id: str,
+        owner_agent_id: str,
+        workflow_metadata: dict | None,
+    ) -> tuple[str, str]:
+        workflow_id = submit_spec_to_disk(
+            spec,
+            Provenance(type="user", id="cli"),
+            workflow_store,
+            owner_agent_id=owner_agent_id,
+            caller_agent_id=caller_agent_id,
+            workflow_metadata=workflow_metadata,
+            scoped_agent_store=agent_store,
+        )
+        return workflow_id, workflow_id
+
+    client = WorkflowCompilerClient(
+        compiler=compiler,
+        scoped_agent_store=agent_store,
+        submitter=_submitter,
+    )
+
+    result = client.compile(
+        "read notes and summarize them",
+        "test context",
+        root.agent_id,
+        root.agent_id,
+        "submit_if_valid",
+        use_memory=True,
+    )
+
+    workflow = workflow_store.load_workflow(result.workflow_id)
+    assert workflow is not None
+    assert workflow.metadata["compiled_with_memory"] is True
+    assert workflow.metadata["memory_refs_used"] == ["insight:capability_friction:capability:read_file"]

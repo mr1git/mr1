@@ -33,6 +33,7 @@ def _make_workflow(wf_id: str = "wf-test") -> Workflow:
         title="Test workflow",
         status=WorkflowStatus.PENDING,
         created_by=Provenance(type="user", id="cli"),
+        metadata={"compiled_with_memory": True, "memory_refs_used": ["insight:test"]},
         tasks={t.task_id: t},
         label_to_task_id={"a": t.task_id},
     )

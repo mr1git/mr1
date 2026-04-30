@@ -1258,6 +1258,12 @@ class MR1:
                 caller_agent_id=self._root_agent_id,
                 owner_agent_id=self._root_agent_id,
                 target_workflow_id=pending.target_workflow_id,
+                workflow_metadata={
+                    "compiled_with_memory": bool(pending.compiled_with_memory),
+                    "memory_refs_used": list(pending.memory_refs_used),
+                    "memory_tools_used": list(pending.memory_tools_used),
+                    "memory_context_summary": pending.memory_context_summary,
+                },
             )
             self._state.clear_pending_workflow()
             self._state.add_decision(
@@ -1315,6 +1321,7 @@ class MR1:
                 caller_agent_id=self._root_agent_id,
                 owner_agent_id=self._root_agent_id,
                 target_workflow_id=target_workflow_id,
+                workflow_metadata=self._workflow_authoring.workflow_metadata_from_authoring(authoring),
             )
             self._state.clear_pending_workflow()
             self._state.add_decision(
@@ -1335,6 +1342,11 @@ class MR1:
             needs_confirmation=authoring.needs_confirmation,
             confidence=authoring.confidence,
             complexity=authoring.complexity,
+            compiled_with_memory=authoring.compiled_with_memory,
+            memory_refs_used=list(authoring.memory_refs_used),
+            memory_tools_used=list(authoring.memory_tools_used),
+            memory_context_summary=authoring.memory_context_summary,
+            memory_ref_warnings=list(authoring.memory_ref_warnings),
         )
         self._state.set_pending_workflow(draft.to_dict())
         self._state.add_decision(

@@ -92,6 +92,7 @@ def _envelope(spec: dict) -> str:
         "risks": [],
         "needs_confirmation": False,
         "confidence": "high",
+        "memory_refs_used": [],
     })
 
 

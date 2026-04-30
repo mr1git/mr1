@@ -287,6 +287,7 @@ def build_workflow_from_spec(
     spec: dict[str, Any],
     created_by: Provenance,
     owner_agent_id: Optional[str] = None,
+    workflow_metadata: Optional[dict[str, Any]] = None,
     scoped_agent_store: Optional[PersistentAgentStore] = None,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
@@ -319,6 +320,7 @@ def build_workflow_from_spec(
         owner_agent_id=owner_agent.agent_id,
         owner_agent_title=owner_agent.title,
         parent_agent_id=owner_agent.parent_agent_id,
+        metadata=dict(workflow_metadata or {}),
     )
 
     # First pass: create tasks and the label→id map.
@@ -373,6 +375,7 @@ def submit_spec_to_disk(
     store: WorkflowStore,
     owner_agent_id: Optional[str] = None,
     caller_agent_id: Optional[str] = None,
+    workflow_metadata: Optional[dict[str, Any]] = None,
     scoped_agent_store: Optional[PersistentAgentStore] = None,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
@@ -402,6 +405,7 @@ def submit_spec_to_disk(
         spec,
         created_by,
         resolved_owner_agent_id,
+        workflow_metadata=workflow_metadata,
         scoped_agent_store=scoped_agents,
         watcher_registry=watcher_registry,
         tool_registry=tool_registry,
@@ -1337,6 +1341,7 @@ class Scheduler:
         created_by: Provenance,
         owner_agent_id: Optional[str] = None,
         caller_agent_id: Optional[str] = None,
+        workflow_metadata: Optional[dict[str, Any]] = None,
     ) -> str:
         """
         Validate a spec, persist the resulting workflow, and emit
@@ -1348,6 +1353,7 @@ class Scheduler:
             self._store,
             owner_agent_id=owner_agent_id or caller_agent_id or self._scoped_agents.root_agent_id,
             caller_agent_id=caller_agent_id,
+            workflow_metadata=workflow_metadata,
             scoped_agent_store=self._scoped_agents,
             watcher_registry=self._watchers,
             tool_registry=self._tools,

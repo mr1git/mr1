@@ -781,6 +781,7 @@ class TestStep:
                     "risks": [],
                     "needs_confirmation": True,
                     "confidence": "high",
+                    "memory_refs_used": [],
                 }
             )
         )

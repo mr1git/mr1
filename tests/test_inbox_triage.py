@@ -135,6 +135,7 @@ def _compiler_envelope(*, needs_confirmation: bool = False) -> str:
         "risks": ["summary may be incomplete"],
         "needs_confirmation": needs_confirmation,
         "confidence": "medium",
+        "memory_refs_used": [],
     })
 
 

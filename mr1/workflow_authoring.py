@@ -248,6 +248,11 @@ class PendingWorkflowDraft:
     needs_confirmation: bool = True
     confidence: str = "medium"
     complexity: str = "complex"
+    compiled_with_memory: bool = False
+    memory_refs_used: list[str] = field(default_factory=list)
+    memory_tools_used: list[str] = field(default_factory=list)
+    memory_context_summary: str = ""
+    memory_ref_warnings: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=_now_iso)
 
     def to_dict(self) -> dict[str, Any]:
@@ -262,6 +267,11 @@ class PendingWorkflowDraft:
             "needs_confirmation": self.needs_confirmation,
             "confidence": self.confidence,
             "complexity": self.complexity,
+            "compiled_with_memory": self.compiled_with_memory,
+            "memory_refs_used": list(self.memory_refs_used),
+            "memory_tools_used": list(self.memory_tools_used),
+            "memory_context_summary": self.memory_context_summary,
+            "memory_ref_warnings": list(self.memory_ref_warnings),
             "created_at": self.created_at,
         }
 
@@ -278,6 +288,11 @@ class PendingWorkflowDraft:
             needs_confirmation=bool(data.get("needs_confirmation", True)),
             confidence=data.get("confidence", "medium"),
             complexity=data.get("complexity", "complex"),
+            compiled_with_memory=bool(data.get("compiled_with_memory", False)),
+            memory_refs_used=list(data.get("memory_refs_used", [])),
+            memory_tools_used=list(data.get("memory_tools_used", [])),
+            memory_context_summary=data.get("memory_context_summary", ""),
+            memory_ref_warnings=list(data.get("memory_ref_warnings", [])),
             created_at=data.get("created_at", _now_iso()),
         )
 
@@ -315,6 +330,11 @@ class AuthoringResult:
     needs_confirmation: bool
     confidence: str
     complexity: str
+    compiled_with_memory: bool = False
+    memory_refs_used: list[str] = field(default_factory=list)
+    memory_tools_used: list[str] = field(default_factory=list)
+    memory_context_summary: str = ""
+    memory_ref_warnings: list[str] = field(default_factory=list)
 
 
 CompilerFn = Callable[[str, str], str]
@@ -634,6 +654,11 @@ class WorkflowAuthoringService:
                 needs_confirmation=result.envelope.needs_confirmation,
                 confidence=result.envelope.confidence,
                 complexity=complexity,
+                compiled_with_memory=result.compiled_with_memory,
+                memory_refs_used=list(result.envelope.memory_refs_used),
+                memory_tools_used=list(result.memory_tools_used),
+                memory_context_summary=result.memory_context_summary,
+                memory_ref_warnings=list(result.memory_ref_warnings),
             )
 
         spec = self.generate_spec(
@@ -727,6 +752,7 @@ class WorkflowAuthoringService:
         caller_agent_id: Optional[str] = None,
         owner_agent_id: Optional[str] = None,
         target_workflow_id: Optional[str] = None,
+        workflow_metadata: Optional[dict[str, Any]] = None,
     ) -> SubmissionResult:
         spec = self._normalize_compiled_spec(spec)
         if target_workflow_id:
@@ -736,6 +762,7 @@ class WorkflowAuthoringService:
                     workflow,
                     spec,
                     created_by=created_by,
+                    workflow_metadata=workflow_metadata,
                 )
                 if rewritten is not None:
                     return SubmissionResult(
@@ -749,6 +776,7 @@ class WorkflowAuthoringService:
             created_by,
             owner_agent_id=owner_agent_id or caller_agent_id,
             caller_agent_id=caller_agent_id,
+            workflow_metadata=workflow_metadata,
         )
         workflow = self._store.load_workflow(workflow_id)
         if workflow is None:
@@ -758,6 +786,14 @@ class WorkflowAuthoringService:
             message=self._build_submission_message(workflow, in_place=False),
             in_place=False,
         )
+
+    def workflow_metadata_from_authoring(self, authoring: AuthoringResult) -> dict[str, Any]:
+        return {
+            "compiled_with_memory": bool(authoring.compiled_with_memory),
+            "memory_refs_used": list(authoring.memory_refs_used),
+            "memory_tools_used": list(authoring.memory_tools_used),
+            "memory_context_summary": authoring.memory_context_summary,
+        }
 
     def clarify_message(
         self,
@@ -949,6 +985,7 @@ class WorkflowAuthoringService:
         spec: dict[str, Any],
         *,
         created_by: Provenance,
+        workflow_metadata: Optional[dict[str, Any]] = None,
     ) -> Optional[Workflow]:
         if workflow.is_terminal():
             return None
@@ -974,6 +1011,7 @@ class WorkflowAuthoringService:
             created_by=workflow.created_by or created_by,
             created_at=workflow.created_at,
             finished_at=workflow.finished_at,
+            metadata=dict(workflow_metadata) if workflow_metadata is not None else dict(workflow.metadata),
         )
 
         label_to_new_task: dict[str, Task] = {}

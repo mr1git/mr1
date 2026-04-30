@@ -45,14 +45,10 @@ from mr1.messages import MessageStore, PersistentMessage
 from mr1.memory_graph import (
     MemoryGraph,
     MemoryGraphStore,
-    agent_summary,
-    capability_stats,
     file_summary,
-    failure_modes,
     graph_stats,
     project_summary,
     show_node,
-    top_workflow_templates,
     update_graph_from_events,
     workflow_template_summary,
 )
@@ -63,6 +59,23 @@ from mr1.memory_curator import (
     build_memory_curation_bundle,
     evaluate_memory_curation_due,
     run_memory_curation,
+)
+from mr1.memory_feedback import (
+    InsightFeedback,
+    build_memory_maintenance_spec,
+    evaluate_memory_feedback_due,
+    maintenance_status_payload,
+    submit_memory_maintenance_workflow,
+    update_insight_feedback,
+)
+from mr1.memory_queries import (
+    list_filtered_insights,
+    memory_graph_agent_summary,
+    memory_graph_capabilities,
+    memory_graph_failures,
+    memory_graph_top_workflows,
+    memory_insight_show,
+    memory_insights_search,
 )
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunResult, MRnRunRunner
@@ -1314,6 +1327,31 @@ def _format_memory_curation_due(payload: dict[str, Any], *, json_output: bool = 
     return _render_table(rows)
 
 
+def _format_compile_memory_summary(result: dict[str, Any] | Any) -> str:
+    if hasattr(result, "compiled_with_memory"):
+        compiled_with_memory = bool(result.compiled_with_memory)
+        memory_tools_used = list(result.memory_tools_used or [])
+        memory_refs_used = list(result.envelope.memory_refs_used)
+        memory_context = result.memory_context_summary
+        warnings = list(result.memory_ref_warnings or [])
+    else:
+        compiled_with_memory = bool(result.get("compiled_with_memory"))
+        memory_tools_used = list(result.get("memory_tools_used", []))
+        memory_refs_used = list(result.get("memory_refs_used", []))
+        memory_context = str(result.get("memory_context_summary") or "")
+        warnings = list(result.get("memory_ref_warnings", []))
+    lines = [
+        f"memory_enabled: {compiled_with_memory}",
+        f"memory_tools_used: {', '.join(memory_tools_used) if memory_tools_used else '-'}",
+        f"memory_refs_used: {', '.join(memory_refs_used) if memory_refs_used else '-'}",
+    ]
+    if memory_context:
+        lines.append(f"memory_context_summary: {memory_context}")
+    if warnings:
+        lines.append(f"memory_ref_warnings: {', '.join(warnings)}")
+    return "\n".join(lines)
+
+
 def _format_memory_insights(
     items: list[MemoryInsight],
     *,
@@ -1368,6 +1406,56 @@ def _format_memory_curation_runs(
             str(len(item.output_insight_ids)),
             str(len(item.errors)),
             _short_ts(item.started_at),
+        ))
+    return _render_table(rows)
+
+
+def _format_memory_feedback(
+    items: list[InsightFeedback],
+    *,
+    json_output: bool = False,
+) -> str:
+    payload = [item.to_dict() for item in items]
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    if not items:
+        return "No feedback."
+    rows = [("FEEDBACK_ID", "INSIGHT_ID", "OUTCOME", "DELTA", "EVENT_TYPE", "CREATED")]
+    for item in items:
+        rows.append((
+            item.feedback_id,
+            item.insight_id,
+            item.outcome,
+            f"{float(item.confidence_delta):+.2f}",
+            str(item.metadata.get("event_type") or "-"),
+            _short_ts(item.created_at),
+        ))
+    return _render_table(rows)
+
+
+def _format_memory_insight_effectiveness(
+    items: list[MemoryInsight],
+    *,
+    json_output: bool = False,
+) -> str:
+    payload = [item.to_dict() for item in items]
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    if not items:
+        return "No active or stale insights."
+    rows = [("INSIGHT_ID", "STATUS", "CONF", "USED", "POS", "NEG", "NEU", "EFF", "UPDATED")]
+    for item in items:
+        stats = dict(item.stats)
+        rows.append((
+            item.insight_id,
+            item.status,
+            f"{float(item.confidence):.2f}",
+            str(int(stats.get("used_count", 0))),
+            str(int(stats.get("positive_outcome_count", 0))),
+            str(int(stats.get("negative_outcome_count", 0))),
+            str(int(stats.get("neutral_outcome_count", 0))),
+            f"{float(stats.get('effectiveness_score', 0.0)):.2f}",
+            _short_ts(item.updated_at),
         ))
     return _render_table(rows)
 
@@ -1672,15 +1760,24 @@ def _cmd_compile_workflow(
     if error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    if bool(args.use_memory) and bool(args.no_memory):
+        print("error: invalid flag combination", file=sys.stderr)
+        return 2
     owner_agent_id = args.owner or caller_agent_id
 
-    def _submitter(spec: dict[str, Any], submit_caller_agent_id: str, submit_owner_agent_id: str) -> tuple[str, str]:
+    def _submitter(
+        spec: dict[str, Any],
+        submit_caller_agent_id: str,
+        submit_owner_agent_id: str,
+        workflow_metadata: Optional[dict[str, Any]],
+    ) -> tuple[str, str]:
         wf_id = submit_spec_to_disk(
             spec,
             Provenance(type="user", id="cli"),
             store,
             owner_agent_id=submit_owner_agent_id,
             caller_agent_id=submit_caller_agent_id,
+            workflow_metadata=workflow_metadata,
             scoped_agent_store=scoped_agents,
             tool_registry=default_tool_registry(),
         )
@@ -1699,10 +1796,14 @@ def _cmd_compile_workflow(
             caller_agent_id=caller_agent_id,
             owner_agent_id=owner_agent_id,
             mode="submit_if_valid" if args.submit else "preview_only",
+            use_memory=True if args.use_memory else False if args.no_memory else None,
+            memory_limit=args.memory_limit,
         )
     except (WorkflowCompilerFailure, WorkflowSpecError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if args.show_memory:
+        print(_format_compile_memory_summary(result), file=sys.stderr)
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     return 0
 
@@ -2670,11 +2771,11 @@ def _cmd_memory_top_workflows(
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
-        graph, _ = _load_memory_graph(store)
+        payload = memory_graph_top_workflows(store.root.parent, limit=args.limit)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(_format_memory_templates(top_workflow_templates(graph, limit=args.limit), json_output=args.json))
+    print(_format_memory_templates(payload["items"], json_output=args.json))
     return 0
 
 
@@ -2686,11 +2787,11 @@ def _cmd_memory_capabilities(
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
-        graph, _ = _load_memory_graph(store)
+        payload = memory_graph_capabilities(store.root.parent, limit=args.limit)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(_format_memory_capabilities(capability_stats(graph, limit=args.limit), json_output=args.json))
+    print(_format_memory_capabilities(payload["items"], json_output=args.json))
     return 0
 
 
@@ -2702,11 +2803,11 @@ def _cmd_memory_failures(
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
-        graph, _ = _load_memory_graph(store)
+        payload = memory_graph_failures(store.root.parent, limit=args.limit)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(_format_memory_failures(failure_modes(graph, limit=args.limit), json_output=args.json))
+    print(_format_memory_failures(payload["items"], json_output=args.json))
     return 0
 
 
@@ -2720,12 +2821,14 @@ def _cmd_memory_agent(
         print("error: access denied: agent not in scope", file=sys.stderr)
         return 2
     try:
-        graph, _ = _load_memory_graph(store)
-        payload = agent_summary(graph, args.agent_id)
+        payload = memory_graph_agent_summary(store.root.parent, agent_id=args.agent_id)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(_format_memory_detail(payload, json_output=args.json))
+    if not payload["found"]:
+        print(f"error: agent not found: {args.agent_id}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload["summary"], json_output=args.json))
     return 0
 
 
@@ -2827,15 +2930,11 @@ def _load_insights_filtered(
     insight_types: Optional[set[str]] = None,
     include_statuses: Optional[set[str]] = None,
 ) -> list[MemoryInsight]:
-    include_statuses = include_statuses or {"active"}
-    items = [
-        insight
-        for insight in _insight_store_for(store).load_insights().values()
-        if insight.status in include_statuses
-        and (insight_types is None or insight.insight_type in insight_types)
-    ]
-    items.sort(key=lambda item: (item.updated_at, item.insight_id), reverse=True)
-    return items
+    return list_filtered_insights(
+        store.root.parent,
+        insight_types=insight_types,
+        include_statuses=include_statuses,
+    )
 
 
 def _cmd_memory_insights_list(
@@ -2862,13 +2961,14 @@ def _cmd_memory_insights_show(
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
-        insight = _insight_store_for(store).load_insights().get(args.insight_id)
+        payload = memory_insight_show(store.root.parent, insight_id=args.insight_id)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if insight is None:
+    if not payload["found"]:
         print(f"error: insight not found: {args.insight_id}", file=sys.stderr)
         return 2
+    insight = MemoryInsight.from_dict(dict(payload["insight"]))
     print(_format_memory_insight(insight, json_output=args.json))
     return 0
 
@@ -2930,6 +3030,22 @@ def _cmd_memory_insights_failures(
     return 0
 
 
+def _cmd_memory_insights_effectiveness(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        items = _load_insights_filtered(store, include_statuses={"active", "stale"})
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_insight_effectiveness(items, json_output=args.json))
+    return 0
+
+
 def _cmd_memory_curation_runs(
     args: argparse.Namespace,
     store: WorkflowStore,
@@ -2943,6 +3059,119 @@ def _cmd_memory_curation_runs(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_memory_curation_runs(runs, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_feedback_due(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        payload = evaluate_memory_feedback_due(
+            _timeline_for(store),
+            _insight_store_for(store),
+            store,
+        ).to_dict()
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_feedback_update(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        payload = update_insight_feedback(
+            _timeline_for(store),
+            _insight_store_for(store),
+            store,
+        ).to_dict()
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_feedback_list(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        items = _insight_store_for(store).load_feedback(limit=args.limit)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_feedback(items, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_feedback_insight(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        items = _insight_store_for(store).load_feedback(limit=args.limit, insight_id=args.insight_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_feedback(items, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_maintenance_spec(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del store, caller_agent_id, scoped_agents
+    print(json.dumps(build_memory_maintenance_spec(), indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_memory_maintenance_run(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id
+    try:
+        workflow_id = submit_memory_maintenance_workflow(store, scoped_agent_store=scoped_agents)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"workflow_id": workflow_id}, indent=2, sort_keys=True))
+    else:
+        print(workflow_id)
+    return 0
+
+
+def _cmd_memory_maintenance_status(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    print(_format_memory_detail(maintenance_status_payload(store), json_output=args.json))
     return 0
 
 
@@ -3230,6 +3459,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_compile.add_argument("path", help="Path to a text file containing the workflow request.")
     p_compile.add_argument("--owner", default=None)
     p_compile.add_argument("--submit", action="store_true")
+    p_compile.add_argument("--use-memory", action="store_true")
+    p_compile.add_argument("--no-memory", action="store_true")
+    p_compile.add_argument("--show-memory", action="store_true")
+    p_compile.add_argument("--memory-limit", type=int, default=5)
     p_compile.set_defaults(func=_cmd_compile_workflow)
 
     p_rerun = subs.add_parser("rerun", help="Rerun one task in a workflow.")
@@ -3476,10 +3709,54 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_memory_insights_failures, include_example=False)
     p_memory_insights_failures.set_defaults(func=_cmd_memory_insights_failures)
 
+    p_memory_insights_effectiveness = memory_insights_subs.add_parser(
+        "effectiveness",
+        help="Show active and stale insight effectiveness stats.",
+    )
+    add_common_flags(p_memory_insights_effectiveness, include_example=False)
+    p_memory_insights_effectiveness.set_defaults(func=_cmd_memory_insights_effectiveness)
+
     p_memory_runs = memory_subs.add_parser("curation-runs", help="List recent memory curation runs.")
     p_memory_runs.add_argument("--limit", type=int, default=20)
     add_common_flags(p_memory_runs, include_example=False)
     p_memory_runs.set_defaults(func=_cmd_memory_curation_runs)
+
+    p_memory_feedback = memory_subs.add_parser("feedback", help="Inspect insight feedback.")
+    memory_feedback_subs = p_memory_feedback.add_subparsers(dest="memory_feedback_command", required=True)
+
+    p_memory_feedback_due = memory_feedback_subs.add_parser("due", help="Check whether insight feedback is due.")
+    add_common_flags(p_memory_feedback_due, include_example=False)
+    p_memory_feedback_due.set_defaults(func=_cmd_memory_feedback_due)
+
+    p_memory_feedback_update = memory_feedback_subs.add_parser("update", help="Run one insight feedback update pass.")
+    add_common_flags(p_memory_feedback_update, include_example=False)
+    p_memory_feedback_update.set_defaults(func=_cmd_memory_feedback_update)
+
+    p_memory_feedback_list = memory_feedback_subs.add_parser("list", help="List recent insight feedback.")
+    p_memory_feedback_list.add_argument("--limit", type=int, default=20)
+    add_common_flags(p_memory_feedback_list, include_example=False)
+    p_memory_feedback_list.set_defaults(func=_cmd_memory_feedback_list)
+
+    p_memory_feedback_insight = memory_feedback_subs.add_parser("insight", help="List feedback for one insight.")
+    p_memory_feedback_insight.add_argument("insight_id")
+    p_memory_feedback_insight.add_argument("--limit", type=int, default=20)
+    add_common_flags(p_memory_feedback_insight, include_example=False)
+    p_memory_feedback_insight.set_defaults(func=_cmd_memory_feedback_insight)
+
+    p_memory_maintenance = memory_subs.add_parser("maintenance", help="Build or submit the memory maintenance workflow.")
+    memory_maintenance_subs = p_memory_maintenance.add_subparsers(dest="memory_maintenance_command", required=True)
+
+    p_memory_maintenance_spec = memory_maintenance_subs.add_parser("spec", help="Print the memory maintenance workflow spec.")
+    add_common_flags(p_memory_maintenance_spec, include_example=False)
+    p_memory_maintenance_spec.set_defaults(func=_cmd_memory_maintenance_spec)
+
+    p_memory_maintenance_run = memory_maintenance_subs.add_parser("run", help="Submit the memory maintenance workflow.")
+    add_common_flags(p_memory_maintenance_run, include_example=False)
+    p_memory_maintenance_run.set_defaults(func=_cmd_memory_maintenance_run)
+
+    p_memory_maintenance_status = memory_maintenance_subs.add_parser("status", help="Show the latest memory maintenance workflow status.")
+    add_common_flags(p_memory_maintenance_status, include_example=False)
+    p_memory_maintenance_status.set_defaults(func=_cmd_memory_maintenance_status)
 
     p_memory_graph = memory_subs.add_parser("graph", help="Inspect graph memory views.")
     memory_graph_subs = p_memory_graph.add_subparsers(dest="memory_graph_command", required=True)
@@ -3633,7 +3910,9 @@ def main(
             getattr(args, "approvals_command", None),
             getattr(args, "capability_audit_command", None),
             getattr(args, "memory_command", None),
+            getattr(args, "memory_feedback_command", None),
             getattr(args, "memory_insights_command", None),
+            getattr(args, "memory_maintenance_command", None),
             getattr(args, "memory_graph_command", None),
         ]
         if item

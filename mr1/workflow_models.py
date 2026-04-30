@@ -320,6 +320,7 @@ class Workflow:
     parent_agent_id: Optional[str] = None
     created_at: str = field(default_factory=_now_iso)
     finished_at: Optional[str] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
     tasks: dict[str, Task] = field(default_factory=dict)
     label_to_task_id: dict[str, str] = field(default_factory=dict)
 
@@ -341,6 +342,7 @@ class Workflow:
             "parent_agent_id": self.parent_agent_id,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
+            "metadata": dict(self.metadata),
             "tasks": {tid: t.to_dict() for tid, t in self.tasks.items()},
             "label_to_task_id": dict(self.label_to_task_id),
         }
@@ -365,6 +367,7 @@ class Workflow:
             parent_agent_id=data.get("parent_agent_id"),
             created_at=data.get("created_at", _now_iso()),
             finished_at=data.get("finished_at"),
+            metadata=dict(data.get("metadata", {})),
             tasks=tasks,
             label_to_task_id=dict(data.get("label_to_task_id", {})),
         )

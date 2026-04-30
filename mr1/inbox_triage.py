@@ -592,6 +592,11 @@ class InboxTriageRunner:
                     needs_confirmation=result.envelope.needs_confirmation,
                     confidence=result.envelope.confidence,
                     complexity="complex",
+                    compiled_with_memory=result.compiled_with_memory,
+                    memory_refs_used=list(result.envelope.memory_refs_used),
+                    memory_tools_used=list(result.memory_tools_used or []),
+                    memory_context_summary=result.memory_context_summary,
+                    memory_ref_warnings=list(result.memory_ref_warnings or []),
                 )
                 self._pending_workflow_state.set_pending_workflow(draft.to_dict())
                 return {
@@ -608,6 +613,12 @@ class InboxTriageRunner:
                 created_by=Provenance(type="agent", id="MR1"),
                 caller_agent_id=root_agent_id,
                 owner_agent_id=root_agent_id,
+                workflow_metadata={
+                    "compiled_with_memory": result.compiled_with_memory,
+                    "memory_refs_used": list(result.envelope.memory_refs_used),
+                    "memory_tools_used": list(result.memory_tools_used or []),
+                    "memory_context_summary": result.memory_context_summary,
+                },
             )
             counts["workflows_created"] += 1
             return {

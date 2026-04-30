@@ -99,8 +99,10 @@ class TestSubmit:
 class FakeCompiler:
     def __init__(self, *responses: str):
         self._responses = list(responses)
+        self.prompts: list[tuple[str, str]] = []
 
     def __call__(self, system_prompt: str, prompt: str) -> str:
+        self.prompts.append((system_prompt, prompt))
         if not self._responses:
             raise AssertionError("no compiler responses configured")
         return self._responses.pop(0)
@@ -117,6 +119,7 @@ class TestCompileWorkflow:
             "risks": [],
             "needs_confirmation": False,
             "confidence": "high",
+            "memory_refs_used": [],
         }))
 
         rc = workflow_cli.main(
@@ -140,6 +143,7 @@ class TestCompileWorkflow:
             "risks": [],
             "needs_confirmation": False,
             "confidence": "high",
+            "memory_refs_used": [],
         }))
 
         rc = workflow_cli.main(
@@ -152,6 +156,58 @@ class TestCompileWorkflow:
         payload = json.loads(capsys.readouterr().out)
         assert payload["workflow_id"].startswith("wf-")
         assert len(store.list_workflows()) == 1
+
+    def test_compile_workflow_memory_flags_and_show_memory(self, tmp_path, store, capsys):
+        request_path = tmp_path / "request.txt"
+        request_path.write_text("Read notes and summarize them", encoding="utf-8")
+        compiler = FakeCompiler(json.dumps({
+            "preview": "Read notes, then summarize them.",
+            "spec": SPEC,
+            "assumptions": [],
+            "risks": [],
+            "needs_confirmation": False,
+            "confidence": "high",
+            "memory_refs_used": ["insight:missing"],
+        }))
+
+        rc = workflow_cli.main(
+            ["compile-workflow", str(request_path), "--use-memory", "--show-memory", "--memory-limit", "2"],
+            store=store,
+            workflow_compiler=compiler,
+        )
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["compiled_with_memory"] is True
+        assert payload["memory_refs_used"] == ["insight:missing"]
+        compile_payload = json.loads(compiler.prompts[0][1])
+        assert compile_payload["memory"]["enabled"] is True
+        assert compile_payload["memory"]["memory_limit"] == 2
+        assert "memory_enabled: True" in captured.err
+
+    def test_compile_workflow_no_memory_disables_prefetch(self, tmp_path, store):
+        request_path = tmp_path / "request.txt"
+        request_path.write_text("Read notes and summarize them", encoding="utf-8")
+        compiler = FakeCompiler(json.dumps({
+            "preview": "Read notes, then summarize them.",
+            "spec": SPEC,
+            "assumptions": [],
+            "risks": [],
+            "needs_confirmation": False,
+            "confidence": "high",
+            "memory_refs_used": [],
+        }))
+
+        rc = workflow_cli.main(
+            ["compile-workflow", str(request_path), "--no-memory"],
+            store=store,
+            workflow_compiler=compiler,
+        )
+
+        assert rc == 0
+        compile_payload = json.loads(compiler.prompts[0][1])
+        assert compile_payload["memory"]["enabled"] is False
 
 
 class TestReadCommands:

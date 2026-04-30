@@ -225,6 +225,24 @@ class TestCapabilityCli:
         out = capsys.readouterr().out
         assert "status:       denied" in out
 
+    def test_capability_call_cli_memory_search_smoke(self, tmp_path, store, capsys):
+        config_path = tmp_path / "cfg.json"
+        config_path.write_text(json.dumps({"query": "file access", "limit": 5}), encoding="utf-8")
+        scoped = __import__("mr1.scoped_agents", fromlist=["PersistentAgentStore"]).PersistentAgentStore(
+            root=tmp_path / "agents"
+        )
+
+        rc = workflow_cli.main(
+            ["capability-call", "memory_insights_search", str(config_path)],
+            store=store,
+            scoped_agent_store=scoped,
+        )
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "capability:   memory_insights_search" in out
+        assert "status:       succeeded" in out
+
     def test_capability_text_output_shows_direct_call_metadata(self, store, capsys):
         rc = workflow_cli.main(["capability", "read_file"], store=store)
 

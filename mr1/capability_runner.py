@@ -24,13 +24,30 @@ from mr1.capability_policy import (
 )
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
+from mr1.memory_feedback import (
+    evaluate_memory_feedback_due_for_runtime_root,
+    run_memory_curate,
+    run_memory_graph_update,
+    update_insight_feedback,
+)
+from mr1.memory_queries import (
+    memory_graph_agent_summary,
+    memory_graph_capabilities,
+    memory_graph_failures,
+    memory_graph_top_workflows,
+    memory_insight_show,
+    memory_insights_search,
+)
 from mr1.scoped_agents import PersistentAgentStore
-from mr1.memory_curator import evaluate_memory_curation_due_for_runtime_root
+from mr1.memory_curator import InsightStore, evaluate_memory_curation_due_for_runtime_root
+from mr1.memory_graph import MemoryGraphStore
 from mr1.tools import _read_file_pure
+from mr1.workflow_store import WorkflowStore
 from mr1.watchers import (
     _evaluate_condition_script_pure,
     _evaluate_file_exists_pure,
     _evaluate_memory_curation_due_pure,
+    _evaluate_memory_feedback_due_pure,
     _evaluate_time_reached_pure,
 )
 
@@ -49,6 +66,10 @@ class CapabilityResult:
     decision: dict[str, Any] = field(default_factory=dict)
     approval_request_id: Optional[str] = None
     audit_record_path: Optional[str] = None
+
+
+class CapabilityValidationError(ValueError):
+    """Structured validation failure for direct capability calls."""
 
 
 class CapabilityRunner:
@@ -227,6 +248,13 @@ class CapabilityRunner:
             output, error = self._dispatch(name, config, meta_timeout)
             if error is not None:
                 status = "failed"
+        except CapabilityValidationError as exc:
+            output = {
+                "error_type": "validation_error",
+                "message": str(exc),
+            }
+            error = str(exc)
+            status = "failed"
         except Exception as exc:
             error = str(exc)
             status = "failed"
@@ -408,6 +436,125 @@ class CapabilityRunner:
                 "state": result["state"],
                 "message": result["message"],
             }
+            return output, None
+
+        if name == "memory_feedback_due":
+            runtime_root = config.get("runtime_root")
+            if isinstance(runtime_root, str) and runtime_root.strip():
+                result = _evaluate_memory_feedback_due_pure(runtime_root)
+            else:
+                result = evaluate_memory_feedback_due_for_runtime_root(self._workspace_root).to_dict()
+                result["state"] = "satisfied" if result["due"] else "not_satisfied"
+                result["message"] = (
+                    f"memory feedback due: {result['relevant_event_count']} relevant event(s)"
+                    if result["due"] else
+                    "memory feedback not due"
+                )
+            output = {
+                "due": bool(result["due"]),
+                "latest_event_index": int(result["latest_event_index"]),
+                "last_evaluated_event_index": int(result["last_evaluated_event_index"]),
+                "relevant_event_count": int(result["relevant_event_count"]),
+                "relevant_event_types": list(result["relevant_event_types"]),
+                "suggested_event_window": list(result["suggested_event_window"]),
+                "state": result["state"],
+                "message": result["message"],
+            }
+            return output, None
+
+        if name == "memory_insights_search":
+            try:
+                output = memory_insights_search(
+                    self._workspace_root,
+                    query=config.get("query"),
+                    types=config.get("types"),
+                    status=config.get("status"),
+                    limit=config.get("limit"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_insight_show":
+            try:
+                output = memory_insight_show(
+                    self._workspace_root,
+                    insight_id=config.get("insight_id"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_graph_top_workflows":
+            try:
+                output = memory_graph_top_workflows(
+                    self._workspace_root,
+                    limit=config.get("limit"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_graph_capabilities":
+            try:
+                output = memory_graph_capabilities(
+                    self._workspace_root,
+                    limit=config.get("limit"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_graph_failures":
+            try:
+                output = memory_graph_failures(
+                    self._workspace_root,
+                    limit=config.get("limit"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_graph_agent_summary":
+            try:
+                output = memory_graph_agent_summary(
+                    self._workspace_root,
+                    agent_id=config.get("agent_id"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_graph_update":
+            try:
+                output = run_memory_graph_update(
+                    event_log=EventLog(self._workspace_root / "events"),
+                    graph_store=MemoryGraphStore(self._workspace_root / "graph"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_curate":
+            try:
+                output = run_memory_curate(
+                    event_log=EventLog(self._workspace_root / "events"),
+                    graph_store=MemoryGraphStore(self._workspace_root / "graph"),
+                    insight_store=InsightStore(self._workspace_root / "insights"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_feedback_update":
+            try:
+                output = update_insight_feedback(
+                    event_log=EventLog(self._workspace_root / "events"),
+                    insight_store=InsightStore(self._workspace_root / "insights"),
+                    workflow_store=WorkflowStore(root=self._workspace_root / "workflows"),
+                ).to_dict()
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
             return output, None
 
         raise ValueError(f"capability not found: {name}")
