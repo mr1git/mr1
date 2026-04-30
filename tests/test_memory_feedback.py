@@ -278,6 +278,7 @@ def test_new_tool_and_capability_registrations():
     assert tools.is_registered("memory_graph_update") is True
     assert tools.is_registered("memory_curate") is True
     assert tools.is_registered("memory_feedback_update") is True
+    assert tools.is_registered("memory_retrieval_update") is True
 
     feedback_due = capabilities.describe_capability("memory_feedback_due")
     assert feedback_due["direct_allowed"] is True
@@ -289,15 +290,23 @@ def test_new_tool_and_capability_registrations():
     assert feedback_update["workflow_allowed"] is True
     assert feedback_update["risk_score"] == 0.25
 
+    retrieval_update = capabilities.describe_capability("memory_retrieval_update")
+    assert retrieval_update["direct_allowed"] is False
+    assert retrieval_update["workflow_allowed"] is True
+    assert retrieval_update["risk_score"] == 0.20
+
 
 def test_memory_maintenance_spec_shape_is_valid():
     spec = build_memory_maintenance_spec()
     labels = [task["label"] for task in spec["tasks"]]
-    assert labels == ["curation_due", "graph_update", "curate", "feedback_due", "feedback_update"]
+    assert labels == ["curation_due", "graph_update", "curate", "feedback_due", "feedback_update", "retrieval_update"]
     graph_update = next(task for task in spec["tasks"] if task["label"] == "graph_update")
     feedback_update = next(task for task in spec["tasks"] if task["label"] == "feedback_update")
+    retrieval_update = next(task for task in spec["tasks"] if task["label"] == "retrieval_update")
     assert graph_update["depends_on"] == ["curation_due"]
     assert feedback_update["depends_on"] == ["feedback_due"]
+    assert retrieval_update["depends_on"] == ["curate", "feedback_update"]
+    assert retrieval_update["dependency_policy"] == "any_succeeded"
     assert graph_update["run_if"]["ref"] == "curation_due.result.data.due"
     assert feedback_update["run_if"]["ref"] == "feedback_due.result.data.due"
 

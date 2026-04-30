@@ -17,6 +17,7 @@ from mr1.memory_graph import (
     failure_node_id,
     workflow_template_node_id,
 )
+from mr1.memory_retrieval import RetrievalStore
 from mr1.scoped_agents import PersistentAgentStore
 
 
@@ -129,9 +130,27 @@ def _seed_graph(tmp_path):
     return store
 
 
+def _seed_events(tmp_path):
+    log = EventLog(tmp_path / "events")
+    log.emit(
+        event_type="workflow_completed",
+        actor_id="scheduler",
+        actor_type="mr1",
+        target_id="wf-1",
+        target_type="workflow",
+        status="succeeded",
+        summary="workflow completed with approval friction",
+        workflow_id="wf-1",
+        correlation_id="corr-1",
+        timestamp="2026-04-27T00:00:00+00:00",
+    )
+    return log
+
+
 def test_memory_capabilities_registered_with_policy_metadata():
     registry = default_capability_registry()
     for name in (
+        "memory_search",
         "memory_insights_search",
         "memory_insight_show",
         "memory_graph_top_workflows",
@@ -144,6 +163,10 @@ def test_memory_capabilities_registered_with_policy_metadata():
         assert desc["workflow_allowed"] is True
         assert desc["risk_score"] == 0.05
         assert desc["is_execution"] is False
+    update_desc = registry.describe_capability("memory_retrieval_update")
+    assert update_desc["direct_allowed"] is False
+    assert update_desc["workflow_allowed"] is True
+    assert update_desc["risk_score"] == 0.20
 
 
 def test_memory_insights_search_filters_ranks_and_limits(tmp_path, runner, root_agent_id):
@@ -214,16 +237,37 @@ def test_memory_graph_queries_return_existing_helper_results(tmp_path, runner, r
     assert agent.output["summary"]["node"]["node_id"] == agent_node_id("ag-123")
 
 
+def test_memory_search_auto_bootstraps_and_filters(tmp_path, runner, root_agent_id):
+    _seed_insights(tmp_path)
+    _seed_graph(tmp_path)
+    _seed_events(tmp_path)
+
+    result = runner.run_capability(
+        "memory_search",
+        {"query": "approval friction", "limit": 5, "types": ["insight"]},
+        root_agent_id,
+    )
+
+    assert result.status == "succeeded"
+    assert result.output["retrieval_ready"] is True
+    assert result.output["updated_now"] is True
+    assert result.output["count"] >= 1
+    assert result.output["items"][0]["doc_type"] == "insight"
+
+
 def test_memory_capabilities_return_empty_structures_when_stores_missing(runner, root_agent_id):
     top = runner.run_capability("memory_graph_top_workflows", {"limit": 5}, root_agent_id)
     caps = runner.run_capability("memory_graph_capabilities", {"limit": 10}, root_agent_id)
     failures = runner.run_capability("memory_graph_failures", {"limit": 10}, root_agent_id)
     search = runner.run_capability("memory_insights_search", {"query": "anything", "limit": 5}, root_agent_id)
+    retrieval = runner.run_capability("memory_search", {"query": "anything", "limit": 5}, root_agent_id)
 
     assert top.output == {"items": [], "count": 0}
     assert caps.output == {"items": [], "count": 0}
     assert failures.output == {"items": [], "count": 0}
     assert search.output["items"] == []
+    assert retrieval.output["retrieval_ready"] is True
+    assert retrieval.output["items"] == []
 
 
 def test_memory_capability_invalid_input_returns_structured_validation_failure(runner, root_agent_id):
@@ -237,19 +281,44 @@ def test_memory_capability_invalid_input_returns_structured_validation_failure(r
     assert result.output["error_type"] == "validation_error"
     assert result.error == result.output["message"]
 
+    memory_search_result = runner.run_capability(
+        "memory_search",
+        {"query": "   "},
+        root_agent_id,
+    )
+    assert memory_search_result.status == "failed"
+    assert memory_search_result.output["error_type"] == "validation_error"
+
+
+def test_memory_retrieval_update_capability_rebuilds_documents(tmp_path, runner, root_agent_id):
+    _seed_insights(tmp_path)
+    _seed_graph(tmp_path)
+    _seed_events(tmp_path)
+
+    result = runner.run_capability(
+        "memory_retrieval_update",
+        {},
+        root_agent_id,
+        mode="workflow",
+    )
+
+    assert result.status == "succeeded"
+    assert result.output["documents_written"] >= 1
+    assert RetrievalStore(tmp_path).documents_path.exists() is True
+
 
 def test_memory_capability_direct_call_writes_audit_and_timeline(tmp_path, runner, root_agent_id):
     _seed_graph(tmp_path)
 
     result = runner.run_capability(
-        "memory_graph_capabilities",
-        {"limit": 10},
+        "memory_search",
+        {"query": "read_file", "limit": 10},
         root_agent_id,
     )
 
     assert result.status == "succeeded"
     audit = json.loads(open(result.audit_record_path, "r", encoding="utf-8").read())
-    assert audit["capability_name"] == "memory_graph_capabilities"
+    assert audit["capability_name"] == "memory_search"
     events = EventLog(tmp_path / "events").list_events()
     assert [event.event_type for event in events[-3:]] == [
         "capability_requested",

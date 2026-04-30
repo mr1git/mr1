@@ -446,6 +446,14 @@ def build_memory_maintenance_spec() -> dict[str, Any]:
                     "value": True,
                 },
             },
+            {
+                "label": "retrieval_update",
+                "title": "Update unified retrieval documents",
+                "task_kind": "tool",
+                "tool_type": "memory_retrieval_update",
+                "depends_on": ["curate", "feedback_update"],
+                "dependency_policy": "any_succeeded",
+            },
         ],
     }
     validate_spec(spec)

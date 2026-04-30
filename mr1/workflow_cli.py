@@ -70,6 +70,7 @@ from mr1.memory_feedback import (
 )
 from mr1.memory_queries import (
     list_filtered_insights,
+    memory_search,
     memory_graph_agent_summary,
     memory_graph_capabilities,
     memory_graph_failures,
@@ -77,6 +78,7 @@ from mr1.memory_queries import (
     memory_insight_show,
     memory_insights_search,
 )
+from mr1.memory_retrieval import RetrievalStore, update_memory_retrieval
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunResult, MRnRunRunner
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
@@ -1310,6 +1312,48 @@ def _format_memory_detail(payload: dict[str, Any], *, json_output: bool = False)
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _format_memory_retrieval_stats(payload: dict[str, Any], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    lines = [
+        f"retrieval_ready: {bool(payload.get('retrieval_ready'))}",
+        f"document_count: {int(payload.get('document_count', 0))}",
+        f"schema_version: {payload.get('schema_version') or '-'}",
+        f"updated_at: {payload.get('updated_at') or '-'}",
+        "",
+        "doc_types:",
+    ]
+    doc_rows = [("TYPE", "COUNT")]
+    for name, count in sorted(dict(payload.get("doc_type_counts", {})).items()):
+        doc_rows.append((name, str(count)))
+    lines.append(_render_table(doc_rows, indent="  "))
+    lines.append("")
+    lines.append("source_counts:")
+    source_rows = [("SOURCE", "COUNT")]
+    for name, count in sorted(dict(payload.get("source_counts", {})).items()):
+        source_rows.append((name, str(count)))
+    lines.append(_render_table(source_rows, indent="  "))
+    return "\n".join(lines)
+
+
+def _format_memory_retrieval_search(payload: dict[str, Any], *, json_output: bool = False) -> str:
+    if json_output:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    items = list(payload.get("items", []))
+    if not items:
+        return "No retrieval documents."
+    rows = [("DOC_ID", "TYPE", "SCORE", "TITLE", "SUMMARY")]
+    for item in items:
+        rows.append((
+            str(item.get("doc_id") or ""),
+            str(item.get("doc_type") or ""),
+            f"{float(item.get('score', 0.0)):.2f}",
+            str(item.get("title") or "")[:36],
+            str(item.get("summary") or "")[:56],
+        ))
+    return _render_table(rows)
 
 
 def _format_memory_curation_due(payload: dict[str, Any], *, json_output: bool = False) -> str:
@@ -3102,6 +3146,81 @@ def _cmd_memory_feedback_update(
     return 0
 
 
+def _cmd_memory_retrieval_update(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        payload = update_memory_retrieval(store.root.parent).to_dict()
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_detail(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_retrieval_stats(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    retrieval_store = RetrievalStore(store.root.parent)
+    payload: dict[str, Any] = {
+        "retrieval_ready": False,
+        "document_count": 0,
+        "schema_version": None,
+        "updated_at": None,
+        "doc_type_counts": {},
+        "source_counts": {},
+    }
+    try:
+        manifest = retrieval_store.load_manifest() if retrieval_store.manifest_path.exists() else {}
+        documents = retrieval_store.load_documents() if retrieval_store.documents_path.exists() else []
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if manifest or documents:
+        doc_type_counts: dict[str, int] = {}
+        for item in documents:
+            doc_type_counts[item.doc_type] = doc_type_counts.get(item.doc_type, 0) + 1
+        payload = {
+            "retrieval_ready": retrieval_store.exists(),
+            "document_count": int(manifest.get("document_count", len(documents))),
+            "schema_version": manifest.get("schema_version"),
+            "updated_at": manifest.get("updated_at"),
+            "doc_type_counts": dict(sorted(doc_type_counts.items())),
+            "source_counts": dict(sorted(dict(manifest.get("source_counts", {})).items())),
+        }
+    print(_format_memory_retrieval_stats(payload, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_retrieval_search(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    try:
+        payload = memory_search(
+            store.root.parent,
+            query=args.query,
+            limit=args.limit,
+            types=list(args.types or []),
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(_format_memory_retrieval_search(payload, json_output=args.json))
+    return 0
+
+
 def _cmd_memory_feedback_list(
     args: argparse.Namespace,
     store: WorkflowStore,
@@ -3676,6 +3795,24 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_memory_curate, include_example=False)
     p_memory_curate.set_defaults(func=_cmd_memory_curate)
 
+    p_memory_retrieval = memory_subs.add_parser("retrieval", help="Inspect unified retrieval documents.")
+    memory_retrieval_subs = p_memory_retrieval.add_subparsers(dest="memory_retrieval_command", required=True)
+
+    p_memory_retrieval_update = memory_retrieval_subs.add_parser("update", help="Rebuild unified retrieval documents.")
+    add_common_flags(p_memory_retrieval_update, include_example=False)
+    p_memory_retrieval_update.set_defaults(func=_cmd_memory_retrieval_update)
+
+    p_memory_retrieval_stats = memory_retrieval_subs.add_parser("stats", help="Show retrieval manifest and document counts.")
+    add_common_flags(p_memory_retrieval_stats, include_example=False)
+    p_memory_retrieval_stats.set_defaults(func=_cmd_memory_retrieval_stats)
+
+    p_memory_retrieval_search = memory_retrieval_subs.add_parser("search", help="Search unified retrieval documents.")
+    p_memory_retrieval_search.add_argument("query")
+    p_memory_retrieval_search.add_argument("--limit", type=int, default=5)
+    p_memory_retrieval_search.add_argument("--type", action="append", dest="types", default=[])
+    add_common_flags(p_memory_retrieval_search, include_example=False)
+    p_memory_retrieval_search.set_defaults(func=_cmd_memory_retrieval_search)
+
     p_memory_insights = memory_subs.add_parser("insights", help="Inspect curated memory insights.")
     memory_insights_subs = p_memory_insights.add_subparsers(dest="memory_insights_command", required=True)
 
@@ -3914,6 +4051,7 @@ def main(
             getattr(args, "memory_insights_command", None),
             getattr(args, "memory_maintenance_command", None),
             getattr(args, "memory_graph_command", None),
+            getattr(args, "memory_retrieval_command", None),
         ]
         if item
     )

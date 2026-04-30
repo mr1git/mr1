@@ -233,14 +233,14 @@ class TestCapabilityCli:
         )
 
         rc = workflow_cli.main(
-            ["capability-call", "memory_insights_search", str(config_path)],
+            ["capability-call", "memory_search", str(config_path)],
             store=store,
             scoped_agent_store=scoped,
         )
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "capability:   memory_insights_search" in out
+        assert "capability:   memory_search" in out
         assert "status:       succeeded" in out
 
     def test_capability_text_output_shows_direct_call_metadata(self, store, capsys):

@@ -18,6 +18,7 @@ from typing import Any, Optional, Protocol
 from mr1.capability_policy import normalize_path
 from mr1.dataflow import Artifact, new_artifact_id
 from mr1.memory_queries import (
+    memory_search,
     memory_graph_agent_summary,
     memory_graph_capabilities,
     memory_graph_failures,
@@ -25,6 +26,7 @@ from mr1.memory_queries import (
     memory_insight_show,
     memory_insights_search,
 )
+from mr1.memory_retrieval import update_memory_retrieval
 from mr1.workflow_models import Task, Workflow
 from mr1.workflow_store import WorkflowStore
 
@@ -424,6 +426,35 @@ class MemoryInsightsSearchTool:
         )
 
 
+class MemorySearchTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        query = config.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ToolConfigError("memory_search requires non-empty tool_config.query")
+        types = config.get("types")
+        if types is not None:
+            if not isinstance(types, list) or any(not isinstance(item, str) or not item.strip() for item in types):
+                raise ToolConfigError("memory_search types must be a list of non-empty strings")
+        limit = config.get("limit")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+            raise ToolConfigError("memory_search limit must be an integer >= 0")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del workflow
+        result = memory_search(
+            store.root.parent,
+            query=task.tool_config.get("query"),
+            types=task.tool_config.get("types"),
+            limit=task.tool_config.get("limit"),
+        )
+        return ToolResult(
+            state="succeeded",
+            summary=f"found {result['count']} retrieval document(s)",
+            text="",
+            data=result,
+        )
+
+
 class MemoryInsightShowTool:
     def validate_config(self, config: dict[str, Any]) -> None:
         insight_id = config.get("insight_id")
@@ -592,6 +623,22 @@ class MemoryFeedbackUpdateTool:
         return ToolResult(
             state="succeeded",
             summary=f"created {result['feedback_created']} insight feedback record(s)",
+            text="",
+            data=result,
+        )
+
+
+class MemoryRetrievalUpdateTool:
+    def validate_config(self, config: dict[str, Any]) -> None:
+        if not isinstance(config, dict):
+            raise ToolConfigError("memory_retrieval_update tool_config must be a JSON object")
+
+    def run(self, task: Task, store: WorkflowStore, workflow: Workflow) -> ToolResult:
+        del task, workflow
+        result = update_memory_retrieval(store.root.parent).to_dict()
+        return ToolResult(
+            state="succeeded",
+            summary=f"wrote {result['documents_written']} retrieval document(s)",
             text="",
             data=result,
         )
@@ -771,6 +818,39 @@ def default_tool_registry() -> ToolRegistry:
                     "tool_config": {
                         "argv": ["python3", "--version"],
                         "cwd": ".",
+                    },
+                }
+            ],
+        )
+        registry.register(
+            "memory_search",
+            MemorySearchTool(),
+            description="Search unified derived memory documents using deterministic lexical ranking.",
+            config_shape='{"query": "file access approval friction", "limit": 5, "types": ["insight", "capability"]}',
+            config_schema={
+                "query": {"type": "string", "required": True},
+                "types": {"type": "list[string]", "required": False},
+                "limit": {"type": "int", "required": False, "default": 5},
+            },
+            outputs={
+                "result.data.items": "compact matching retrieval documents",
+                "result.data.count": "number of returned documents",
+                "result.data.query": "normalized search query",
+                "result.data.types": "requested retrieval document type filters",
+                "result.data.retrieval_ready": "true when retrieval documents were readable",
+                "result.data.updated_now": "true when retrieval docs were rebuilt before searching",
+                "result.data.update_errors": "non-fatal retrieval rebuild errors encountered during bootstrap",
+            },
+            examples=[
+                {
+                    "label": "memory_search",
+                    "title": "Search unified memory",
+                    "task_kind": "tool",
+                    "tool_type": "memory_search",
+                    "tool_config": {
+                        "query": "file access approval friction",
+                        "limit": 5,
+                        "types": ["insight", "capability"],
                     },
                 }
             ],
@@ -984,6 +1064,29 @@ def default_tool_registry() -> ToolRegistry:
                     "title": "Update insight feedback",
                     "task_kind": "tool",
                     "tool_type": "memory_feedback_update",
+                    "tool_config": {},
+                }
+            ],
+        )
+        registry.register(
+            "memory_retrieval_update",
+            MemoryRetrievalUpdateTool(),
+            description="Rebuild derived unified retrieval documents from current memory stores.",
+            config_shape='{}',
+            config_schema={},
+            outputs={
+                "result.data.documents_written": "number of retrieval documents written",
+                "result.data.documents_created": "number of newly created retrieval documents",
+                "result.data.documents_updated": "number of changed retrieval documents",
+                "result.data.source_counts": "document counts by retrieval source type",
+                "result.data.errors": "non-fatal retrieval rebuild errors",
+            },
+            examples=[
+                {
+                    "label": "memory_retrieval_update",
+                    "title": "Update unified retrieval documents",
+                    "task_kind": "tool",
+                    "tool_type": "memory_retrieval_update",
                     "tool_config": {},
                 }
             ],

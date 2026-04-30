@@ -8,6 +8,7 @@ import pytest
 from mr1.kazi_runner import MockRunner
 from mr1.memory_curator import EvidenceRef, InsightStore, MemoryInsight
 from mr1.memory_graph import MemoryGraph, MemoryGraphStore, MemoryNode, agent_node_id
+from mr1.memory_retrieval import update_memory_retrieval
 from mr1.mr1 import MR1, MR1Process, StateManager
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.scheduler import Scheduler, WorkflowSpecError, submit_spec_to_disk
@@ -343,12 +344,14 @@ def test_compile_includes_memory_payload_when_enabled(tmp_path, agent_store):
     assert payload["memory"]["enabled"] is True
     assert payload["memory"]["memory_limit"] == 3
     assert payload["memory"]["tools_used"] == [
+        "memory_search",
         "memory_insights_search",
         "memory_graph_top_workflows",
         "memory_graph_capabilities",
         "memory_graph_failures",
         "memory_graph_agent_summary",
     ]
+    assert "memory_search" in payload["memory"]["prefetched_context"]
     assert result.compiled_with_memory is True
 
 
@@ -398,6 +401,7 @@ def test_unknown_memory_refs_produce_warnings_without_failure(tmp_path, agent_st
 
 def test_submit_if_valid_persists_workflow_memory_metadata(tmp_path, workflow_store, agent_store):
     _seed_memory(tmp_path)
+    update_memory_retrieval(tmp_path)
     root = agent_store.ensure_root_agent()
     compiler = FakeCompiler(json.dumps({
         "preview": "Read notes, then summarize them.",
@@ -406,7 +410,7 @@ def test_submit_if_valid_persists_workflow_memory_metadata(tmp_path, workflow_st
         "risks": [],
         "needs_confirmation": False,
         "confidence": "high",
-        "memory_refs_used": ["insight:capability_friction:capability:read_file"],
+        "memory_refs_used": ["retrieval:insight:insight:capability_friction:capability:read_file"],
     }))
 
     def _submitter(
@@ -444,4 +448,5 @@ def test_submit_if_valid_persists_workflow_memory_metadata(tmp_path, workflow_st
     workflow = workflow_store.load_workflow(result.workflow_id)
     assert workflow is not None
     assert workflow.metadata["compiled_with_memory"] is True
-    assert workflow.metadata["memory_refs_used"] == ["insight:capability_friction:capability:read_file"]
+    assert workflow.metadata["memory_refs_used"] == ["retrieval:insight:insight:capability_friction:capability:read_file"]
+    assert workflow.metadata["memory_tools_used"][0] == "memory_search"

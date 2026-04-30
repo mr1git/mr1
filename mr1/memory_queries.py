@@ -8,10 +8,18 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.memory_retrieval import (
+    LexicalMemoryRetriever,
+    RETRIEVAL_DOC_TYPES,
+    RetrievalStore,
+    update_memory_retrieval,
+)
+
 DEFAULT_MEMORY_LIMIT = 5
 DEFAULT_GRAPH_CAPABILITY_LIMIT = 10
 DEFAULT_GRAPH_FAILURE_LIMIT = 10
 MEMORY_CAPABILITY_NAMES = [
+    "memory_search",
     "memory_insights_search",
     "memory_insight_show",
     "memory_graph_top_workflows",
@@ -41,7 +49,14 @@ def _graph_store(runtime_root: Optional[Path]) -> MemoryGraphStore:
 
 def memory_stores_available(runtime_root: Optional[Path]) -> bool:
     root = _memory_root(runtime_root)
-    return (root / "insights" / "insights.json").exists() or (root / "graph" / "graph.json").exists()
+    return any((
+        (root / "retrieval" / "documents.jsonl").exists(),
+        (root / "retrieval" / "manifest.json").exists(),
+        (root / "insights" / "insights.json").exists(),
+        (root / "insights" / "feedback.jsonl").exists(),
+        (root / "graph" / "graph.json").exists(),
+        (root / "events" / "events.jsonl").exists(),
+    ))
 
 
 def _load_insights_or_empty(runtime_root: Optional[Path]) -> dict[str, MemoryInsight]:
@@ -75,6 +90,20 @@ def _validate_limit(value: Any, *, default: int) -> int:
     if value < 0:
         raise ValueError("limit must be an integer >= 0")
     return value
+
+
+def _validate_memory_search_types(types: Any) -> Optional[list[str]]:
+    if types is None:
+        return None
+    if not isinstance(types, list) or any(not isinstance(item, str) or not item.strip() for item in types):
+        raise ValueError("types must be a list of non-empty strings")
+    if not types:
+        return None
+    normalized = [_normalized_text(item) for item in types]
+    invalid = sorted(item for item in normalized if item not in RETRIEVAL_DOC_TYPES)
+    if invalid:
+        raise ValueError(f"invalid retrieval document types: {', '.join(invalid)}")
+    return normalized
 
 
 def _validate_types(types: Any) -> Optional[list[str]]:
@@ -118,6 +147,66 @@ def _validate_insight_id(insight_id: Any) -> str:
 
 def _normalized_text(value: Any) -> str:
     return " ".join(str(value or "").strip().split()).lower()
+
+
+def memory_search(
+    runtime_root: Optional[Path],
+    *,
+    query: Any,
+    limit: Any = DEFAULT_MEMORY_LIMIT,
+    types: Any = None,
+) -> dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+    validated_limit = _validate_limit(limit, default=DEFAULT_MEMORY_LIMIT)
+    validated_types = _validate_memory_search_types(types)
+    root = _memory_root(runtime_root)
+    retrieval_store = RetrievalStore(root)
+    updated_now = False
+    update_errors: list[str] = []
+    retrieval_ready = retrieval_store.exists()
+    if retrieval_ready:
+        try:
+            retrieval_store.load_documents()
+        except ValueError:
+            retrieval_ready = False
+    if not retrieval_ready:
+        result = update_memory_retrieval(root)
+        updated_now = True
+        update_errors = list(result.errors)
+        try:
+            retrieval_store.load_documents()
+            retrieval_ready = retrieval_store.exists()
+        except ValueError:
+            retrieval_ready = False
+    if not retrieval_ready:
+        return {
+            "items": [],
+            "count": 0,
+            "query": query.strip(),
+            "types": list(validated_types or []),
+            "retrieval_ready": False,
+            "updated_now": updated_now,
+            "update_errors": update_errors,
+        }
+    retriever = LexicalMemoryRetriever(root)
+    items = [
+        item.to_dict()
+        for item in retriever.search(
+            query=query.strip(),
+            limit=validated_limit,
+            types=validated_types,
+        )
+    ]
+    return {
+        "items": items,
+        "count": len(items),
+        "query": query.strip(),
+        "types": list(validated_types or []),
+        "retrieval_ready": True,
+        "updated_now": updated_now,
+        "update_errors": update_errors,
+    }
 
 
 def _insight_text_fields(insight: MemoryInsight) -> list[str]:
@@ -266,16 +355,26 @@ def memory_graph_agent_summary(runtime_root: Optional[Path], *, agent_id: Any) -
 def known_memory_refs(runtime_root: Optional[Path]) -> set[str]:
     insights = set(_load_insights_or_empty(runtime_root))
     graph = _load_graph_or_empty(runtime_root)
-    return insights | set(graph.nodes)
+    retrieval_docs: set[str] = set()
+    try:
+        retrieval_docs = {
+            item.doc_id
+            for item in RetrievalStore(_memory_root(runtime_root)).load_documents()
+        }
+    except ValueError:
+        retrieval_docs = set()
+    return insights | set(graph.nodes) | retrieval_docs
 
 
 def memory_context_summary(prefetched_context: dict[str, Any]) -> str:
+    retrieval = len(list(prefetched_context.get("memory_search", {}).get("items", [])))
     insights = len(list(prefetched_context.get("memory_insights_search", {}).get("items", [])))
     workflows = len(list(prefetched_context.get("memory_graph_top_workflows", {}).get("items", [])))
     capabilities = len(list(prefetched_context.get("memory_graph_capabilities", {}).get("items", [])))
     failures = len(list(prefetched_context.get("memory_graph_failures", {}).get("items", [])))
     agent_found = bool(prefetched_context.get("memory_graph_agent_summary", {}).get("found"))
     return (
+        f"retrieval={retrieval}, "
         f"insights={insights}, "
         f"top_workflows={workflows}, "
         f"capabilities={capabilities}, "

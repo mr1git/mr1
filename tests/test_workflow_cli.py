@@ -20,6 +20,8 @@ from mr1 import workflow_cli
 from mr1.capability_runner import CapabilityRunner
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.memory_curator import EvidenceRef, InsightStore, MemoryInsight
+from mr1.memory_graph import MemoryGraph, MemoryGraphStore, MemoryNode, agent_node_id, capability_node_id
 from mr1.mrn_loop import MRnStepResult
 from mr1.mrn_run import MRnRunResult
 from mr1.scheduler import Scheduler, submit_spec_to_disk
@@ -48,6 +50,41 @@ def _write_spec(tmp_path: Path, spec: dict) -> Path:
     p = tmp_path / "spec.json"
     p.write_text(json.dumps(spec), encoding="utf-8")
     return p
+
+
+def _seed_memory_runtime(tmp_path: Path) -> None:
+    InsightStore(tmp_path / "insights").save_insights({
+        "insight:capability_friction:capability:read_file": MemoryInsight(
+            insight_id="insight:capability_friction:capability:read_file",
+            insight_type="capability_friction",
+            title="Read file approval friction",
+            summary="Approval friction is common for read_file workflows.",
+            confidence=0.9,
+            severity="WARNING",
+            recommended_action="consider narrowing scope",
+            evidence=[EvidenceRef(source_type="query", source_id="query:test", reason="fixture")],
+            related_nodes=[capability_node_id("read_file")],
+            created_at="2026-04-20T00:00:00+00:00",
+            updated_at="2026-04-25T00:00:00+00:00",
+            status="active",
+            metadata={"capability_id": capability_node_id("read_file")},
+        )
+    })
+    MemoryGraphStore(tmp_path / "graph").save_graph(MemoryGraph(
+        nodes={
+            capability_node_id("read_file"): MemoryNode(
+                node_id=capability_node_id("read_file"),
+                node_type="Capability",
+                name="read_file",
+                stats={"request_count": 3, "execution_count": 2, "blocked_count": 1, "failure_count": 0},
+            ),
+            agent_node_id("ag-root"): MemoryNode(
+                node_id=agent_node_id("ag-root"),
+                node_type="Agent",
+                name="MR1",
+            ),
+        }
+    ))
 
 
 class TestSubmit:
@@ -208,6 +245,31 @@ class TestCompileWorkflow:
         assert rc == 0
         compile_payload = json.loads(compiler.prompts[0][1])
         assert compile_payload["memory"]["enabled"] is False
+
+
+class TestMemoryRetrievalCommands:
+    def test_memory_retrieval_update_stats_and_search(self, tmp_path, store, capsys):
+        _seed_memory_runtime(tmp_path)
+
+        rc = workflow_cli.main(["memory", "retrieval", "update", "--json"], store=store)
+        assert rc == 0
+        update_payload = json.loads(capsys.readouterr().out)
+        assert update_payload["documents_written"] >= 1
+
+        rc = workflow_cli.main(["memory", "retrieval", "stats", "--json"], store=store)
+        assert rc == 0
+        stats_payload = json.loads(capsys.readouterr().out)
+        assert stats_payload["retrieval_ready"] is True
+        assert stats_payload["document_count"] >= 1
+
+        rc = workflow_cli.main(
+            ["memory", "retrieval", "search", "approval friction", "--json", "--limit", "1", "--type", "insight"],
+            store=store,
+        )
+        assert rc == 0
+        search_payload = json.loads(capsys.readouterr().out)
+        assert search_payload["count"] == 1
+        assert search_payload["items"][0]["doc_type"] == "insight"
 
 
 class TestReadCommands:

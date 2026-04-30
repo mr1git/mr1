@@ -31,6 +31,7 @@ from mr1.memory_feedback import (
     update_insight_feedback,
 )
 from mr1.memory_queries import (
+    memory_search,
     memory_graph_agent_summary,
     memory_graph_capabilities,
     memory_graph_failures,
@@ -38,6 +39,7 @@ from mr1.memory_queries import (
     memory_insight_show,
     memory_insights_search,
 )
+from mr1.memory_retrieval import update_memory_retrieval
 from mr1.scoped_agents import PersistentAgentStore
 from mr1.memory_curator import InsightStore, evaluate_memory_curation_due_for_runtime_root
 from mr1.memory_graph import MemoryGraphStore
@@ -475,6 +477,18 @@ class CapabilityRunner:
                 raise CapabilityValidationError(str(exc)) from exc
             return output, None
 
+        if name == "memory_search":
+            try:
+                output = memory_search(
+                    self._workspace_root,
+                    query=config.get("query"),
+                    types=config.get("types"),
+                    limit=config.get("limit"),
+                )
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
         if name == "memory_insight_show":
             try:
                 output = memory_insight_show(
@@ -553,6 +567,13 @@ class CapabilityRunner:
                     insight_store=InsightStore(self._workspace_root / "insights"),
                     workflow_store=WorkflowStore(root=self._workspace_root / "workflows"),
                 ).to_dict()
+            except ValueError as exc:
+                raise CapabilityValidationError(str(exc)) from exc
+            return output, None
+
+        if name == "memory_retrieval_update":
+            try:
+                output = update_memory_retrieval(self._workspace_root).to_dict()
             except ValueError as exc:
                 raise CapabilityValidationError(str(exc)) from exc
             return output, None
