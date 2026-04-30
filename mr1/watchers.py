@@ -150,6 +150,21 @@ def _evaluate_condition_script_pure(path_str: Any, timeout_s: int) -> dict[str, 
     }
 
 
+def _evaluate_memory_curation_due_pure(runtime_root: Optional[str] = None) -> dict[str, Any]:
+    from mr1.memory_curator import evaluate_memory_curation_due_for_runtime_root
+
+    root = Path(runtime_root).expanduser() if isinstance(runtime_root, str) and runtime_root.strip() else None
+    due = evaluate_memory_curation_due_for_runtime_root(root)
+    payload = due.to_dict()
+    payload["state"] = "satisfied" if due.due else "not_satisfied"
+    payload["message"] = (
+        f"memory curation due: {due.important_event_count} important event(s)"
+        if due.due else
+        "memory curation not due"
+    )
+    return payload
+
+
 class FileExistsWatcher:
     def validate_config(self, watch_config: dict[str, Any]) -> None:
         path = watch_config.get("path")
@@ -236,6 +251,27 @@ class ConditionScriptWatcher:
             state=result["state"],
             message=result["message"],
             metadata=result["metadata"],
+        )
+
+
+class MemoryCurationDueWatcher:
+    def validate_config(self, watch_config: dict[str, Any]) -> None:
+        runtime_root = watch_config.get("runtime_root")
+        if runtime_root is not None and (not isinstance(runtime_root, str) or not runtime_root.strip()):
+            raise WatcherConfigError("memory_curation_due runtime_root must be a non-empty string")
+
+    def evaluate(self, task: Task, now: datetime) -> WatchEvaluation:
+        del now
+        result = _evaluate_memory_curation_due_pure(task.watch_config.get("runtime_root"))
+        metadata = {
+            key: value
+            for key, value in result.items()
+            if key not in {"state", "message"}
+        }
+        return WatchEvaluation(
+            state=result["state"],
+            message=result["message"],
+            metadata=metadata,
         )
 
 
@@ -395,6 +431,33 @@ def default_watcher_registry() -> WatcherRegistry:
                     "task_kind": "watcher",
                     "watcher_type": "condition_script",
                     "watch_config": {"path": str(Path(__file__).resolve())},
+                }
+            ],
+        )
+        registry.register(
+            "memory_curation_due",
+            MemoryCurationDueWatcher(),
+            description="Check whether important timeline events make memory curation due.",
+            config_schema={
+                "poll_interval_s": {"type": "int", "required": False},
+                "runtime_root": {"type": "string", "required": False},
+            },
+            outputs={
+                **outputs,
+                "result.data.due": "true when curation is due",
+                "result.data.latest_event_index": "latest event index in the timeline",
+                "result.data.last_curated_event_index": "last curated insight cursor index",
+                "result.data.important_event_count": "number of important events since the cursor",
+                "result.data.important_event_types": "important event types seen since the cursor",
+                "result.data.suggested_event_window": "suggested event index window for the curator",
+            },
+            examples=[
+                {
+                    "label": "curation_due",
+                    "title": "Check memory curation",
+                    "task_kind": "watcher",
+                    "watcher_type": "memory_curation_due",
+                    "watch_config": {},
                 }
             ],
         )

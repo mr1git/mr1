@@ -509,5 +509,52 @@ def default_agent_registry() -> AgentRegistry:
             ],
             config_path=_AGENTS_DIR / "workflow_compiler.yml",
         )
+        registry.register(
+            "memory_curator",
+            description="Specialized memory curator agent that converts compact evidence bundles into advisory insight JSON.",
+            config_schema={
+                "model": {"type": "string", "required": False, "optional": True},
+                "allowed_tools": {
+                    "type": "list[string]",
+                    "required": False,
+                    "optional": True,
+                    "default": [],
+                },
+                "timeout_s": {
+                    "type": "int",
+                    "required": False,
+                    "optional": True,
+                    "default": _DEFAULT_AGENT_TIMEOUT_S,
+                },
+            },
+            runtime={
+                "binary": "claude",
+                "invocation": "claude -p <prompt> --append-system-prompt <system> --output-format json",
+                "supports_json_output": True,
+            },
+            workflow_task_allowed=False,
+            inputs={
+                "bundle": "compact memory curation bundle",
+                "existing_related_insights": "compact existing insight summaries",
+                "graph_stats": "deterministic graph summary",
+            },
+            outputs={
+                "result.text": "memory curator output JSON text",
+                "result.data.raw": "parsed Claude JSON envelope",
+                "result.data.is_error": "true when the Claude envelope reports an error",
+                "result.data.metadata": "Claude metadata block or extra envelope fields",
+                "result.metrics.usage": "Claude usage block when present",
+            },
+            examples=[
+                {
+                    "label": "curate_memory",
+                    "title": "Curate memory",
+                    "task_kind": "agent",
+                    "agent_type": "kazi",
+                    "prompt": "This profile is internal only and cannot be used in workflow tasks.",
+                }
+            ],
+            config_path=_AGENTS_DIR / "memory_curator.yml",
+        )
         _DEFAULT_REGISTRY = registry
     return _DEFAULT_REGISTRY

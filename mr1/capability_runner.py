@@ -25,10 +25,12 @@ from mr1.capability_policy import (
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
+from mr1.memory_curator import evaluate_memory_curation_due_for_runtime_root
 from mr1.tools import _read_file_pure
 from mr1.watchers import (
     _evaluate_condition_script_pure,
     _evaluate_file_exists_pure,
+    _evaluate_memory_curation_due_pure,
     _evaluate_time_reached_pure,
 )
 
@@ -381,6 +383,30 @@ class CapabilityRunner:
                 "state": state,
                 "message": r["message"],
                 **r["metadata"],
+            }
+            return output, None
+
+        if name == "memory_curation_due":
+            runtime_root = config.get("runtime_root")
+            if isinstance(runtime_root, str) and runtime_root.strip():
+                result = _evaluate_memory_curation_due_pure(runtime_root)
+            else:
+                result = evaluate_memory_curation_due_for_runtime_root(self._workspace_root).to_dict()
+                result["state"] = "satisfied" if result["due"] else "not_satisfied"
+                result["message"] = (
+                    f"memory curation due: {result['important_event_count']} important event(s)"
+                    if result["due"] else
+                    "memory curation not due"
+                )
+            output = {
+                "due": bool(result["due"]),
+                "latest_event_index": int(result["latest_event_index"]),
+                "last_curated_event_index": int(result["last_curated_event_index"]),
+                "important_event_count": int(result["important_event_count"]),
+                "important_event_types": list(result["important_event_types"]),
+                "suggested_event_window": list(result["suggested_event_window"]),
+                "state": result["state"],
+                "message": result["message"],
             }
             return output, None
 

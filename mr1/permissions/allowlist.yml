@@ -112,6 +112,20 @@ agents:
       - "echo"
     allowed_tools: []
 
+  memory_curator:
+    description: "Specialized memory curator agent"
+    cli_flags:
+      - "-p"
+      - "--allowedTools"
+      - "--model"
+      - "--output-format"
+      - "--append-system-prompt"
+    shell_commands:
+      - "ls"
+      - "cat"
+      - "echo"
+    allowed_tools: []
+
   mem_dltr:
     description: "Memory deletion agent — can remove memory files"
     cli_flags:

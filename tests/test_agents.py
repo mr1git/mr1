@@ -38,7 +38,7 @@ class TestAgentRegistry:
     def test_lists_runtime_profiles(self):
         registry = default_agent_registry()
 
-        assert registry.list_agents() == ["kazi", "workflow_compiler"]
+        assert registry.list_agents() == ["kazi", "memory_curator", "workflow_compiler"]
 
     def test_describe_agent_shape(self):
         description = default_agent_registry().describe_agent("kazi")
@@ -56,6 +56,14 @@ class TestAgentRegistry:
         description = default_agent_registry().describe_agent("workflow_compiler")
 
         assert description["name"] == "workflow_compiler"
+        assert description["workflow_task_allowed"] is False
+        assert description["runtime"]["supports_json_output"] is True
+        assert description["config_schema"]["allowed_tools"]["default"] == []
+
+    def test_describe_memory_curator_shape(self):
+        description = default_agent_registry().describe_agent("memory_curator")
+
+        assert description["name"] == "memory_curator"
         assert description["workflow_task_allowed"] is False
         assert description["runtime"]["supports_json_output"] is True
         assert description["config_schema"]["allowed_tools"]["default"] == []
