@@ -13,10 +13,12 @@ from mr1.mr1 import (
     MR1,
     MR1Process,
     StateManager,
+    _ORCHESTRATOR_PROMPT,
     _load_agent_config,
     _generate_task_id,
 )
 from mr1.kazi_runner import MockRunner
+from mr1.mrn_run import MRnRunResult
 from mr1.workflow_store import WorkflowStore
 
 
@@ -506,6 +508,76 @@ class TestStep:
         sent = mock_process.send.call_args.args[0]
         assert "Answer this request directly" in sent
         assert "what is 2+2?" in sent
+
+    @pytest.mark.parametrize(
+        "user_text",
+        [
+            "create a child responsible for tool creation",
+            "delegate this domain to an agent",
+            "have an agent own this area",
+            "let that agent propose/create/test three tools",
+        ],
+    )
+    def test_persistent_delegation_requests_are_classified(self, mr1_with_mock_process, user_text):
+        mr1_instance, _mock_process = mr1_with_mock_process
+
+        assert mr1_instance._classify_turn_route(user_text, None) == "persistent_delegation"
+
+    @patch("mr1.mr1.MRnRunRunner.run")
+    def test_persistent_delegation_creates_child_and_runs_persistent_mrn(self, mock_run, tmp_path):
+        compiler = MagicMock()
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+
+        def _fake_run(agent_id, policy, caller_agent_id=None):
+            return MRnRunResult(
+                run_id="run-1",
+                agent_id=agent_id,
+                caller_agent_id=caller_agent_id or mr1_instance._root_agent_id,
+                started_at="2026-01-01T00:00:00+00:00",
+                finished_at="2026-01-01T00:00:02+00:00",
+                policy=policy.to_dict(),
+                steps=[{"iteration": 1, "action": "create_workflow"}],
+                workflows_created=1,
+                messages_created=0,
+                stopped_reason="confirmation_required",
+                status="stopped",
+                final_run_status="reporting",
+            )
+
+        mock_run.side_effect = _fake_run
+
+        request = "create a child responsible for tool creation and let that agent propose/create/test"
+        response = mr1_instance.step(request)
+
+        assert response.startswith("delegated to persistent agent: ag-")
+        assert "run_id=run-1" in response
+        assert "workflows_created=1" in response
+        assert mock_run.call_count == 1
+        agent_id = mock_run.call_args.args[0]
+        policy = mock_run.call_args.args[1]
+        child = mr1_instance._scoped_agents.require_agent(agent_id)
+        assert child.title == "MR2"
+        assert request in (child.mission or "")
+        assert "Own the requested domain/responsibility" in (child.mission or "")
+        assert "Prefer creating workflows for execution when appropriate." in (child.mission or "")
+        assert policy.max_steps == 3
+        assert policy.max_workflows_created == 2
+        assert policy.require_confirmation_for_workflows is True
+        assert compiler.call_count == 0
+        assert mr1_instance._process.send.call_count == 0
+
+    def test_orchestrator_prompt_includes_mr2_ownership_guidance(self):
+        assert "PERSISTENT DELEGATION / OWNERSHIP" in _ORCHESTRATOR_PROMPT
+        assert '{"agent": "mr2"' in _ORCHESTRATOR_PROMPT
+        assert "If the user wants an agent to own an area" in _ORCHESTRATOR_PROMPT
 
     def test_workflow_request_uses_compiler_first_not_brain(self, tmp_path):
         compiler = FakeCompiler(

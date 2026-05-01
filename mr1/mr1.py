@@ -105,6 +105,23 @@ _DELEGATE_PATTERN = re.compile(
     re.DOTALL,
 )
 
+_PERSISTENT_DELEGATION_MARKERS = (
+    "create a child",
+    "create child",
+    "create an agent",
+    "create agent",
+    "delegate this domain",
+    "delegate this area",
+    "delegate this responsibility",
+    "have an agent own",
+    "have a child own",
+    "have an mr2 own",
+    "let that agent",
+    "let the agent",
+    "child responsible for",
+    "agent responsible for",
+)
+
 # Signal that MR1 has finished writing mr1_context.md during /memdltr.
 _DUMP_COMPLETE_SIGNAL = "[MR1:DUMP_COMPLETE]"
 
@@ -135,13 +152,18 @@ You are the user's interface and decision engine. For every message, decide the 
    - monitor or wait for something
    - connect tools / files / agents together
 
-3. DELEGATION (RARE)  
-   Only delegate to a single agent when:
+3. PERSISTENT DELEGATION / OWNERSHIP
+   Create or reuse a persistent MR2-style child agent when the user wants:
+   - a child responsible for an area or domain
+   - delegation of ownership, not just execution
+   - an agent to propose, create, review, or test within that domain
+   - an agent that should decide when to create workflows
+
+4. ONE-SHOT DELEGATION (RARE)  
+   Delegate to a single worker only when:
    - the task is clearly a one-shot execution
    - AND workflow overhead is unnecessary
-   - AND it does not require structured dataflow
-
-Prefer workflows over delegation for anything multi-step.
+   - AND persistent ownership is unnecessary
 
 ---
 
@@ -158,6 +180,8 @@ DO NOT create workflows for:
 These MUST be handled as DIRECT ANSWER.
 
 ONLY create workflows when the user clearly intends execution.
+
+If the user wants an agent to own an area, create a persistent MR2-style child instead of compiling a workflow directly.
 
 If unsure → DIRECT ANSWER.
 
@@ -204,6 +228,14 @@ Never:
 == DELEGATION FORMAT (RARE) ==
 
 Only use if NOT using workflows:
+
+Persistent ownership / orchestration example:
+
+[DELEGATE]
+{"agent": "mr2", "task": "Own tool creation for this area and decide when to create workflows", "context": "Keep responsibility for proposal, safety review, creation, and testing"}
+[/DELEGATE]
+
+One-shot worker example:
 
 [DELEGATE]
 {"agent": "kazi", "task": "clear actionable instruction", "context": "relevant context"}
@@ -300,6 +332,11 @@ def _load_agent_config(path: Path) -> dict:
     """Load an agent YAML definition."""
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _normalize_routing_text(value: str) -> str:
+    """Normalize free-form user text for deterministic routing checks."""
+    return " ".join(value.strip().lower().split())
 
 
 def _generate_task_id() -> str:
@@ -1024,6 +1061,97 @@ class MR1:
             lines.extend(["", f"Confidence: {result.confidence}"])
         return "\n".join(lines)
 
+    def _is_persistent_delegation_request(self, user_input: str) -> bool:
+        normalized = _normalize_routing_text(user_input)
+        if not normalized:
+            return False
+        if any(marker in normalized for marker in _PERSISTENT_DELEGATION_MARKERS):
+            return True
+
+        has_agent_target = any(token in normalized for token in ("mr2", "child", "agent"))
+        if has_agent_target and "responsible for" in normalized:
+            return True
+        if has_agent_target and any(
+            phrase in normalized
+            for phrase in (
+                "own this area",
+                "own this domain",
+                "own this responsibility",
+                "own this part",
+            )
+        ):
+            return True
+        if "delegate" in normalized and any(
+            token in normalized
+            for token in ("domain", "area", "ownership", "owner", "responsible")
+        ):
+            return True
+        return False
+
+    def _classify_turn_route(
+        self,
+        user_input: str,
+        pending_draft: Optional[PendingWorkflowDraft],
+    ) -> str:
+        if pending_draft is None and self._is_persistent_delegation_request(user_input):
+            return "persistent_delegation"
+        return self._workflow_authoring.classify_request(
+            user_input,
+            pending_draft=pending_draft,
+        )
+
+    def _build_persistent_delegation_mission(self, user_input: str) -> str:
+        return "\n".join([
+            "You are a persistent MR2-style child agent.",
+            "Own the requested domain/responsibility instead of treating it as a one-shot execution.",
+            "",
+            "Parent request:",
+            user_input.strip(),
+            "",
+            "Operating instructions:",
+            "- Treat this as an ownership/delegation request.",
+            "- Prefer creating workflows for execution when appropriate.",
+            "- Keep responsibility for proposal quality, safety review, creation, and testing.",
+            "- Use workflow creation when execution should become structured work.",
+            "- Ask the parent for clarification or confirmation when needed.",
+        ])
+
+    def _route_to_persistent_delegation(self, user_input: str) -> str:
+        try:
+            agent = self._scoped_agents.create_child_agent(self._root_agent_id, "MR2")
+            agent = self._scoped_agents.assign_mission(
+                self._root_agent_id,
+                agent.agent_id,
+                self._build_persistent_delegation_mission(user_input),
+            )
+        except (ValueError, AgentScopeError) as exc:
+            return str(exc)
+
+        runner = MRnRunRunner(
+            workflow_store=self._workflow_store,
+            scoped_agent_store=self._scoped_agents,
+            message_store=self._message_store,
+        )
+        policy = MRnRunPolicy(
+            max_steps=3,
+            max_workflows_created=2,
+            require_confirmation_for_workflows=True,
+        )
+        try:
+            result = runner.run(
+                agent.agent_id,
+                policy,
+                caller_agent_id=self._root_agent_id,
+            )
+        except (ValueError, AgentScopeError) as exc:
+            return str(exc)
+
+        self._state.add_decision(user_input, "spawn_persistent_mr2", agent.agent_id)
+        return "\n".join([
+            f"delegated to persistent agent: {agent.agent_id} ({agent.title})",
+            workflow_cli._format_mrn_run_result(result),
+        ])
+
     def _answer_directly(self, user_input: str) -> str:
         raw = self._send_to_brain(
             "Answer this request directly. Do not delegate to MR2 or Kazi.\n\n"
@@ -1219,22 +1347,28 @@ class MR1:
         Process one turn of conversation.
 
         Phase 5 is compiler-first for normal turns:
-          1. Decide direct answer vs workflow authoring
-          2. For workflow turns: compile, validate, preview, submit
-          3. For direct answers: ask MR1 to answer without delegation
+          1. Decide direct answer vs persistent delegation vs workflow authoring
+          2. For persistent delegation: create/run a scoped MRn child
+          3. For workflow turns: compile, validate, preview, submit
+          4. For direct answers: ask MR1 to answer without delegation
         """
         self._record_conversation("user", user_input)
         pending = self._workflow_authoring.coerce_pending_draft(
             self._state.pending_workflow
         )
-        action = self._workflow_authoring.classify_request(
+        action = self._classify_turn_route(
             user_input,
-            pending_draft=pending,
+            pending,
         )
 
         if action == "direct_answer":
             self._state.add_decision(user_input, "direct_answer")
             return self._record_local_response(self._answer_directly(user_input))
+
+        if action == "persistent_delegation":
+            return self._record_local_response(
+                self._route_to_persistent_delegation(user_input)
+            )
 
         if action == "show_json_preview":
             if pending is None:
