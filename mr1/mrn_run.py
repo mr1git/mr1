@@ -179,7 +179,11 @@ class MRnRunRunner:
                     status = "stopped"
                     break
 
-                step_result = step_runner.step(agent_id, caller_agent_id=resolved_caller)
+                step_result = step_runner.step(
+                    agent_id,
+                    caller_agent_id=resolved_caller,
+                    run_id=run_id,
+                )
                 step_summaries.append(step_result.to_dict())
                 if step_result.created_workflow_id is not None:
                     workflows_created += 1

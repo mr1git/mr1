@@ -123,6 +123,7 @@ class MRnStepResult:
     workflow_submitted: bool = False
     capability_result: Optional[dict[str, Any]] = None
     stored_as: Optional[str] = None
+    prompt_artifact_path: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -146,6 +147,7 @@ class MRnStepResult:
             "workflow_submitted": self.workflow_submitted,
             "capability_result": self.capability_result,
             "stored_as": self.stored_as,
+            "prompt_artifact_path": self.prompt_artifact_path,
         }
 
 
@@ -319,6 +321,7 @@ class MRnStepRunner:
         self,
         agent_id: str,
         caller_agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> MRnStepResult:
         resolved_caller = caller_agent_id or self._scoped_agents.root_agent_id
         if not self._scoped_agents.can_manage_agent(resolved_caller, agent_id):
@@ -347,6 +350,15 @@ class MRnStepRunner:
         )
 
         prompt = self._build_step_prompt(agent)
+        prompt_artifact_path = self._write_prompt_artifact(
+            agent,
+            step_id=step_id,
+            run_id=run_id,
+            caller_agent_id=resolved_caller,
+            system_prompt=_SYSTEM_PROMPT,
+            prompt=prompt,
+            correlation_id=correlation_id,
+        )
         with bind_correlation_id(correlation_id):
             raw = self._reasoner(agent, _SYSTEM_PROMPT, prompt)
             try:
@@ -364,16 +376,23 @@ class MRnStepRunner:
                         agent,
                         reason=f"invalid mrn action: {second_exc}",
                         raw_action=corrected_raw,
+                        prompt_artifact_path=str(prompt_artifact_path),
                     )
 
             step_call_count = [0]  # mutable counter, scoped to this step() invocation
             try:
-                return self._execute_action(agent, action, step_call_count)
+                return self._execute_action(
+                    agent,
+                    action,
+                    step_call_count,
+                    prompt_artifact_path=str(prompt_artifact_path),
+                )
             except (AgentScopeError, WorkflowCompilerFailure, WorkflowSpecError, RuntimeError, ValueError) as exc:
                 return self._persist_blocked_step(
                     agent,
                     reason=str(exc),
                     raw_action=_json_dumps(action),
+                    prompt_artifact_path=str(prompt_artifact_path),
                 )
 
     def _build_step_prompt(self, agent: PersistentAgent) -> str:
@@ -539,6 +558,43 @@ class MRnStepRunner:
             invalid_output,
         ])
 
+    def _write_prompt_artifact(
+        self,
+        agent: PersistentAgent,
+        *,
+        step_id: str,
+        run_id: Optional[str],
+        caller_agent_id: str,
+        system_prompt: str,
+        prompt: str,
+        correlation_id: str,
+    ) -> Path:
+        payload = {
+            "agent_id": agent.agent_id,
+            "agent_type": agent.agent_type,
+            "agent_title": agent.title,
+            "tree_level": agent.tree_level,
+            "parent_agent_id": agent.parent_agent_id,
+            "caller_agent_id": caller_agent_id,
+            "run_id": run_id,
+            "step_id": step_id,
+            "correlation_id": correlation_id,
+            "mission": agent.mission,
+            "run_status_before": agent.run_status,
+            "current_iteration_before": agent.current_iteration,
+            "parent_request": agent.parent_request,
+            "owned_workflow_ids": list(agent.owned_workflow_ids),
+            "step_context": dict(agent.step_context),
+            "system_prompt": system_prompt,
+            "prompt": prompt,
+            "full_payload": f"{system_prompt}\n\n{prompt}",
+        }
+        return self._scoped_agents.write_step_prompt_artifact(
+            agent.agent_id,
+            step_id,
+            payload,
+        )
+
     def _parse_and_validate_action(self, raw: str) -> dict[str, Any]:
         action = _extract_json_object(raw)
         action_name = action.get("action")
@@ -621,26 +677,59 @@ class MRnStepRunner:
         agent: PersistentAgent,
         action: dict[str, Any],
         step_call_count: list[int],
+        *,
+        prompt_artifact_path: Optional[str] = None,
     ) -> MRnStepResult:
         if action["action"] == "call_capability":
-            return self._execute_call_capability(agent, action, step_call_count)
+            return self._execute_call_capability(
+                agent,
+                action,
+                step_call_count,
+                prompt_artifact_path=prompt_artifact_path,
+            )
         if action["action"] == "create_workflow":
-            return self._execute_create_workflow(agent, action)
+            return self._execute_create_workflow(
+                agent,
+                action,
+                prompt_artifact_path=prompt_artifact_path,
+            )
         if action["action"] == "inspect_workflow":
-            return self._execute_inspect_workflow(agent, action)
+            return self._execute_inspect_workflow(
+                agent,
+                action,
+                prompt_artifact_path=prompt_artifact_path,
+            )
         if action["action"] == "write_report":
-            return self._execute_write_report(agent, action)
+            return self._execute_write_report(
+                agent,
+                action,
+                prompt_artifact_path=prompt_artifact_path,
+            )
         if action["action"] == "send_message":
-            return self._execute_send_message(agent, action)
+            return self._execute_send_message(
+                agent,
+                action,
+                prompt_artifact_path=prompt_artifact_path,
+            )
         if action["action"] == "ask_parent":
-            return self._execute_ask_parent(agent, action)
-        return self._execute_idle(agent, action)
+            return self._execute_ask_parent(
+                agent,
+                action,
+                prompt_artifact_path=prompt_artifact_path,
+            )
+        return self._execute_idle(
+            agent,
+            action,
+            prompt_artifact_path=prompt_artifact_path,
+        )
 
     def _execute_call_capability(
         self,
         agent: PersistentAgent,
         action: dict[str, Any],
         step_call_count: list[int],
+        *,
+        prompt_artifact_path: Optional[str] = None,
     ) -> MRnStepResult:
         step_call_count[0] += 1
 
@@ -680,9 +769,16 @@ class MRnStepRunner:
                 "audit_record_path": result.audit_record_path,
             },
             stored_as=stored_as,
+            prompt_artifact_path=prompt_artifact_path,
         )
 
-    def _execute_create_workflow(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+    def _execute_create_workflow(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        *,
+        prompt_artifact_path: Optional[str] = None,
+    ) -> MRnStepResult:
         compile_context = self._build_create_workflow_context(agent, action)
         client = (
             self._workflow_compiler_client or
@@ -745,6 +841,7 @@ class MRnStepRunner:
                     created_workflow.status.value if created_workflow is not None else None
                 ),
                 workflow_submitted=True,
+                prompt_artifact_path=prompt_artifact_path,
             )
 
         report_path = self._scoped_agents.write_report(
@@ -784,6 +881,7 @@ class MRnStepRunner:
             message_to_agent_id=parent_message.to_agent_id if parent_message is not None else None,
             confirmation_required=True,
             workflow_submitted=False,
+            prompt_artifact_path=prompt_artifact_path,
         )
         self._emit_mrn_reported(agent, result)
         return result
@@ -833,7 +931,13 @@ class MRnStepRunner:
             lines.append("- none")
         return "\n".join(lines)
 
-    def _execute_inspect_workflow(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+    def _execute_inspect_workflow(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        *,
+        prompt_artifact_path: Optional[str] = None,
+    ) -> MRnStepResult:
         workflow = self._workflow_store.load_workflow(action["workflow_id"])
         if workflow is None:
             raise ValueError(f"workflow not found: {action['workflow_id']}")
@@ -848,6 +952,7 @@ class MRnStepRunner:
             message=f"inspected workflow {workflow.workflow_id}",
             workflow_id=workflow.workflow_id,
             workflow_summary=summary,
+            prompt_artifact_path=prompt_artifact_path,
         )
 
     def _summarize_workflow(self, workflow: Workflow) -> dict[str, Any]:
@@ -880,7 +985,13 @@ class MRnStepRunner:
             "recent_events": events,
         }
 
-    def _execute_write_report(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+    def _execute_write_report(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        *,
+        prompt_artifact_path: Optional[str] = None,
+    ) -> MRnStepResult:
         content = "\n".join([
             f"# MRn Report for {agent.title}",
             "",
@@ -908,11 +1019,18 @@ class MRnStepRunner:
             message_id=message.message_id if message is not None else None,
             created_parent_message_id=message.message_id if message is not None else None,
             message_to_agent_id=message.to_agent_id if message is not None else None,
+            prompt_artifact_path=prompt_artifact_path,
         )
         self._emit_mrn_reported(agent, result)
         return result
 
-    def _execute_send_message(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+    def _execute_send_message(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        *,
+        prompt_artifact_path: Optional[str] = None,
+    ) -> MRnStepResult:
         message = self._send_agent_message(
             agent,
             kind=action["message_kind"],
@@ -934,9 +1052,16 @@ class MRnStepRunner:
                 else None
             ),
             message_to_agent_id=message.to_agent_id,
+            prompt_artifact_path=prompt_artifact_path,
         )
 
-    def _execute_ask_parent(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+    def _execute_ask_parent(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        *,
+        prompt_artifact_path: Optional[str] = None,
+    ) -> MRnStepResult:
         message = self._send_agent_message(
             agent,
             kind="question",
@@ -953,14 +1078,22 @@ class MRnStepRunner:
             parent_request=action["parent_request"],
             created_parent_message_id=message.message_id,
             message_to_agent_id=message.to_agent_id,
+            prompt_artifact_path=prompt_artifact_path,
         )
 
-    def _execute_idle(self, agent: PersistentAgent, action: dict[str, Any]) -> MRnStepResult:
+    def _execute_idle(
+        self,
+        agent: PersistentAgent,
+        action: dict[str, Any],
+        *,
+        prompt_artifact_path: Optional[str] = None,
+    ) -> MRnStepResult:
         return self._persist_step(
             agent,
             action=action,
             status_after="idle",
             message="agent remains idle",
+            prompt_artifact_path=prompt_artifact_path,
         )
 
     def _persist_step(
@@ -984,6 +1117,7 @@ class MRnStepRunner:
         workflow_submitted: bool = False,
         capability_result: Optional[dict[str, Any]] = None,
         stored_as: Optional[str] = None,
+        prompt_artifact_path: Optional[str] = None,
     ) -> MRnStepResult:
         updated = self._scoped_agents.require_agent(agent.agent_id)
         status_before = updated.run_status
@@ -1011,6 +1145,8 @@ class MRnStepRunner:
             normalized_last_action["created_parent_message_id"] = created_parent_message_id
         if message_to_agent_id is not None:
             normalized_last_action["message_to_agent_id"] = message_to_agent_id
+        if prompt_artifact_path is not None:
+            normalized_last_action["prompt_artifact_path"] = prompt_artifact_path
         if confirmation_required:
             normalized_last_action["confirmation_required"] = True
         if workflow_submitted:
@@ -1041,6 +1177,7 @@ class MRnStepRunner:
             "workflow_submitted": workflow_submitted,
             "capability_result": capability_result,
             "stored_as": stored_as,
+            "prompt_artifact_path": prompt_artifact_path,
         }
         if workflow_summary is not None:
             log_record["workflow_summary"] = workflow_summary
@@ -1062,6 +1199,7 @@ class MRnStepRunner:
                 "action": action["action"],
                 "reason": action["reason"],
                 "error": error,
+                "prompt_artifact_path": prompt_artifact_path,
             },
         )
         return MRnStepResult(
@@ -1085,6 +1223,7 @@ class MRnStepRunner:
             workflow_submitted=workflow_submitted,
             capability_result=capability_result,
             stored_as=stored_as,
+            prompt_artifact_path=prompt_artifact_path,
         )
 
     def _send_agent_message(
@@ -1120,6 +1259,7 @@ class MRnStepRunner:
         *,
         reason: str,
         raw_action: str,
+        prompt_artifact_path: Optional[str] = None,
     ) -> MRnStepResult:
         action = {
             "action": "invalid",
@@ -1133,6 +1273,7 @@ class MRnStepRunner:
             message="step blocked",
             error=reason,
             workflow_summary={"raw_action": _compact(raw_action, limit=400)},
+            prompt_artifact_path=prompt_artifact_path,
         )
 
     def _emit_mrn_reported(self, agent: PersistentAgent, result: MRnStepResult) -> None:

@@ -202,6 +202,22 @@ class PersistentAgentStore:
     def step_log_path(self, agent_id: str) -> Path:
         return self.logs_dir(agent_id) / "steps.jsonl"
 
+    def step_artifacts_dir(self, agent_id: str) -> Path:
+        path = self.logs_dir(agent_id) / "steps"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def step_prompt_artifact_path(
+        self,
+        agent_id: str,
+        step_id: str,
+        *,
+        attempt: str = "primary",
+    ) -> Path:
+        safe_step_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in step_id)
+        suffix = "" if attempt == "primary" else f".{attempt}"
+        return self.step_artifacts_dir(agent_id) / f"{safe_step_id}{suffix}.prompt.json"
+
     def run_logs_dir(self, agent_id: str) -> Path:
         path = self.logs_dir(agent_id) / "runs"
         path.mkdir(parents=True, exist_ok=True)
@@ -221,6 +237,7 @@ class PersistentAgentStore:
     def ensure_agent_files(self, agent_id: str) -> None:
         self.agent_dir(agent_id)
         self.logs_dir(agent_id)
+        self.step_artifacts_dir(agent_id)
         self.run_logs_dir(agent_id)
         self.report_dir(agent_id)
         memory_path = self.memory_path(agent_id)
@@ -606,6 +623,22 @@ class PersistentAgentStore:
             path = self.step_log_path(agent_id)
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
+            return path
+
+    def write_step_prompt_artifact(
+        self,
+        agent_id: str,
+        step_id: str,
+        record: dict[str, Any],
+        *,
+        attempt: str = "primary",
+    ) -> Path:
+        with self._lock:
+            path = self.step_prompt_artifact_path(agent_id, step_id, attempt=attempt)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, indent=2, sort_keys=True)
+            tmp.replace(path)
             return path
 
     def write_run_log(self, agent_id: str, run_id: str, record: dict[str, Any]) -> Path:

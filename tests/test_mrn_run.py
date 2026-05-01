@@ -64,10 +64,15 @@ class StubStepRunner:
     def __init__(self, agent_store: PersistentAgentStore, results: list[MRnStepResult]):
         self._agent_store = agent_store
         self._results = list(results)
-        self.calls: list[tuple[str, str | None]] = []
+        self.calls: list[tuple[str, str | None, str | None]] = []
 
-    def step(self, agent_id: str, caller_agent_id: str | None = None) -> MRnStepResult:
-        self.calls.append((agent_id, caller_agent_id))
+    def step(
+        self,
+        agent_id: str,
+        caller_agent_id: str | None = None,
+        run_id: str | None = None,
+    ) -> MRnStepResult:
+        self.calls.append((agent_id, caller_agent_id, run_id))
         if not self._results:
             raise AssertionError("no step results configured")
         result = self._results.pop(0)
@@ -268,7 +273,12 @@ def test_run_log_written_with_policy_and_step_summaries(workflow_store, agent_st
         scoped_agent_store=agent_store,
         message_store=message_store,
         step_runner=StubStepRunner(agent_store, [
-            _step_result(child.agent_id, 1, status_after="working"),
+            _step_result(
+                child.agent_id,
+                1,
+                status_after="working",
+                prompt_artifact_path="/tmp/prompt-artifact.json",
+            ),
         ]),
     )
 
@@ -282,6 +292,7 @@ def test_run_log_written_with_policy_and_step_summaries(workflow_store, agent_st
 
     assert payload["policy"]["max_steps"] == 1
     assert payload["steps"][0]["iteration"] == 1
+    assert payload["steps"][0]["prompt_artifact_path"] == "/tmp/prompt-artifact.json"
     assert summary["run_id"] == result.run_id
     assert reloaded.last_run["run_id"] == result.run_id
 

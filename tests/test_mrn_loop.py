@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -179,16 +180,19 @@ def test_valid_idle_action_updates_iteration_and_log(workflow_store, agent_store
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
     agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
+    reasoner = FakeReasoner(_action("idle"))
     runner = MRnStepRunner(
         workflow_store=workflow_store,
         scoped_agent_store=agent_store,
-        reasoner=FakeReasoner(_action("idle")),
+        reasoner=reasoner,
     )
 
-    result = runner.step(child.agent_id)
+    result = runner.step(child.agent_id, run_id="run-123")
     reloaded = agent_store.require_agent(child.agent_id)
     logs = agent_store.step_log_path(child.agent_id).read_text(encoding="utf-8").strip().splitlines()
     record = json.loads(logs[-1])
+    prompt_artifact_path = Path(record["prompt_artifact_path"])
+    prompt_artifact = json.loads(prompt_artifact_path.read_text(encoding="utf-8"))
 
     assert result.action == "idle"
     assert result.iteration == 1
@@ -196,6 +200,13 @@ def test_valid_idle_action_updates_iteration_and_log(workflow_store, agent_store
     assert reloaded.run_status == "idle"
     assert record["action"] == "idle"
     assert record["iteration"] == 1
+    assert result.prompt_artifact_path == str(prompt_artifact_path)
+    assert prompt_artifact["agent_id"] == child.agent_id
+    assert prompt_artifact["step_id"] == f"{child.agent_id}:1"
+    assert prompt_artifact["run_id"] == "run-123"
+    assert prompt_artifact["system_prompt"] == reasoner.calls[0][1]
+    assert prompt_artifact["prompt"] == reasoner.calls[0][2]
+    assert prompt_artifact["full_payload"] == f"{reasoner.calls[0][1]}\n\n{reasoner.calls[0][2]}"
 
 
 def test_valid_write_report_writes_report_file_and_updates_status(workflow_store, agent_store, message_store):

@@ -523,6 +523,18 @@ class TestStep:
 
         assert mr1_instance._classify_turn_route(user_text, None) == "persistent_delegation"
 
+    def test_non_ownership_requests_preserve_existing_routing(self, mr1_with_mock_process):
+        mr1_instance, _mock_process = mr1_with_mock_process
+
+        assert mr1_instance._classify_turn_route("what is 2+2?", None) == "direct_answer"
+        assert (
+            mr1_instance._classify_turn_route(
+                "Read a file, check Python version, and summarize",
+                None,
+            )
+            == "create_workflow"
+        )
+
     @patch("mr1.mr1.MRnRunRunner.run")
     def test_persistent_delegation_creates_child_and_runs_persistent_mrn(self, mock_run, tmp_path):
         compiler = MagicMock()
@@ -568,6 +580,8 @@ class TestStep:
         assert request in (child.mission or "")
         assert "Own the requested domain/responsibility" in (child.mission or "")
         assert "Prefer creating workflows for execution when appropriate." in (child.mission or "")
+        assert "Keep responsibility for proposal quality, safety review, creation, and testing." in (child.mission or "")
+        assert "Escalate to MR1/user when clarification or confirmation is needed." in (child.mission or "")
         assert policy.max_steps == 3
         assert policy.max_workflows_created == 2
         assert policy.require_confirmation_for_workflows is True

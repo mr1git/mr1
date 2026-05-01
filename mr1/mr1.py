@@ -1113,7 +1113,7 @@ class MR1:
             "- Prefer creating workflows for execution when appropriate.",
             "- Keep responsibility for proposal quality, safety review, creation, and testing.",
             "- Use workflow creation when execution should become structured work.",
-            "- Ask the parent for clarification or confirmation when needed.",
+            "- Escalate to MR1/user when clarification or confirmation is needed.",
         ])
 
     def _route_to_persistent_delegation(self, user_input: str) -> str:
