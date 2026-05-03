@@ -221,7 +221,10 @@ def test_reply_message_creates_message(workflow_store, agent_store, message_stor
         ])),
     )
 
-    result = runner.run(InboxTriagePolicy(auto_mark_read=False), caller_agent_id=root.agent_id)
+    result = runner.run(
+        InboxTriagePolicy(auto_mark_read=False, allow_reply_messages=True),
+        caller_agent_id=root.agent_id,
+    )
     sent_id = result.actions_executed[0]["created_message_id"]
     sent = message_store.get_message(sent_id)
 
@@ -230,6 +233,40 @@ def test_reply_message_creates_message(workflow_store, agent_store, message_stor
     assert sent.subject == "Re: Need input"
     assert sent.kind == message.kind
     assert sent.to_agent_id == child.agent_id
+
+
+def test_reply_message_is_blocked_by_default_and_surfaces_pending_question(
+    workflow_store,
+    agent_store,
+    message_store,
+):
+    root, _child, message = _root_message(message_store, agent_store, subject="Need input")
+    reasoner = FakeReasoner(
+        _triage([
+            _action(
+                "reply_message",
+                message_id=message.message_id,
+                reply_body="Please continue.",
+            )
+        ]),
+        _triage([
+            _action("ask_user", reason="Child is waiting for a parent reply.")
+        ], summary="pending child question"),
+    )
+    runner = InboxTriageRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        reasoner=reasoner,
+    )
+
+    result = runner.run(InboxTriagePolicy(auto_mark_read=False), caller_agent_id=root.agent_id)
+
+    assert len(reasoner.calls) == 2
+    assert result.summary == "pending child question"
+    assert result.actions_executed[0]["status"] == "ask_user"
+    assert result.counts["messages_sent"] == 0
+    assert message_store.get_message(message.message_id).status == "unread"
 
 
 def test_agent_run_invoked(workflow_store, agent_store, message_store):

@@ -25,11 +25,10 @@ Every state change follows the same atomic shape:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-import hashlib
+from dataclasses import replace
 import json
 import threading
-import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -43,14 +42,10 @@ from mr1.capability_policy import (
     CapabilityMetadata,
     CapabilityRequest,
     PolicyEngine,
-    build_approval_request,
-    build_scope_context,
-    capability_audit_index_entry,
-    maybe_route_approval_request,
 )
+from mr1.core import Logger
 from mr1.conditions import (
     ConditionEvaluation,
-    SUPPORTED_DEPENDENCY_POLICIES,
     evaluate_condition,
     validate_condition,
     validate_dependency_policy,
@@ -83,6 +78,47 @@ from mr1.tools import (
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
+from mr1.scheduler_core.attempts import (
+    AttemptManager,
+    UNSET as ATTEMPT_UNSET,
+    attempt_result_payload as _attempt_result_payload_impl,
+    run_result_from_payload as _run_result_from_payload_impl,
+    set_task_terminal_attempt as _set_task_terminal_attempt_impl,
+)
+from mr1.scheduler_core.capability_gate import CapabilityGate
+from mr1.scheduler_core.dependencies import (
+    DependencyGateDecision,
+    compute_ancestor_labels,
+    evaluate_dependency_gate,
+    status_for_reset,
+)
+from mr1.scheduler_core.diagnostics import (
+    available_agent_slots,
+    build_scheduler_log_metadata,
+    probe_path,
+)
+from mr1.scheduler_core.discovery import WorkflowQueryService, workflow_has_live_handles
+from mr1.scheduler_core.events import SchedulerEventAdapter
+from mr1.scheduler_core.mutations import (
+    append_workflow_on_disk as _mutation_append_workflow_on_disk,
+    cancel_task_on_disk as _mutation_cancel_task_on_disk,
+    cancel_workflow_on_disk as _mutation_cancel_workflow_on_disk,
+    insert_workflow_on_disk as _mutation_insert_workflow_on_disk,
+    label_for_task_id as _label_for_task_id_impl,
+    new_task_from_spec as _new_task_from_spec_impl,
+    replace_workflow_on_disk as _mutation_replace_workflow_on_disk,
+    require_fragment_tasks as _require_fragment_tasks_impl,
+    rerun_task_on_disk as _mutation_rerun_task_on_disk,
+    task_for_label_or_id as _task_for_label_or_id_impl,
+    task_spec_for_workflow as _task_spec_for_workflow_impl,
+    workflow_to_spec as _workflow_to_spec_impl,
+)
+from mr1.scheduler_core.reporting import WorkflowReporter
+from mr1.scheduler_core.semantic_validation import (
+    SemanticValidator,
+    extract_semantic_expectation,
+)
+from mr1.scheduler_core.state_machine import reopen_workflow
 from mr1.watchers import (
     WatcherConfigError,
     WatchEvaluation,
@@ -94,7 +130,6 @@ from mr1.workflow_models import (
     FAILED_TASK_STATUSES,
     Provenance,
     Task,
-    TaskAttempt,
     TaskStatus,
     Workflow,
     WorkflowStatus,
@@ -108,16 +143,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-_UNSET = object()
-
-
-@dataclass(frozen=True)
-class DependencyGateDecision:
-    state: str
-    reason: str
-    blocked_by: list[str] = field(default_factory=list)
-
-
+_UNSET = ATTEMPT_UNSET
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -244,7 +270,7 @@ def validate_spec(
     if visited != len(labels):
         raise WorkflowSpecError("workflow spec contains a dependency cycle")
 
-    ancestors = _compute_ancestor_labels(depends_on_by_label)
+    ancestors = compute_ancestor_labels(depends_on_by_label)
     for raw in tasks:
         raw_inputs = raw.get("inputs", [])
         if not isinstance(raw_inputs, list):
@@ -364,6 +390,14 @@ def build_workflow_from_spec(
             for label in (raw.get("depends_on") or [])
         ]
         wf.tasks[task.task_id] = task
+
+    semantic_expectations: dict[str, dict[str, Any]] = {}
+    for raw, task in task_objs:
+        expectation = extract_semantic_expectation(raw, workflow_title=wf.title)
+        if expectation is not None:
+            semantic_expectations[task.task_id] = expectation
+    if semantic_expectations:
+        wf.metadata["semantic_expectations"] = semantic_expectations
 
     wf.label_to_task_id = label_to_task_id
     return wf
@@ -537,141 +571,31 @@ def trigger_watcher_on_disk(
 
 
 def _label_for_task_id(workflow: Workflow, task_id: str) -> Optional[str]:
-    for label, candidate in workflow.label_to_task_id.items():
-        if candidate == task_id:
-            return label
-    return None
+    return _label_for_task_id_impl(workflow, task_id)
 
 
 def _task_for_label_or_id(workflow: Workflow, label_or_task_id: str) -> Optional[Task]:
-    return workflow.tasks.get(label_or_task_id) or workflow.task_by_label(label_or_task_id)
+    return _task_for_label_or_id_impl(workflow, label_or_task_id)
 
 
 def _task_spec_for_workflow(workflow: Workflow, task: Task) -> dict[str, Any]:
-    dep_labels = [
-        _label_for_task_id(workflow, parent_id) or parent_id
-        for parent_id in task.depends_on
-    ]
-    task_spec: dict[str, Any] = {
-        "label": task.label,
-        "title": task.title,
-        "task_kind": task.task_kind,
-    }
-    if dep_labels:
-        task_spec["depends_on"] = dep_labels
-    if task.dependency_policy != "all_succeeded":
-        task_spec["dependency_policy"] = task.dependency_policy
-    if task.run_if is not None:
-        task_spec["run_if"] = dict(task.run_if)
-    if task.inputs:
-        task_spec["inputs"] = [item.to_dict() for item in task.inputs]
-    if task.timeout_s is not None:
-        task_spec["timeout_s"] = task.timeout_s
-    if task.task_kind == "agent":
-        task_spec["agent_type"] = task.agent_type or "kazi"
-        task_spec["prompt"] = task.prompt
-    elif task.task_kind == "tool":
-        task_spec["tool_type"] = task.tool_type
-        task_spec["tool_config"] = dict(task.tool_config)
-    elif task.task_kind == "watcher":
-        task_spec["watcher_type"] = task.watcher_type
-        task_spec["watch_config"] = dict(task.watch_config)
-        if task.condition is not None:
-            task_spec["condition"] = dict(task.condition)
-    return task_spec
+    return _task_spec_for_workflow_impl(workflow, task)
 
 
 def _workflow_to_spec(workflow: Workflow) -> dict[str, Any]:
-    tasks: list[dict[str, Any]] = []
-    for label, task_id in workflow.label_to_task_id.items():
-        task = workflow.tasks.get(task_id)
-        if task is None:
-            continue
-        tasks.append(_task_spec_for_workflow(workflow, task))
-    return {
-        "title": workflow.title,
-        "tasks": tasks,
-    }
+    return _workflow_to_spec_impl(workflow)
 
 
 def _reopen_workflow(workflow: Workflow) -> None:
-    workflow.finished_at = None
-    if any(task.status is TaskStatus.RUNNING for task in workflow.tasks.values()):
-        workflow.status = WorkflowStatus.RUNNING
-    else:
-        workflow.status = WorkflowStatus.PENDING
+    reopen_workflow(workflow)
 
 
 def _evaluate_dependency_gate(workflow: Workflow, task: Task) -> DependencyGateDecision:
-    if not task.depends_on:
-        return DependencyGateDecision("pass", "no dependencies; ready to run")
-
-    policy = task.dependency_policy
-    if policy not in SUPPORTED_DEPENDENCY_POLICIES:
-        policy = "all_succeeded"
-
-    if policy == "all_succeeded":
-        failed_parents = [
-            parent_id
-            for parent_id in task.depends_on
-            if (parent := workflow.tasks.get(parent_id)) is not None
-            and parent.status in FAILED_TASK_STATUSES
-        ]
-        if failed_parents:
-            parent_statuses = [
-                f"{workflow.tasks[parent_id].label}={workflow.tasks[parent_id].status.value}"
-                for parent_id in failed_parents
-            ]
-            return DependencyGateDecision(
-                "block",
-                ", ".join(parent_statuses),
-                blocked_by=failed_parents,
-            )
-        skipped_parents = [
-            parent_id
-            for parent_id in task.depends_on
-            if (parent := workflow.tasks.get(parent_id)) is not None
-            and parent.status is TaskStatus.SKIPPED
-        ]
-        if skipped_parents:
-            return DependencyGateDecision(
-                "skip",
-                "dependency branch skipped under all_succeeded",
-            )
-        parents_ok = all(
-            (parent := workflow.tasks.get(parent_id)) is not None
-            and parent.status is TaskStatus.SUCCEEDED
-            for parent_id in task.depends_on
-        )
-        if parents_ok:
-            return DependencyGateDecision("pass", "all dependencies succeeded")
-        return DependencyGateDecision(
-            "wait",
-            f"waiting on {len(task.depends_on)} dependency(ies)",
-        )
-
-    all_terminal = all(
-        (parent := workflow.tasks.get(parent_id)) is not None
-        and parent.is_terminal()
-        for parent_id in task.depends_on
-    )
-    if not all_terminal:
-        return DependencyGateDecision(
-            "wait",
-            f"waiting on {len(task.depends_on)} dependency(ies)",
-        )
-    if any(
-        (parent := workflow.tasks.get(parent_id)) is not None
-        and parent.status is TaskStatus.SUCCEEDED
-        for parent_id in task.depends_on
-    ):
-        return DependencyGateDecision("pass", "dependency policy any_succeeded satisfied")
-    return DependencyGateDecision("skip", "no dependency succeeded under any_succeeded")
+    return evaluate_dependency_gate(workflow, task)
 
 
 def _status_for_reset(workflow: Workflow, task: Task) -> TaskStatus:
-    gate = _evaluate_dependency_gate(workflow, task)
-    return TaskStatus.READY if gate.state == "pass" else TaskStatus.WAITING
+    return status_for_reset(workflow, task)
 
 
 def _condition_message(evaluation: ConditionEvaluation) -> str:
@@ -712,16 +636,14 @@ def _attempt_result_payload(
     error_type: Optional[str],
     result_summary: Optional[str],
 ) -> dict[str, Any]:
-    return {
-        "task_id": task.task_id,
-        "workflow_id": task.workflow_id,
-        "attempt_id": task.current_attempt or None,
-        "status": status.value,
-        "exit_code": exit_code,
-        "error": error,
-        "error_type": error_type,
-        "summary": result_summary,
-    }
+    return _attempt_result_payload_impl(
+        task,
+        status=status,
+        exit_code=exit_code,
+        error=error,
+        error_type=error_type,
+        result_summary=result_summary,
+    )
 
 
 def _set_task_terminal_attempt(
@@ -736,38 +658,17 @@ def _set_task_terminal_attempt(
     result_summary: Optional[str],
     result_payload: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
-    if task.current_attempt <= 0 or task.current_attempt > len(task.attempts):
-        return None
-    attempt = task.attempts[task.current_attempt - 1]
-    result_path = str(store.write_attempt_result(
-        workflow.workflow_id,
-        task.task_id,
-        attempt.attempt_id,
-        result_payload or _attempt_result_payload(
-            task,
-            status=status,
-            exit_code=exit_code,
-            error=error,
-            error_type=error_type,
-            result_summary=result_summary,
-        ),
-    ))
-    now_iso = _now_iso()
-    attempt.finished_at = now_iso
-    attempt.status = status
-    attempt.exit_code = exit_code
-    attempt.error = error
-    attempt.error_type = error_type
-    attempt.result_path = result_path
-    task.status = status
-    task.finished_at = now_iso
-    task.exit_code = exit_code
-    task.pid = None
-    task.last_error = error
-    task.last_error_type = error_type
-    task.result_summary = result_summary
-    task.result_path = result_path
-    return result_path
+    return _set_task_terminal_attempt_impl(
+        store,
+        workflow,
+        task,
+        status=status,
+        exit_code=exit_code,
+        error=error,
+        error_type=error_type,
+        result_summary=result_summary,
+        result_payload=result_payload,
+    )
 
 
 def rerun_task_on_disk(
@@ -777,60 +678,15 @@ def rerun_task_on_disk(
     *,
     agent_id: str = "scheduler",
 ) -> str:
-    event_log = WorkflowEventLog(store, default_agent_id=agent_id)
-    with store.locked():
-        workflow = store.load_workflow(workflow_id)
-        if workflow is None:
-            raise WorkflowSpecError(f"workflow not found: {workflow_id}")
-        task = _task_for_label_or_id(workflow, label_or_task_id)
-        if task is None:
-            raise WorkflowSpecError(
-                f"task not found in workflow {workflow_id}: {label_or_task_id}"
-            )
-        if task.status not in {
-            TaskStatus.FAILED,
-            TaskStatus.TIMED_OUT,
-            TaskStatus.CANCELLED,
-            TaskStatus.SUCCEEDED,
-            TaskStatus.SKIPPED,
-        }:
-            raise WorkflowSpecError(
-                f"task cannot be rerun from status '{task.status.value}': {task.label}"
-            )
-        task.status = _status_for_reset(workflow, task)
-        task.started_at = None
-        task.finished_at = None
-        task.pid = None
-        task.exit_code = None
-        task.last_error = None
-        task.last_error_type = None
-        task.result_summary = None
-        task.log_stdout_path = None
-        task.log_stderr_path = None
-        task.result_path = None
-        task.dataflow_error = None
-        task.blocked_by = []
-        task.blocked_reason = None
-        task.blocked_at = None
-        task.skip_reason = None
-        task.condition_result = None
-        task.watch_started_at = None
-        task.watch_satisfied_at = None
-        task.last_checked_at = None
-        task.last_check_result = None
-        task.tool_started_at = None
-        task.tool_finished_at = None
-        task.tool_error = None
-        _reopen_workflow(workflow)
-        store.save_workflow(workflow)
-        event_log.task_rerun(
-            workflow.workflow_id,
-            task.task_id,
-            agent_id=agent_id,
-            message=f"task rerun requested: {task.label}",
-            metadata={"status": task.status.value},
-        )
-    return task.task_id
+    return _mutation_rerun_task_on_disk(
+        store,
+        workflow_id,
+        label_or_task_id,
+        agent_id=agent_id,
+        validate_spec=validate_spec,
+        event_log=WorkflowEventLog(store, default_agent_id=agent_id),
+        error_cls=WorkflowSpecError,
+    )
 
 
 def cancel_task_on_disk(
@@ -839,71 +695,14 @@ def cancel_task_on_disk(
     *,
     agent_id: str = "scheduler",
 ) -> str:
-    event_log = WorkflowEventLog(store, default_agent_id=agent_id)
-    with store.locked():
-        workflow: Optional[Workflow] = None
-        task: Optional[Task] = None
-        for candidate in store.list_workflows():
-            maybe = candidate.tasks.get(task_id)
-            if maybe is not None:
-                workflow = candidate
-                task = maybe
-                break
-        if workflow is None or task is None:
-            raise WorkflowSpecError(f"task not found: {task_id}")
-        if task.is_terminal() and task.status is not TaskStatus.BLOCKED:
-            raise WorkflowSpecError(
-                f"task already terminal: {task.label or task.task_id}"
-            )
-        original_status = task.status
-        task.status = TaskStatus.CANCELLED
-        task.last_error = "task cancelled"
-        task.last_error_type = "cancelled"
-        task.blocked_by = []
-        task.blocked_reason = None
-        task.blocked_at = None
-        if original_status is TaskStatus.RUNNING and task.current_attempt > 0:
-            _set_task_terminal_attempt(
-                store,
-                workflow,
-                task,
-                status=TaskStatus.CANCELLED,
-                exit_code=None,
-                error="task cancelled",
-                error_type="cancelled",
-                result_summary="task cancelled",
-            )
-        else:
-            task.started_at = None
-            task.finished_at = _now_iso()
-            task.pid = None
-            task.exit_code = None
-            task.log_stdout_path = None
-            task.log_stderr_path = None
-            task.result_path = None
-        _reopen_workflow(workflow)
-        store.save_workflow(workflow)
-        event_log.task_cancelled(
-            workflow.workflow_id,
-            task.task_id,
-            agent_id=agent_id,
-            attempt_id=task.current_attempt or None,
-            message="task cancelled",
-            metadata={"status": TaskStatus.CANCELLED.value},
-        )
-        if task.current_attempt > 0:
-            event_log.task_attempt_finished(
-                workflow.workflow_id,
-                task.task_id,
-                agent_id=agent_id,
-                attempt_id=task.current_attempt,
-                message="task attempt cancelled",
-                metadata={
-                    "status": TaskStatus.CANCELLED.value,
-                    "error_type": "cancelled",
-                },
-            )
-    return task.task_id
+    return _mutation_cancel_task_on_disk(
+        store,
+        task_id,
+        agent_id=agent_id,
+        validate_spec=validate_spec,
+        event_log=WorkflowEventLog(store, default_agent_id=agent_id),
+        error_cls=WorkflowSpecError,
+    )
 
 
 def cancel_workflow_on_disk(
@@ -912,69 +711,14 @@ def cancel_workflow_on_disk(
     *,
     agent_id: str = "scheduler",
 ) -> str:
-    event_log = WorkflowEventLog(store, default_agent_id=agent_id)
-    with store.locked():
-        workflow = store.load_workflow(workflow_id)
-        if workflow is None:
-            raise WorkflowSpecError(f"workflow not found: {workflow_id}")
-        for task in workflow.tasks.values():
-            if task.is_terminal():
-                continue
-            original_status = task.status
-            task.status = TaskStatus.CANCELLED
-            task.last_error = "workflow cancelled"
-            task.last_error_type = "cancelled"
-            task.blocked_by = []
-            task.blocked_reason = None
-            task.blocked_at = None
-            if original_status is TaskStatus.RUNNING and task.current_attempt > 0:
-                _set_task_terminal_attempt(
-                    store,
-                    workflow,
-                    task,
-                    status=TaskStatus.CANCELLED,
-                    exit_code=None,
-                    error="workflow cancelled",
-                    error_type="cancelled",
-                    result_summary="workflow cancelled",
-                )
-            else:
-                task.started_at = None
-                task.finished_at = _now_iso()
-                task.pid = None
-                task.exit_code = None
-                task.log_stdout_path = None
-                task.log_stderr_path = None
-                task.result_path = None
-            event_log.task_cancelled(
-                workflow.workflow_id,
-                task.task_id,
-                agent_id=agent_id,
-                attempt_id=task.current_attempt or None,
-                message="workflow cancelled",
-                metadata={"status": TaskStatus.CANCELLED.value},
-            )
-            if task.current_attempt > 0:
-                event_log.task_attempt_finished(
-                    workflow.workflow_id,
-                    task.task_id,
-                    agent_id=agent_id,
-                    attempt_id=task.current_attempt,
-                    message="task attempt cancelled",
-                    metadata={
-                        "status": TaskStatus.CANCELLED.value,
-                        "error_type": "cancelled",
-                    },
-                )
-        workflow.status = WorkflowStatus.CANCELLED
-        workflow.finished_at = _now_iso()
-        store.save_workflow(workflow)
-        event_log.workflow_cancelled(
-            workflow.workflow_id,
-            agent_id=agent_id,
-            message="workflow cancelled",
-        )
-    return workflow.workflow_id
+    return _mutation_cancel_workflow_on_disk(
+        store,
+        workflow_id,
+        agent_id=agent_id,
+        validate_spec=validate_spec,
+        event_log=WorkflowEventLog(store, default_agent_id=agent_id),
+        error_cls=WorkflowSpecError,
+    )
 
 
 def _new_task_from_spec(
@@ -983,38 +727,11 @@ def _new_task_from_spec(
     *,
     created_by: Provenance,
 ) -> Task:
-    return Task(
-        task_id=new_task_id(),
-        workflow_id=workflow.workflow_id,
-        label=raw["label"],
-        title=raw.get("title", raw["label"]),
-        task_kind=raw.get("task_kind", "agent"),
-        agent_type=raw.get("agent_type", "kazi")
-        if raw.get("task_kind", "agent") == "agent" else None,
-        prompt=raw.get("prompt", "")
-        if raw.get("task_kind", "agent") == "agent" else "",
-        watcher_type=raw.get("watcher_type"),
-        watch_config=dict(raw.get("watch_config", {})),
-        tool_type=raw.get("tool_type"),
-        tool_config=dict(raw.get("tool_config", {})),
-        condition=dict(raw["condition"]) if raw.get("condition") is not None else None,
-        run_if=dict(raw["run_if"]) if raw.get("run_if") is not None else None,
-        dependency_policy=raw.get("dependency_policy", "all_succeeded"),
-        created_by=created_by,
-        timeout_s=raw.get("timeout_s"),
-        inputs=[
-            TaskInputSpec.from_dict(item)
-            for item in (raw.get("inputs") or [])
-        ],
-        status=TaskStatus.CREATED,
-    )
+    return _new_task_from_spec_impl(workflow, raw, created_by=created_by)
 
 
 def _require_fragment_tasks(spec_fragment: dict[str, Any]) -> list[dict[str, Any]]:
-    tasks = spec_fragment.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
-        raise WorkflowSpecError("workflow fragment must contain a non-empty 'tasks' list")
-    return list(tasks)
+    return _require_fragment_tasks_impl(spec_fragment, error_cls=WorkflowSpecError)
 
 
 def append_workflow_on_disk(
@@ -1024,38 +741,15 @@ def append_workflow_on_disk(
     *,
     agent_id: str = "scheduler",
 ) -> str:
-    event_log = WorkflowEventLog(store, default_agent_id=agent_id)
-    created_by = Provenance(type="user", id=agent_id)
-    with store.locked():
-        workflow = store.load_workflow(workflow_id)
-        if workflow is None:
-            raise WorkflowSpecError(f"workflow not found: {workflow_id}")
-        new_tasks = _require_fragment_tasks(spec_fragment)
-        merged = _workflow_to_spec(workflow)
-        merged["tasks"].extend(new_tasks)
-        validate_spec(merged)
-        for raw in new_tasks:
-            if raw["label"] in workflow.label_to_task_id:
-                raise WorkflowSpecError(f"duplicate label '{raw['label']}' in workflow")
-        added: list[str] = []
-        for raw in new_tasks:
-            task = _new_task_from_spec(workflow, raw, created_by=created_by)
-            task.depends_on = [
-                workflow.label_to_task_id[label]
-                for label in (raw.get("depends_on") or [])
-            ]
-            workflow.tasks[task.task_id] = task
-            workflow.label_to_task_id[task.label] = task.task_id
-            added.append(task.task_id)
-        _reopen_workflow(workflow)
-        store.save_workflow(workflow)
-        event_log.workflow_updated(
-            workflow.workflow_id,
-            agent_id=agent_id,
-            message=f"workflow appended with {len(added)} task(s)",
-            metadata={"operation": "append", "task_ids": added},
-        )
-    return workflow.workflow_id
+    return _mutation_append_workflow_on_disk(
+        store,
+        workflow_id,
+        spec_fragment,
+        agent_id=agent_id,
+        validate_spec=validate_spec,
+        event_log=WorkflowEventLog(store, default_agent_id=agent_id),
+        error_cls=WorkflowSpecError,
+    )
 
 
 def insert_workflow_on_disk(
@@ -1066,70 +760,16 @@ def insert_workflow_on_disk(
     *,
     agent_id: str = "scheduler",
 ) -> str:
-    event_log = WorkflowEventLog(store, default_agent_id=agent_id)
-    created_by = Provenance(type="user", id=agent_id)
-    with store.locked():
-        workflow = store.load_workflow(workflow_id)
-        if workflow is None:
-            raise WorkflowSpecError(f"workflow not found: {workflow_id}")
-        anchor = _task_for_label_or_id(workflow, after_task)
-        if anchor is None:
-            raise WorkflowSpecError(f"task not found in workflow {workflow_id}: {after_task}")
-        fragment_tasks = _require_fragment_tasks(spec_fragment)
-        if len(fragment_tasks) != 1:
-            raise WorkflowSpecError("insert-workflow requires exactly one task in 'tasks'")
-        raw = dict(fragment_tasks[0])
-        if raw.get("depends_on"):
-            raise WorkflowSpecError("insert-workflow task must not declare depends_on")
-        direct_children = [
-            task for task in workflow.tasks.values()
-            if anchor.task_id in task.depends_on
-        ]
-        for child in direct_children:
-            if child.status is TaskStatus.RUNNING:
-                raise WorkflowSpecError(f"cannot mutate running task: {child.label}")
-            if child.status is TaskStatus.SUCCEEDED:
-                raise WorkflowSpecError(f"cannot mutate succeeded task: {child.label}")
-        if raw["label"] in workflow.label_to_task_id:
-            raise WorkflowSpecError(f"duplicate label '{raw['label']}' in workflow")
-        merged = _workflow_to_spec(workflow)
-        merged["tasks"].append({
-            **raw,
-            "depends_on": [_label_for_task_id(workflow, anchor.task_id) or anchor.label],
-        })
-        validate_spec(merged)
-        inserted = _new_task_from_spec(workflow, raw, created_by=created_by)
-        inserted.depends_on = [anchor.task_id]
-        workflow.tasks[inserted.task_id] = inserted
-        workflow.label_to_task_id[inserted.label] = inserted.task_id
-        for child in direct_children:
-            child.depends_on = [
-                inserted.task_id if dep == anchor.task_id else dep
-                for dep in child.depends_on
-            ]
-            if child.status not in {
-                TaskStatus.FAILED,
-                TaskStatus.TIMED_OUT,
-                TaskStatus.CANCELLED,
-            }:
-                child.status = TaskStatus.WAITING
-                child.finished_at = None
-                child.blocked_by = []
-                child.blocked_reason = None
-                child.blocked_at = None
-        _reopen_workflow(workflow)
-        store.save_workflow(workflow)
-        event_log.workflow_updated(
-            workflow.workflow_id,
-            agent_id=agent_id,
-            message=f"workflow inserted task '{inserted.label}'",
-            metadata={
-                "operation": "insert",
-                "task_ids": [inserted.task_id],
-                "after_task_id": anchor.task_id,
-            },
-        )
-    return workflow.workflow_id
+    return _mutation_insert_workflow_on_disk(
+        store,
+        workflow_id,
+        after_task,
+        spec_fragment,
+        agent_id=agent_id,
+        validate_spec=validate_spec,
+        event_log=WorkflowEventLog(store, default_agent_id=agent_id),
+        error_cls=WorkflowSpecError,
+    )
 
 
 def replace_workflow_on_disk(
@@ -1140,98 +780,16 @@ def replace_workflow_on_disk(
     *,
     agent_id: str = "scheduler",
 ) -> str:
-    event_log = WorkflowEventLog(store, default_agent_id=agent_id)
-    with store.locked():
-        workflow = store.load_workflow(workflow_id)
-        if workflow is None:
-            raise WorkflowSpecError(f"workflow not found: {workflow_id}")
-        task = _task_for_label_or_id(workflow, target_task)
-        if task is None:
-            raise WorkflowSpecError(f"task not found in workflow {workflow_id}: {target_task}")
-        if task.status is TaskStatus.RUNNING:
-            raise WorkflowSpecError(f"cannot replace running task: {task.label}")
-        if task.status is TaskStatus.SUCCEEDED:
-            raise WorkflowSpecError(f"cannot replace succeeded task: {task.label}")
-        if task.attempt_count > 0 and task.status not in {
-            TaskStatus.FAILED,
-            TaskStatus.TIMED_OUT,
-            TaskStatus.CANCELLED,
-            TaskStatus.SKIPPED,
-        }:
-            raise WorkflowSpecError(
-                f"replace-workflow allowed only for unstarted or failed/cancelled tasks: {task.label}"
-            )
-        fragment_tasks = _require_fragment_tasks(spec_fragment)
-        if len(fragment_tasks) != 1:
-            raise WorkflowSpecError("replace-workflow requires exactly one task in 'tasks'")
-        raw = dict(fragment_tasks[0])
-        if raw.get("label") != task.label:
-            raise WorkflowSpecError(
-                f"replace-workflow task label must match target label '{task.label}'"
-            )
-        merged = _workflow_to_spec(workflow)
-        for idx, item in enumerate(merged["tasks"]):
-            if item["label"] == task.label:
-                merged["tasks"][idx] = raw
-                break
-        validate_spec(merged)
-        task.title = raw.get("title", raw["label"])
-        task.task_kind = raw.get("task_kind", "agent")
-        task.agent_type = raw.get("agent_type", "kazi") if task.task_kind == "agent" else None
-        task.prompt = raw.get("prompt", "") if task.task_kind == "agent" else ""
-        task.watcher_type = raw.get("watcher_type")
-        task.watch_config = dict(raw.get("watch_config", {}))
-        task.tool_type = raw.get("tool_type")
-        task.tool_config = dict(raw.get("tool_config", {}))
-        task.condition = dict(raw["condition"]) if raw.get("condition") is not None else None
-        task.run_if = dict(raw["run_if"]) if raw.get("run_if") is not None else None
-        task.dependency_policy = raw.get("dependency_policy", "all_succeeded")
-        task.timeout_s = raw.get("timeout_s")
-        task.inputs = [
-            TaskInputSpec.from_dict(item)
-            for item in (raw.get("inputs") or [])
-        ]
-        task.depends_on = [
-            workflow.label_to_task_id[label]
-            for label in (raw.get("depends_on") or [])
-        ]
-        task.status = _status_for_reset(workflow, task)
-        task.started_at = None
-        task.finished_at = None
-        task.pid = None
-        task.exit_code = None
-        task.last_error = None
-        task.last_error_type = None
-        task.result_summary = None
-        task.log_stdout_path = None
-        task.log_stderr_path = None
-        task.result_path = None
-        task.dataflow_error = None
-        task.blocked_by = []
-        task.blocked_reason = None
-        task.blocked_at = None
-        task.skip_reason = None
-        task.condition_result = None
-        task.watch_started_at = None
-        task.watch_satisfied_at = None
-        task.last_checked_at = None
-        task.last_check_result = None
-        task.tool_started_at = None
-        task.tool_finished_at = None
-        task.tool_error = None
-        _reopen_workflow(workflow)
-        store.save_workflow(workflow)
-        event_log.workflow_updated(
-            workflow.workflow_id,
-            agent_id=agent_id,
-            message=f"workflow replaced task '{task.label}'",
-            metadata={
-                "operation": "replace",
-                "task_ids": [task.task_id],
-                "status": task.status.value,
-            },
-        )
-    return workflow.workflow_id
+    return _mutation_replace_workflow_on_disk(
+        store,
+        workflow_id,
+        target_task,
+        spec_fragment,
+        agent_id=agent_id,
+        validate_spec=validate_spec,
+        event_log=WorkflowEventLog(store, default_agent_id=agent_id),
+        error_cls=WorkflowSpecError,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +823,7 @@ class Scheduler:
         scoped_agent_store: Optional[PersistentAgentStore] = None,
         message_store: Optional[MessageStore] = None,
         workspace_root: Optional[Path] = None,
+        logger: Optional[Logger] = None,
     ):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
@@ -1291,8 +850,46 @@ class Scheduler:
         )
         self._audit_writer = CapabilityAuditWriter()
         self._timeline = EventLog(self._store.root.parent / "events")
+        self._logger = logger or Logger()
+        self._event_adapter = SchedulerEventAdapter(
+            workflow_events=self._events,
+            timeline=self._timeline,
+            agent_id=self._agent_id,
+        )
+        self._semantic_validator = SemanticValidator(
+            workspace_root=self._workspace_root,
+            approval_store=self._approval_store,
+            scoped_agents=self._scoped_agents,
+        )
+        self._workflow_queries = WorkflowQueryService(
+            store=self._store,
+            scoped_agents=self._scoped_agents,
+        )
 
         self._handles: dict[str, RunHandle] = {}
+        self._attempts = AttemptManager(
+            store=self._store,
+            events=self._event_adapter,
+            handle_registry=self._handles,
+            now_fn=_now_iso,
+        )
+        self._capability_gate = CapabilityGate(
+            store=self._store,
+            capabilities=self._capabilities,
+            scoped_agents=self._scoped_agents,
+            message_store=self._message_store,
+            policy_engine=self._policy_engine,
+            approval_store=self._approval_store,
+            audit_writer=self._audit_writer,
+            timeline=self._timeline,
+            workspace_root=self._workspace_root,
+            now_fn=_now_iso,
+        )
+        self._reporter = WorkflowReporter(
+            scoped_agents=self._scoped_agents,
+            message_store=self._message_store,
+        )
+        self._tick_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -1364,29 +961,16 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def list_workflows(self) -> list[Workflow]:
-        return [
-            self._scoped_agents.normalize_workflow_ownership(wf)
-            for wf in self._store.list_workflows()
-        ]
+        return self._workflow_queries.list_workflows()
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
-        wf = self._store.load_workflow(workflow_id)
-        return self._scoped_agents.normalize_workflow_ownership(wf) if wf is not None else None
+        return self._workflow_queries.get_workflow(workflow_id)
 
     def get_task(self, task_id: str) -> Optional[Task]:
-        for wf in self._store.list_workflows():
-            if task_id in wf.tasks:
-                return wf.tasks[task_id]
-        return None
+        return self._workflow_queries.get_task(task_id)
 
     def list_watchers(self) -> list[tuple[Workflow, Task]]:
-        watchers: list[tuple[Workflow, Task]] = []
-        for wf in self._store.list_workflows():
-            for task in wf.tasks.values():
-                if task.task_kind != "watcher" or task.is_terminal():
-                    continue
-                watchers.append((wf, task))
-        return watchers
+        return self._workflow_queries.list_watchers()
 
     def trigger_watcher(
         self,
@@ -1470,14 +1054,73 @@ class Scheduler:
           4. Finalise the workflow when every task is terminal.
           5. Launch ready tasks up to the concurrency cap.
         """
-        for wf in self._store.list_workflows():
-            self._reconcile_external_control(wf)
-            if wf.is_terminal() and not self._workflow_has_live_handles(wf):
-                continue
-            self._tick_workflow(wf)
+        with self._tick_lock:
+            for wf in self._workflow_queries.active_workflows(set(self._handles)):
+                self._reconcile_external_control(wf)
+                self._tick_workflow(wf)
 
     def _workflow_has_live_handles(self, wf: Workflow) -> bool:
-        return any(task.task_id in self._handles for task in wf.tasks.values())
+        return workflow_has_live_handles(wf, set(self._handles))
+
+    @staticmethod
+    def _probe_path(path: Optional[str | Path]) -> dict[str, Any]:
+        return probe_path(path)
+
+    def _scheduler_log_metadata(
+        self,
+        task: Task,
+        *,
+        handle: Optional[RunHandle] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        return build_scheduler_log_metadata(
+            task,
+            store=self._store,
+            handle_present=task.task_id in self._handles,
+            handle=handle,
+            extra=extra,
+        )
+
+    def _log_scheduler_task(
+        self,
+        task: Task,
+        action: str,
+        *,
+        result: str = "ok",
+        handle: Optional[RunHandle] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self._logger.log(
+            task.task_id,
+            "scheduler",
+            action,
+            result,
+            metadata=self._scheduler_log_metadata(task, handle=handle, extra=metadata),
+        )
+
+    def _drop_handle(self, task: Task, *, reason: str) -> Optional[RunHandle]:
+        handle = self._handles.pop(task.task_id, None)
+        if handle is not None:
+            self._log_scheduler_task(
+                task,
+                "handle_removed",
+                handle=handle,
+                metadata={"reason": reason},
+            )
+        return handle
+
+    @staticmethod
+    def _run_result_from_payload(
+        task: Task,
+        payload: dict[str, Any],
+    ) -> Optional[RunResult]:
+        return _run_result_from_payload_impl(task, payload)
+
+    def _load_persisted_result(
+        self,
+        task: Task,
+    ) -> tuple[Optional[RunResult], Optional[str]]:
+        return self._attempts.load_persisted_result(task)
 
     def _reconcile_external_control(self, wf: Workflow) -> None:
         for task in wf.tasks.values():
@@ -1490,7 +1133,7 @@ class Scheduler:
                 self._runner.cancel(handle)
             except Exception:
                 pass
-            self._handles.pop(task.task_id, None)
+            self._drop_handle(task, reason="external_control")
 
     def _tick_workflow(self, wf: Workflow) -> None:
         changed = False
@@ -1558,8 +1201,34 @@ class Scheduler:
                 continue
             handle = self._handles.get(task.task_id)
             if handle is None:
-                # Lost the handle (e.g. scheduler restart mid-run). Mark
-                # the task failed so downstream work doesn't stall.
+                recovered: Optional[RunResult] = None
+                recovery_source: Optional[str] = None
+                self._log_scheduler_task(
+                    task,
+                    "handle_missing",
+                    result="error",
+                    metadata={"reason": "running task has no live scheduler handle"},
+                )
+                recovered, recovery_source = self._load_persisted_result(task)
+                if recovered is None:
+                    try:
+                        recovered = self._runner.recover_result(task)
+                    except Exception:
+                        recovered = None
+                    if recovered is not None:
+                        recovery_source = "stdout_log"
+                if recovered is not None:
+                    self._log_scheduler_task(
+                        task,
+                        "handle_recovered",
+                        metadata={"source": recovery_source},
+                    )
+                    stub_handle = RunHandle(
+                        task_id=task.task_id,
+                        workflow_id=wf.workflow_id,
+                    )
+                    changed |= self._handle_terminal_result(wf, task, stub_handle, recovered)
+                    continue
                 result_path = str(self._store.write_attempt_result(
                     wf.workflow_id,
                     task.task_id,
@@ -1568,17 +1237,17 @@ class Scheduler:
                         task,
                         status=TaskStatus.FAILED,
                         exit_code=None,
-                        error="run handle lost (scheduler restart?)",
-                        error_type="unknown",
+                        error="run handle lost: no recoverable persisted result",
+                        error_type="infrastructure_failure",
                         result_summary="run handle lost",
                     ),
                 ))
                 self._finish_attempt(
                     wf, task, TaskStatus.FAILED, event=ev.TASK_FAILED,
-                    message="run handle lost (scheduler restart?)",
+                    message="run handle lost: no recoverable persisted result",
                     exit_code=None,
-                    error="run handle lost (scheduler restart?)",
-                    error_type="unknown",
+                    error="run handle lost: no recoverable persisted result",
+                    error_type="infrastructure_failure",
                     result_path=result_path,
                     result_summary="run handle lost",
                 )
@@ -1587,8 +1256,58 @@ class Scheduler:
             result = self._runner.poll(handle)
             if result is None:
                 continue
-            changed |= self._finalize_task(wf, task, handle, result)
+            changed |= self._handle_terminal_result(wf, task, handle, result)
         return changed
+
+    def _handle_terminal_result(
+        self,
+        wf: Workflow,
+        task: Task,
+        handle: RunHandle,
+        result: RunResult,
+    ) -> bool:
+        try:
+            return self._finalize_task(wf, task, handle, result)
+        except Exception as exc:
+            detail = f"task finalization failed: {type(exc).__name__}: {exc}"
+            trace = traceback.format_exc()
+            stderr_path = result.stderr_path or handle.payload.get("stderr_path")
+            if isinstance(stderr_path, Path):
+                try:
+                    with open(stderr_path, "a", encoding="utf-8") as handle_out:
+                        if handle_out.tell() > 0:
+                            handle_out.write("\n")
+                        handle_out.write(trace)
+                except OSError:
+                    pass
+            result_path = str(self._store.write_attempt_result(
+                wf.workflow_id,
+                task.task_id,
+                task.current_attempt,
+                _attempt_result_payload(
+                    task,
+                    status=TaskStatus.FAILED,
+                    exit_code=result.exit_code,
+                    error=detail,
+                    error_type="internal_error",
+                    result_summary="task finalization failed",
+                ),
+            ))
+            self._finish_attempt(
+                wf,
+                task,
+                TaskStatus.FAILED,
+                event=ev.TASK_FAILED,
+                message=detail,
+                exit_code=result.exit_code,
+                error=detail,
+                error_type="internal_error",
+                log_stdout_path=str(result.stdout_path) if result.stdout_path else None,
+                log_stderr_path=str(stderr_path) if isinstance(stderr_path, Path) else None,
+                result_path=result_path,
+                result_summary="task finalization failed",
+            )
+            return True
 
     def _poll_running_watcher(self, wf: Workflow, task: Task) -> bool:
         audit_path = self._current_attempt_policy_audit_path(task)
@@ -1819,37 +1538,19 @@ class Scheduler:
         return f"watcher exceeded max_wait_s={int(max_wait_s)}"
 
     def _workflow_actor_type(self, wf: Workflow) -> str:
-        owner = self._scoped_agents.load_agent(wf.owner_agent_id or "")
-        if owner is None:
-            return "mr1"
-        return "mr1" if owner.agent_type == "mr1" else "mrn"
+        return self._capability_gate.workflow_actor_type(wf)
 
     def _capability_name_for_task(self, task: Task) -> str:
-        if task.task_kind == "tool":
-            return task.tool_type or ""
-        if task.task_kind == "watcher":
-            return task.watcher_type or ""
-        raise ValueError(f"task is not a policy-managed capability: {task.task_id}")
+        return self._capability_gate.capability_name_for_task(task)
 
     def _capability_args_for_task(self, task: Task) -> dict[str, Any]:
-        if task.task_kind == "tool":
-            return dict(task.tool_config)
-        if task.task_kind == "watcher":
-            return dict(task.watch_config)
-        raise ValueError(f"task is not a policy-managed capability: {task.task_id}")
+        return self._capability_gate.capability_args_for_task(task)
 
     def _current_attempt_policy_audit_path(self, task: Task) -> Optional[Path]:
-        if task.current_attempt <= 0 or task.current_attempt > len(task.attempts):
-            return None
-        attempt = task.attempts[task.current_attempt - 1]
-        return Path(attempt.policy_audit_path) if attempt.policy_audit_path else None
+        return self._capability_gate.current_attempt_policy_audit_path(task)
 
     def _policy_audit_path(self, wf: Workflow, task: Task, attempt_id: int) -> Path:
-        return self._store.task_attempt_dir(
-            wf.workflow_id,
-            task.task_id,
-            attempt_id,
-        ) / "capability_audit.json"
+        return self._capability_gate.policy_audit_path(wf, task, attempt_id)
 
     def _write_policy_audit(
         self,
@@ -1862,16 +1563,15 @@ class Scheduler:
         execution_result: Optional[dict[str, Any]] = None,
         error: Optional[str] = None,
     ) -> Path:
-        record = CapabilityAuditRecord(
+        return self._capability_gate.write_policy_audit(
+            audit_path,
             capability_name=capability_name,
-            request=request.to_dict(),
-            metadata=metadata.to_dict(),
-            decision=dict(decision),
+            request=request,
+            metadata=metadata,
+            decision=decision,
             execution_result=execution_result,
             error=error,
-            timestamp=_now_iso(),
         )
-        return self._audit_writer.write(audit_path, record)
 
     def _finalize_policy_audit(
         self,
@@ -1880,14 +1580,11 @@ class Scheduler:
         execution_result: dict[str, Any],
         error: Optional[str] = None,
     ) -> None:
-        try:
-            with open(audit_path, "r", encoding="utf-8") as handle:
-                record = CapabilityAuditRecord.from_dict(json.load(handle))
-        except (OSError, json.JSONDecodeError, KeyError, ValueError):
-            return
-        record.execution_result = dict(execution_result)
-        record.error = error
-        self._audit_writer.write(audit_path, record)
+        self._capability_gate.finalize_policy_audit(
+            audit_path,
+            execution_result=execution_result,
+            error=error,
+        )
 
     def _append_policy_audit_index(
         self,
@@ -1902,18 +1599,16 @@ class Scheduler:
         error: Optional[str] = None,
         approval_request_id: Optional[str] = None,
     ) -> None:
-        self._scoped_agents.append_capability_call_log(
-            actor_id,
-            capability_audit_index_entry(
-                audit_id=audit_id,
-                audit_path=audit_path,
-                request=request,
-                metadata=metadata,
-                decision=decision,
-                execution_status=execution_status,
-                error=error,
-                approval_request_id=approval_request_id,
-            ),
+        self._capability_gate.append_policy_audit_index(
+            actor_id=actor_id,
+            audit_id=audit_id,
+            audit_path=audit_path,
+            request=request,
+            metadata=metadata,
+            decision=decision,
+            execution_status=execution_status,
+            error=error,
+            approval_request_id=approval_request_id,
         )
 
     def _append_policy_audit_index_from_path(
@@ -1924,28 +1619,15 @@ class Scheduler:
         error: Optional[str] = None,
         approval_request_id: Optional[str] = None,
     ) -> None:
-        try:
-            with open(audit_path, "r", encoding="utf-8") as handle:
-                record = CapabilityAuditRecord.from_dict(json.load(handle))
-        except (OSError, json.JSONDecodeError, KeyError, ValueError):
-            return
-        request = CapabilityRequest.from_dict(record.request)
-        metadata = CapabilityMetadata.from_dict(record.metadata)
-        self._append_policy_audit_index(
-            actor_id=request.actor_id,
-            audit_id=self._policy_audit_id(audit_path),
-            audit_path=audit_path,
-            request=request,
-            metadata=metadata,
-            decision=record.decision,
+        self._capability_gate.append_policy_audit_index_from_path(
+            audit_path,
             execution_status=execution_status,
-            error=error or record.error,
+            error=error,
             approval_request_id=approval_request_id,
         )
 
     def _policy_audit_id(self, audit_path: Path) -> str:
-        digest = hashlib.sha256(str(audit_path).encode("utf-8")).hexdigest()[:16]
-        return f"wf_cap_audit_{digest}"
+        return self._capability_gate.policy_audit_id(audit_path)
 
     def _evaluate_task_policy(
         self,
@@ -1953,71 +1635,7 @@ class Scheduler:
         task: Task,
         attempt_id: int,
     ) -> tuple[CapabilityRequest, CapabilityMetadata, dict[str, Any], Path]:
-        capability_name = self._capability_name_for_task(task)
-        capability = self._capabilities.describe_capability(capability_name)
-        metadata = CapabilityMetadata.from_dict(capability)
-        request = CapabilityRequest(
-            actor_id=wf.owner_agent_id or self._scoped_agents.root_agent_id,
-            actor_type=self._workflow_actor_type(wf),
-            invocation_mode="workflow",
-            capability_name=capability_name,
-            args=self._capability_args_for_task(task),
-            scope=build_scope_context(
-                actor_id=wf.owner_agent_id or self._scoped_agents.root_agent_id,
-                workspace_root=self._workspace_root,
-                scoped_agent_store=self._scoped_agents,
-                workflow_store=self._store,
-                workflow_id=wf.workflow_id,
-                task_id=task.task_id,
-            ),
-            workflow_id=wf.workflow_id,
-            task_id=task.task_id,
-        )
-        decision = self._policy_engine.evaluate(
-            request,
-            metadata,
-            config_schema=capability.get("config_schema", {}),
-            approved_request=self._approval_store.active_approval_for_request(request, metadata),
-        ).to_dict()
-        audit_path = self._policy_audit_path(wf, task, attempt_id)
-        self._write_policy_audit(
-            audit_path,
-            capability_name=capability_name,
-            request=request,
-            metadata=metadata,
-            decision=decision,
-        )
-        audit_id = self._policy_audit_id(audit_path)
-        self._timeline.emit(
-            event_type="capability_requested",
-            actor_id=request.actor_id,
-            actor_type=request.actor_type,
-            target_id=request.capability_name,
-            target_type="capability",
-            status="requested",
-            summary=f"capability requested: {request.capability_name}",
-            workflow_id=wf.workflow_id,
-            task_id=task.task_id,
-            audit_id=audit_id,
-            record_path=str(audit_path),
-            metadata={"mode": request.invocation_mode},
-        )
-        if decision["allowed"]:
-            self._timeline.emit(
-                event_type="capability_allowed",
-                actor_id=request.actor_id,
-                actor_type=request.actor_type,
-                target_id=request.capability_name,
-                target_type="capability",
-                status="allowed",
-                summary=f"capability allowed: {request.capability_name}",
-                workflow_id=wf.workflow_id,
-                task_id=task.task_id,
-                audit_id=audit_id,
-                record_path=str(audit_path),
-                metadata={"reason": decision["reason"]},
-            )
-        return request, metadata, decision, audit_path
+        return self._capability_gate.evaluate_task_policy(wf, task, attempt_id)
 
     def _policy_block_result_payload(
         self,
@@ -2029,27 +1647,14 @@ class Scheduler:
         approval_request_id: Optional[str] = None,
         audit_path: Optional[Path] = None,
     ) -> dict[str, Any]:
-        payload = {
-            "task_id": task.task_id,
-            "workflow_id": wf.workflow_id,
-            "attempt_id": task.current_attempt,
-            "status": TaskStatus.FAILED.value,
-            "summary": decision["reason"],
-            "text": "",
-            "data": {
-                "request": request.to_dict(),
-                "decision": dict(decision),
-                "approval_request_id": approval_request_id,
-            },
-            "metrics": {},
-            "error": decision["reason"],
-            "error_type": "policy_block",
-            "failure_type": "policy_block",
-            "retryable": False,
-        }
-        if audit_path is not None:
-            payload["audit_record_path"] = str(audit_path)
-        return payload
+        return self._capability_gate.policy_block_result_payload(
+            wf,
+            task,
+            request,
+            decision,
+            approval_request_id=approval_request_id,
+            audit_path=audit_path,
+        )
 
     def _handle_policy_block_for_task(
         self,
@@ -2060,82 +1665,19 @@ class Scheduler:
         decision: dict[str, Any],
         audit_path: Path,
     ) -> None:
-        approval_request_id = None
-        approval = None
-        if decision["status"] == "requires_approval":
-            approval = build_approval_request(
-                request,
-                metadata,
-                self._policy_engine.evaluate(
-                    request,
-                    metadata,
-                    config_schema=self._capabilities.describe_capability(
-                        request.capability_name
-                    ).get("config_schema", {}),
-                ),
-            )
-            approval_request_id = approval.approval_request_id
-        self._timeline.emit(
-            event_type="capability_blocked",
-            actor_id=request.actor_id,
-            actor_type=request.actor_type,
-            target_id=request.capability_name,
-            target_type="capability",
-            status=decision["status"],
-            summary=f"capability blocked: {request.capability_name}",
-            workflow_id=wf.workflow_id,
-            task_id=task.task_id,
-            approval_request_id=approval_request_id,
-            audit_id=self._policy_audit_id(audit_path),
-            record_path=str(audit_path),
-            metadata={
-                "reason": decision["reason"],
-                "decision_status": decision["status"],
-            },
-        )
-        if approval is not None:
-            approval_request_id, _ = maybe_route_approval_request(
-                approval,
-                approval_store=self._approval_store,
-                message_store=self._message_store,
-                scoped_agent_store=self._scoped_agents,
-            )
-        blocked_result = {
-            "status": decision["status"],
-            "reason": decision["reason"],
-        }
-        if approval_request_id is not None:
-            blocked_result["approval_request_id"] = approval_request_id
-        self._write_policy_audit(
+        result_payload, approval_request_id, message = self._capability_gate.handle_policy_block_for_task(
+            wf,
+            task,
+            request,
+            metadata,
+            decision,
             audit_path,
-            capability_name=request.capability_name,
-            request=request,
-            metadata=metadata,
-            decision=decision,
-            execution_result=blocked_result,
-        )
-        self._append_policy_audit_index(
-            actor_id=request.actor_id,
-            audit_id=self._policy_audit_id(audit_path),
-            audit_path=audit_path,
-            request=request,
-            metadata=metadata,
-            decision=decision,
-            execution_status=decision["status"],
-            approval_request_id=approval_request_id,
         )
         result_path = str(self._store.write_attempt_result(
             wf.workflow_id,
             task.task_id,
             task.current_attempt,
-            self._policy_block_result_payload(
-                wf,
-                task,
-                request,
-                decision,
-                approval_request_id=approval_request_id,
-                audit_path=audit_path,
-            ),
+            result_payload,
         ))
         extra_event_type = ev.TOOL_FAILED if task.task_kind == "tool" else ev.WATCHER_FAILED
         extra_metadata: dict[str, Any] = {
@@ -2151,14 +1693,14 @@ class Scheduler:
             task,
             TaskStatus.FAILED,
             event=ev.TASK_FAILED,
-            message=decision["reason"],
-            error=decision["reason"],
+            message=message,
+            error=message,
             error_type="policy_block",
             result_path=result_path,
-            result_summary=decision["reason"],
+            result_summary=message,
             extra_events=[(
                 extra_event_type,
-                decision["reason"],
+                message,
                 extra_metadata,
             )],
         )
@@ -2196,6 +1738,71 @@ class Scheduler:
             return result.error_type
         return "unknown"
 
+    def _semantic_expectation_for_task(
+        self,
+        wf: Workflow,
+        task: Task,
+    ) -> Optional[dict[str, Any]]:
+        return self._semantic_validator.expectation_for_task(wf, task)
+
+    def _semantic_validation_text(
+        self,
+        *,
+        summary: Optional[str],
+        text: Optional[str],
+        data: Optional[dict[str, Any]],
+    ) -> str:
+        return self._semantic_validator.validation_text(
+            summary=summary,
+            text=text,
+            data=data,
+        )
+
+    def _semantic_target_path(self, raw_path: Optional[str]) -> Optional[Path]:
+        return self._semantic_validator.semantic_target_path(raw_path)
+
+    def _semantic_mismatch_reason(
+        self,
+        wf: Workflow,
+        task: Task,
+        expectation: dict[str, Any],
+        *,
+        summary: Optional[str],
+        text: Optional[str],
+        data: Optional[dict[str, Any]],
+    ) -> Optional[str]:
+        return self._semantic_validator.mismatch_reason(
+            wf,
+            task,
+            expectation,
+            summary=summary,
+            text=text,
+            data=data,
+        )
+
+    def _apply_semantic_validation(
+        self,
+        wf: Workflow,
+        task: Task,
+        *,
+        target_status: TaskStatus,
+        event_type: str,
+        summary: Optional[str],
+        text: Optional[str],
+        data: Optional[dict[str, Any]],
+        result_payload: dict[str, Any],
+    ) -> tuple[TaskStatus, str, Optional[str], Optional[str], Optional[str], dict[str, Any]]:
+        return self._semantic_validator.apply(
+            wf,
+            task,
+            target_status=target_status,
+            event_type=event_type,
+            summary=summary,
+            text=text,
+            data=data,
+            result_payload=result_payload,
+        )
+
     def _record_watcher_check(
         self,
         wf: Workflow,
@@ -2208,12 +1815,10 @@ class Scheduler:
             task.last_checked_at = checked_at
             task.last_check_result = dict(check_payload)
             self._store.save_workflow(wf)
-            self._events.emit(
-                ev.WATCHER_CHECKED,
+            self._event_adapter.emit_watcher_check(
                 wf.workflow_id,
-                task_id=task.task_id,
+                task.task_id,
                 attempt_id=task.current_attempt or None,
-                agent_id=self._agent_id,
                 message=check_payload.get("message", ""),
                 metadata=dict(check_payload),
             )
@@ -2225,7 +1830,7 @@ class Scheduler:
         handle: RunHandle,
         result: RunResult,
     ) -> bool:
-        self._handles.pop(task.task_id, None)
+        self._drop_handle(task, reason="terminal_result")
 
         status_map = {
             RunStatus.SUCCEEDED: (TaskStatus.SUCCEEDED, ev.TASK_SUCCEEDED),
@@ -2236,17 +1841,13 @@ class Scheduler:
             result.status, (TaskStatus.FAILED, ev.TASK_FAILED),
         )
         error_type = self._normalize_error_type(result, target_status)
-
-        result_path = str(self._store.write_attempt_result(
-            wf.workflow_id,
-            task.task_id,
-            task.current_attempt,
-            result.result_payload or {},
-        ))
+        result_summary = (result.summary or "")[:500] if result.summary else None
+        result_payload = dict(result.result_payload or {})
 
         extra_events: list[tuple[str, str, dict[str, Any]]] = []
         output_path: Optional[str] = None
         dataflow_error: Optional[str] = None
+        output = None
         try:
             task.artifacts = register_artifacts(
                 task,
@@ -2264,21 +1865,11 @@ class Scheduler:
                     replace(
                         task,
                         status=target_status,
-                        result_summary=(result.summary or "")[:500] if result.summary else None,
+                        result_summary=result_summary,
                         exit_code=result.exit_code,
                     ),
-                    result.result_payload or {},
+                    result_payload,
                 )
-                output_path = str(self._store.write_task_output(
-                    wf.workflow_id,
-                    task.task_id,
-                    output,
-                ))
-                extra_events.append((
-                    ev.OUTPUT_WRITTEN,
-                    "normalized output written",
-                    {"path": output_path},
-                ))
         except DataflowError as exc:
             target_status = TaskStatus.FAILED
             event_type = ev.TASK_FAILED
@@ -2294,17 +1885,44 @@ class Scheduler:
                 result_payload=result.result_payload,
             )
             error_type = "unknown"
+        target_status, event_type, result_summary, semantic_error, semantic_error_type, result_payload = self._apply_semantic_validation(
+            wf,
+            task,
+            target_status=target_status,
+            event_type=event_type,
+            summary=output.summary if output is not None else result_summary,
+            text=output.text if output is not None else result_payload.get("text"),
+            data=output.data if output is not None else result_payload.get("data"),
+            result_payload=result_payload,
+        )
+        if target_status is TaskStatus.SUCCEEDED and output is not None:
+            output_path = str(self._store.write_task_output(
+                wf.workflow_id,
+                task.task_id,
+                output,
+            ))
+            extra_events.append((
+                ev.OUTPUT_WRITTEN,
+                "normalized output written",
+                {"path": output_path},
+            ))
+        result_path = str(self._store.write_attempt_result(
+            wf.workflow_id,
+            task.task_id,
+            task.current_attempt,
+            result_payload,
+        ))
 
         self._finish_attempt(
             wf,
             task,
             target_status,
             event=event_type,
-            message=dataflow_error or result.error or result.summary or "",
+            message=semantic_error or dataflow_error or result.error or result.summary or "",
             exit_code=result.exit_code,
-            result_summary=(result.summary or "")[:500] if result.summary else None,
-            error=dataflow_error or result.error,
-            error_type=error_type,
+            result_summary=result_summary,
+            error=semantic_error or dataflow_error or result.error,
+            error_type=semantic_error_type or error_type,
             log_stdout_path=str(result.stdout_path) if result.stdout_path else None,
             log_stderr_path=str(result.stderr_path) if result.stderr_path else None,
             result_path=result_path,
@@ -2569,45 +2187,7 @@ class Scheduler:
         return True
 
     def _send_workflow_report_message(self, wf: Workflow, report_path: Path) -> None:
-        wf = self._scoped_agents.normalize_workflow_ownership(wf)
-        owner = self._scoped_agents.load_agent(wf.owner_agent_id)
-        if owner is None or owner.parent_agent_id is None:
-            return
-        body_lines = [
-            f"Workflow completed: {wf.title}",
-            "",
-            f"workflow_id: {wf.workflow_id}",
-            f"owner_agent_id: {wf.owner_agent_id}",
-            f"owner_agent_title: {wf.owner_agent_title or owner.title}",
-            f"status: {wf.status.value}",
-            f"finished_at: {wf.finished_at or '-'}",
-            "",
-            "Task summary:",
-        ]
-        emitted = False
-        for label, task_id in wf.label_to_task_id.items():
-            task = wf.tasks.get(task_id)
-            if task is None:
-                continue
-            emitted = True
-            summary = f"{label}: {task.status.value}"
-            if task.result_summary:
-                summary += f" | {task.result_summary}"
-            body_lines.append(f"- {summary}")
-        if not emitted:
-            body_lines.append("- none")
-        body_lines.extend([
-            "",
-            f"Report path: {report_path}",
-        ])
-        self._message_store.create_message(
-            from_agent_id=owner.agent_id,
-            to_agent_id=owner.parent_agent_id,
-            kind="report",
-            subject=f"Workflow completed: {wf.title}",
-            body="\n".join(body_lines).rstrip(),
-            workflow_id=wf.workflow_id,
-        )
+        self._reporter.send_workflow_report_message(wf, report_path)
 
     def _begin_attempt(
         self,
@@ -2620,101 +2200,19 @@ class Scheduler:
         tool_started: bool = False,
         policy_audit_path: Optional[str] = None,
         extra_events: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
+        run_handle: Optional[RunHandle] = None,
     ) -> int:
-        attempt_id = task.current_attempt or (task.attempt_count + 1)
-        with self._store.locked():
-            stdout_path, stderr_path = self._store.task_attempt_log_paths(
-                wf.workflow_id,
-                task.task_id,
-                attempt_id,
-            )
-            now_iso = _now_iso()
-            task.attempt_count = attempt_id
-            task.current_attempt = attempt_id
-            task.status = TaskStatus.RUNNING
-            task.started_at = now_iso
-            task.finished_at = None
-            task.pid = pid
-            task.exit_code = None
-            task.last_error = None
-            task.last_error_type = None
-            task.result_summary = None
-            task.log_stdout_path = str(stdout_path)
-            task.log_stderr_path = str(stderr_path)
-            task.result_path = None
-            task.dataflow_error = None
-            task.blocked_by = []
-            task.blocked_reason = None
-            task.blocked_at = None
-            task.skip_reason = None
-            task.condition_result = None
-            task.watch_satisfied_at = None
-            task.last_checked_at = None
-            task.last_check_result = None
-            task.tool_finished_at = None
-            task.tool_error = None
-            if watch_started:
-                task.watch_started_at = now_iso
-            if tool_started:
-                task.tool_started_at = now_iso
-            if len(task.attempts) != attempt_id - 1:
-                raise RuntimeError(
-                    f"task attempts out of sequence for {task.task_id}: "
-                    f"count={task.attempt_count} len={len(task.attempts)}"
-                )
-            task.attempts.append(TaskAttempt(
-                attempt_id=attempt_id,
-                started_at=now_iso,
-                status=TaskStatus.RUNNING,
-                stdout_path=str(stdout_path),
-                stderr_path=str(stderr_path),
-                policy_audit_path=policy_audit_path,
-            ))
-            self._store.save_workflow(wf)
-            self._events.task_attempt_started(
-                wf.workflow_id,
-                task.task_id,
-                agent_id=self._agent_id,
-                attempt_id=attempt_id,
-                message="task attempt started",
-                metadata={"status": TaskStatus.RUNNING.value},
-            )
-            self._events.task_started(
-                wf.workflow_id,
-                task.task_id,
-                agent_id=self._agent_id,
-                attempt_id=attempt_id,
-                message=message,
-                metadata={"status": TaskStatus.RUNNING.value, "pid": pid} if pid is not None else {"status": TaskStatus.RUNNING.value},
-            )
-            self._timeline.emit(
-                event_type="workflow_task_started",
-                actor_id=self._agent_id,
-                actor_type="scheduler",
-                target_id=task.task_id,
-                target_type="task",
-                status=TaskStatus.RUNNING.value,
-                summary=message,
-                workflow_id=wf.workflow_id,
-                task_id=task.task_id,
-                record_path=str(self._store.workflow_json_path(wf.workflow_id)),
-                metadata={
-                    "attempt_id": attempt_id,
-                    "task_kind": task.task_kind,
-                    "pid": pid,
-                },
-            )
-            for event_type, event_message, event_metadata in extra_events or []:
-                self._events.emit(
-                    event_type,
-                    wf.workflow_id,
-                    task_id=task.task_id,
-                    attempt_id=attempt_id,
-                    agent_id=self._agent_id,
-                    message=event_message,
-                    metadata=dict(event_metadata),
-                )
-        return attempt_id
+        return self._attempts.begin_attempt(
+            wf,
+            task,
+            message=message,
+            pid=pid,
+            watch_started=watch_started,
+            tool_started=tool_started,
+            policy_audit_path=policy_audit_path,
+            extra_events=extra_events,
+            run_handle=run_handle,
+        )
 
     def _finish_attempt(
         self,
@@ -2747,128 +2245,38 @@ class Scheduler:
         tool_error: Any = _UNSET,
         extra_events: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
     ) -> None:
-        attempt_id = task.current_attempt or None
-        with self._store.locked():
-            now_iso = _now_iso()
-            task.status = new_status
-            task.finished_at = now_iso
-            task.pid = None
-            task.exit_code = exit_code
-            task.last_error = error
-            task.last_error_type = error_type
-            if result_summary is not None:
-                task.result_summary = result_summary
-            if log_stdout_path is not None:
-                task.log_stdout_path = log_stdout_path
-            if log_stderr_path is not None:
-                task.log_stderr_path = log_stderr_path
-            if result_path is not None:
-                task.result_path = result_path
-            if output_path is not None:
-                task.output_path = output_path
-            if inputs_path is not None:
-                task.inputs_path = inputs_path
-            if materialized_prompt_path is not None:
-                task.materialized_prompt_path = materialized_prompt_path
-            if artifacts is not None:
-                task.artifacts = list(artifacts)
-            if dataflow_error is not _UNSET:
-                task.dataflow_error = dataflow_error
-            if blocked_by is not None:
-                task.blocked_by = list(blocked_by)
-            if blocked_reason is not _UNSET:
-                task.blocked_reason = blocked_reason
-            if blocked_at is not _UNSET:
-                task.blocked_at = blocked_at
-            if watch_satisfied_at is not _UNSET:
-                task.watch_satisfied_at = watch_satisfied_at
-            if last_checked_at is not _UNSET:
-                task.last_checked_at = last_checked_at
-            if last_check_result is not _UNSET:
-                task.last_check_result = (
-                    dict(last_check_result)
-                    if last_check_result is not None else None
-                )
-            if condition is not _UNSET:
-                task.condition = dict(condition) if condition is not None else None
-            if tool_finished_at is not _UNSET:
-                task.tool_finished_at = tool_finished_at
-            if tool_error is not _UNSET:
-                task.tool_error = tool_error
-            if attempt_id is not None and 0 < attempt_id <= len(task.attempts):
-                attempt = task.attempts[attempt_id - 1]
-                attempt.finished_at = now_iso
-                attempt.status = new_status
-                attempt.exit_code = exit_code
-                attempt.error = error
-                attempt.error_type = error_type
-                if log_stdout_path is not None:
-                    attempt.stdout_path = log_stdout_path
-                if log_stderr_path is not None:
-                    attempt.stderr_path = log_stderr_path
-                if result_path is not None:
-                    attempt.result_path = result_path
-            self._store.save_workflow(wf)
-            if attempt_id is not None:
-                self._events.task_attempt_finished(
-                    wf.workflow_id,
-                    task.task_id,
-                    agent_id=self._agent_id,
-                    attempt_id=attempt_id,
-                    message="task attempt finished",
-                    metadata={
-                        "status": new_status.value,
-                        "error_type": error_type,
-                    },
-                )
-            self._events.emit(
-                event,
-                wf.workflow_id,
-                task_id=task.task_id,
-                attempt_id=attempt_id,
-                agent_id=self._agent_id,
-                message=message,
-                metadata={"status": new_status.value},
-            )
-            self._timeline.emit(
-                event_type=(
-                    "workflow_task_completed"
-                    if new_status in {TaskStatus.SUCCEEDED, TaskStatus.SKIPPED} else
-                    "workflow_task_failed"
-                ),
-                actor_id=self._agent_id,
-                actor_type="scheduler",
-                target_id=task.task_id,
-                target_type="task",
-                status=new_status.value,
-                summary=message,
-                workflow_id=wf.workflow_id,
-                task_id=task.task_id,
-                record_path=result_path or str(self._store.workflow_json_path(wf.workflow_id)),
-                metadata={
-                    "attempt_id": attempt_id,
-                    "task_kind": task.task_kind,
-                    "error_type": error_type,
-                },
-            )
-            for event_type, event_message, event_metadata in extra_events or []:
-                self._events.emit(
-                    event_type,
-                    wf.workflow_id,
-                    task_id=task.task_id,
-                    attempt_id=attempt_id,
-                    agent_id=self._agent_id,
-                    message=event_message,
-                    metadata=dict(event_metadata),
-                )
+        self._attempts.finish_attempt(
+            wf,
+            task,
+            new_status,
+            event=event,
+            message=message,
+            exit_code=exit_code,
+            result_summary=result_summary,
+            error=error,
+            error_type=error_type,
+            log_stdout_path=log_stdout_path,
+            log_stderr_path=log_stderr_path,
+            result_path=result_path,
+            output_path=output_path,
+            inputs_path=inputs_path,
+            materialized_prompt_path=materialized_prompt_path,
+            artifacts=artifacts,
+            dataflow_error=dataflow_error,
+            blocked_by=blocked_by,
+            blocked_reason=blocked_reason,
+            blocked_at=blocked_at,
+            watch_satisfied_at=watch_satisfied_at,
+            last_checked_at=last_checked_at,
+            last_check_result=last_check_result,
+            condition=condition,
+            tool_finished_at=tool_finished_at,
+            tool_error=tool_error,
+            extra_events=extra_events,
+        )
 
     def _launch_ready(self, wf: Workflow) -> None:
-        running_now = sum(
-            1
-            for t in wf.tasks.values()
-            if t.status is TaskStatus.RUNNING and t.task_kind == "agent"
-        )
-        slots = self._concurrency - running_now
+        slots = available_agent_slots(wf, self._concurrency)
         for task in wf.tasks.values():
             if task.status is not TaskStatus.READY:
                 continue
@@ -2948,6 +2356,12 @@ class Scheduler:
                 if self._materialize_inputs_for_task(wf, task):
                     continue
             previous_attempt = task.current_attempt
+            next_attempt = task.attempt_count + 1
+            self._log_scheduler_task(
+                task,
+                "launch_request",
+                metadata={"attempt_id": next_attempt},
+            )
             task.current_attempt = task.attempt_count + 1
             try:
                 launch_task = self._build_launch_task(task)
@@ -2964,14 +2378,33 @@ class Scheduler:
                     result_summary=str(exc),
                 )
                 continue
-            self._handles[task.task_id] = handle
-            self._begin_attempt(
-                wf,
-                task,
-                message="task started",
-                pid=handle.pid,
-            )
+            try:
+                self._begin_attempt(
+                    wf,
+                    task,
+                    message="task started",
+                    pid=handle.pid,
+                    run_handle=handle,
+                )
+                self._log_scheduler_task(task, "handle_registered", handle=handle)
+            except Exception:
+                # _begin_attempt failed before saving RUNNING; cancel the
+                # orphaned subprocess so it doesn't run untracked.
+                try:
+                    self._runner.cancel(handle)
+                except Exception:
+                    pass
+                raise
             slots -= 1
+            immediate_result = self._runner.poll(handle)
+            if immediate_result is not None:
+                self._log_scheduler_task(
+                    task,
+                    "immediate_poll_terminal",
+                    handle=handle,
+                    metadata={"terminal_status": immediate_result.status.value},
+                )
+                self._handle_terminal_result(wf, task, handle, immediate_result)
 
     def _build_launch_task(self, task: Task) -> Task:
         prompt = task.prompt
@@ -3076,6 +2509,7 @@ class Scheduler:
         output_path: Optional[str] = None
         dataflow_error: Optional[str] = None
         artifacts: list[Any] = []
+        output = None
         try:
             artifacts = register_artifacts(task, self._store, tool_result.artifacts)
             for artifact in artifacts:
@@ -3093,16 +2527,6 @@ class Scheduler:
                     ),
                     tool_result,
                 )
-                output_path = str(self._store.write_task_output(
-                    wf.workflow_id,
-                    task.task_id,
-                    output,
-                ))
-                extra_events.append((
-                    ev.OUTPUT_WRITTEN,
-                    "normalized output written",
-                    {"path": output_path},
-                ))
         except DataflowError as exc:
             target_status = TaskStatus.FAILED
             task_event = ev.TASK_FAILED
@@ -3120,27 +2544,54 @@ class Scheduler:
                 error=str(exc),
             )
 
+        result_payload = {
+            "task_id": task.task_id,
+            "workflow_id": wf.workflow_id,
+            "attempt_id": task.current_attempt,
+            "status": target_status.value,
+            "summary": tool_result.summary,
+            "text": tool_result.text,
+            "data": tool_result.data,
+            "metrics": tool_result.metrics,
+            "error": dataflow_error or tool_result.error,
+            "error_type": error_type,
+            "failure_type": None,
+            "retryable": None,
+            "audit_record_path": str(audit_path),
+        }
+        target_status, task_event, tool_result_summary, semantic_error, semantic_error_type, result_payload = self._apply_semantic_validation(
+            wf,
+            task,
+            target_status=target_status,
+            event_type=task_event,
+            summary=output.summary if output is not None else tool_result.summary,
+            text=output.text if output is not None else tool_result.text,
+            data=output.data if output is not None else tool_result.data,
+            result_payload=result_payload,
+        )
+        if semantic_error_type is not None:
+            error_type = semantic_error_type
+            tool_event = ev.TOOL_FAILED
+        tool_result_summary = tool_result_summary or tool_result.summary
+        if target_status is TaskStatus.SUCCEEDED and output is not None:
+            output_path = str(self._store.write_task_output(
+                wf.workflow_id,
+                task.task_id,
+                output,
+            ))
+            extra_events.append((
+                ev.OUTPUT_WRITTEN,
+                "normalized output written",
+                {"path": output_path},
+            ))
         if target_status is TaskStatus.FAILED and error_type is None:
             error_type = "unknown"
+        result_payload["error_type"] = error_type
         result_path = str(self._store.write_attempt_result(
             wf.workflow_id,
             task.task_id,
             task.current_attempt,
-            {
-                "task_id": task.task_id,
-                "workflow_id": wf.workflow_id,
-                "attempt_id": task.current_attempt,
-                "status": target_status.value,
-                "summary": tool_result.summary,
-                "text": tool_result.text,
-                "data": tool_result.data,
-                "metrics": tool_result.metrics,
-                "error": dataflow_error or tool_result.error,
-                "error_type": error_type,
-                "failure_type": None,
-                "retryable": None,
-                "audit_record_path": str(audit_path),
-            },
+            result_payload,
         ))
         self._write_policy_audit(
             audit_path,
@@ -3150,12 +2601,12 @@ class Scheduler:
             decision=decision,
             execution_result={
                 "status": target_status.value,
-                "summary": tool_result.summary,
-                "text": tool_result.text,
-                "data": dict(tool_result.data),
-                "metrics": dict(tool_result.metrics),
+                "summary": result_payload.get("summary"),
+                "text": result_payload.get("text"),
+                "data": dict(result_payload.get("data") or {}),
+                "metrics": dict(result_payload.get("metrics") or {}),
             },
-            error=dataflow_error or tool_result.error,
+            error=result_payload.get("error"),
         )
         approval_request_id = decision.get("metadata", {}).get("approval_request_id")
         if (
@@ -3175,7 +2626,7 @@ class Scheduler:
             metadata=metadata,
             decision=decision,
             execution_status=target_status.value,
-            error=dataflow_error or tool_result.error,
+            error=result_payload.get("error"),
             approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
         )
         self._timeline.emit(
@@ -3195,17 +2646,17 @@ class Scheduler:
             approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
             audit_id=self._policy_audit_id(audit_path),
             record_path=str(audit_path),
-            metadata={"error": dataflow_error or tool_result.error},
+            metadata={"error": result_payload.get("error")},
         )
-        message = dataflow_error or tool_result.error or tool_result.summary or ""
+        message = semantic_error or dataflow_error or tool_result.error or tool_result.summary or ""
         event_metadata = {
             "tool_type": task.tool_type,
             "state": target_status.value,
         }
-        if tool_result.error:
-            event_metadata["error"] = tool_result.error
-        if tool_result.data:
-            event_metadata["data"] = dict(tool_result.data)
+        if result_payload.get("error"):
+            event_metadata["error"] = result_payload.get("error")
+        if result_payload.get("data"):
+            event_metadata["data"] = dict(result_payload["data"])
         extra_events.insert(0, (tool_event, message, event_metadata))
         self._finish_attempt(
             wf,
@@ -3213,8 +2664,8 @@ class Scheduler:
             target_status,
             event=task_event,
             message=message,
-            result_summary=tool_result.summary,
-            error=dataflow_error or tool_result.error,
+            result_summary=tool_result_summary,
+            error=semantic_error or dataflow_error or tool_result.error,
             error_type=error_type,
             result_path=result_path,
             output_path=output_path,
@@ -3415,16 +2866,4 @@ class Scheduler:
 
 
 def _compute_ancestor_labels(depends_on_by_label: dict[str, list[str]]) -> dict[str, set[str]]:
-    memo: dict[str, set[str]] = {}
-
-    def visit(label: str) -> set[str]:
-        if label in memo:
-            return memo[label]
-        ancestors: set[str] = set()
-        for dep in depends_on_by_label.get(label, []):
-            ancestors.add(dep)
-            ancestors.update(visit(dep))
-        memo[label] = ancestors
-        return ancestors
-
-    return {label: visit(label) for label in depends_on_by_label}
+    return compute_ancestor_labels(depends_on_by_label)

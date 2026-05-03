@@ -725,6 +725,14 @@ _DEFAULT_REGISTRY: Optional[ToolRegistry] = None
 
 
 def default_tool_registry() -> ToolRegistry:
+    from mr1.new_tools import (  # lazy import to avoid circular dependency
+        TaskDependencyResolverTool,
+        ConditionalExecutorTool,
+        BatchResultAggregatorTool,
+        FilesystemNavigatorTool,
+        DataQueryTransformTool,
+        DataValidatorTool,
+    )
     global _DEFAULT_REGISTRY
     if _DEFAULT_REGISTRY is None:
         registry = ToolRegistry()
@@ -1088,6 +1096,226 @@ def default_tool_registry() -> ToolRegistry:
                     "task_kind": "tool",
                     "tool_type": "memory_retrieval_update",
                     "tool_config": {},
+                }
+            ],
+        )
+        registry.register(
+            "task_dependency_resolver",
+            TaskDependencyResolverTool(),
+            description="Resolve and aggregate outputs from multiple dependent tasks for complex data flow patterns.",
+            config_shape='{"tasks": [{"task_name": "process_data", "output_path": "result.data.output"}], "merge_strategy": "merge", "fail_on_missing": false}',
+            config_schema={
+                "tasks": {"type": "list[object]", "required": True},
+                "merge_strategy": {"type": "string", "required": False, "default": "merge"},
+                "fail_on_missing": {"type": "bool", "required": False, "default": False},
+            },
+            outputs={
+                "result.data.resolved_count": "number of successfully resolved task outputs",
+                "result.data.missing_count": "number of missing task outputs",
+                "result.data.missing_tasks": "list of task names that were not found",
+                "result.data.merged_result": "consolidated result from all task outputs",
+                "result.data.merge_strategy": "applied merge strategy",
+                "artifact.resolved_outputs": "JSON artifact containing all resolved outputs",
+            },
+            examples=[
+                {
+                    "label": "resolve_parallel_results",
+                    "title": "Resolve outputs from parallel tasks",
+                    "task_kind": "tool",
+                    "tool_type": "task_dependency_resolver",
+                    "tool_config": {
+                        "tasks": [
+                            {"task_name": "parallel_task_1", "output_path": "result.data.value"},
+                            {"task_name": "parallel_task_2", "output_path": "result.data.value"},
+                        ],
+                        "merge_strategy": "merge",
+                        "fail_on_missing": False,
+                    },
+                }
+            ],
+        )
+        registry.register(
+            "conditional_executor",
+            ConditionalExecutorTool(),
+            description="Gate task execution based on conditions evaluated against previous task results.",
+            config_shape='{"conditions": [{"field": "result.state", "operator": "equals", "value": "succeeded"}], "logic": "and", "on_true": "allow", "on_false": "block"}',
+            config_schema={
+                "conditions": {"type": "list[object]", "required": True},
+                "logic": {"type": "string", "required": False, "default": "and"},
+                "on_true": {"type": "string", "required": False, "default": "allow"},
+                "on_false": {"type": "string", "required": False, "default": "block"},
+                "target_task": {"type": "string", "required": False},
+            },
+            outputs={
+                "result.text": "execution decision ('allow' or 'block')",
+                "result.data.decision": "execution decision string",
+                "result.data.allow": "boolean execution permission",
+                "result.data.conditions_met": "number of conditions satisfied",
+                "result.data.conditions_total": "total number of conditions",
+                "result.data.condition_results": "detailed results for each condition",
+                "artifact.condition_results": "JSON artifact containing all condition evaluations",
+            },
+            examples=[
+                {
+                    "label": "gate_on_success",
+                    "title": "Gate execution on upstream success",
+                    "task_kind": "tool",
+                    "tool_type": "conditional_executor",
+                    "tool_config": {
+                        "conditions": [
+                            {"field": "result.state", "operator": "equals", "value": "succeeded"}
+                        ],
+                        "logic": "and",
+                        "on_true": "allow",
+                        "on_false": "block",
+                        "target_task": "upstream_task",
+                    },
+                }
+            ],
+        )
+        registry.register(
+            "batch_result_aggregator",
+            BatchResultAggregatorTool(),
+            description="Aggregate, transform, and summarize results from multiple parallel tasks.",
+            config_shape='{"aggregations": [{"name": "total", "input_path": "result.data.count", "function": "sum"}], "task_pattern": ".*_batch"}',
+            config_schema={
+                "aggregations": {"type": "list[object]", "required": True},
+                "task_pattern": {"type": "string", "required": False, "default": ".*"},
+            },
+            outputs={
+                "result.text": "JSON representation of aggregated results",
+                "result.data.aggregations": "aggregated values by name",
+                "result.data.matched_count": "number of matching tasks found",
+                "result.data.pattern": "task pattern used for matching",
+                "artifact.aggregation_results": "JSON artifact containing full aggregation summary",
+            },
+            examples=[
+                {
+                    "label": "aggregate_batch_results",
+                    "title": "Aggregate results from parallel batch tasks",
+                    "task_kind": "tool",
+                    "tool_type": "batch_result_aggregator",
+                    "tool_config": {
+                        "aggregations": [
+                            {"name": "total_items", "input_path": "result.data.processed_count", "function": "sum"},
+                            {"name": "success_rate", "input_path": "result.data.success_rate", "function": "avg"},
+                        ],
+                        "task_pattern": "batch_.*",
+                    },
+                }
+            ],
+        )
+        registry.register(
+            "filesystem_navigator",
+            FilesystemNavigatorTool(),
+            description="Efficiently navigate and explore directory structures with filtering and pattern matching.",
+            config_shape='{"path": "/data", "max_depth": 3, "pattern": "*.txt", "include_dirs": true, "max_size_bytes": null}',
+            config_schema={
+                "path": {"type": "string", "required": True},
+                "max_depth": {"type": "int", "required": False, "default": 3},
+                "pattern": {"type": "string", "required": False},
+                "include_dirs": {"type": "bool", "required": False, "default": True},
+                "max_size_bytes": {"type": "int", "required": False},
+            },
+            outputs={
+                "result.text": "formatted list of discovered items",
+                "result.data.path": "navigated base path",
+                "result.data.items_found": "number of items discovered",
+                "result.data.items": "detailed list of file/directory entries",
+                "artifact.filesystem_results": "JSON artifact with full navigation results",
+            },
+            examples=[
+                {
+                    "label": "find_python_files",
+                    "title": "Find Python source files",
+                    "task_kind": "tool",
+                    "tool_type": "filesystem_navigator",
+                    "tool_config": {
+                        "path": "/project/src",
+                        "pattern": ".*\\.py$",
+                        "max_depth": 5,
+                        "include_dirs": False,
+                    },
+                }
+            ],
+        )
+        registry.register(
+            "data_query_transform",
+            DataQueryTransformTool(),
+            description="Query and transform data using flexible patterns, in-memory operations, or SQLite databases.",
+            config_shape='{"mode": "data", "operation": "filter", "pattern": "active", "input_data": [{"status": "active"}]}',
+            config_schema={
+                "mode": {"type": "string", "required": False, "default": "data"},
+                "db_path": {"type": "string", "required": False},
+                "query": {"type": "string", "required": False},
+                "params": {"type": "any", "required": False},
+                "limit": {"type": "integer", "required": False, "default": 10000},
+                "transform_op": {"type": "string", "required": False},
+                "operation": {"type": "string", "required": False},
+                "pattern": {"type": "string", "required": False},
+                "function": {"type": "string", "required": False},
+                "input_data": {"type": "any", "required": False},
+            },
+            outputs={
+                "result.text": "JSON representation of transformed data or query results",
+                "result.data.operation": "applied operation type (data mode) or query metadata (sqlite mode)",
+                "result.data.result": "transformed data or query results",
+                "result.data.input_count": "number of input items (data mode) or rows retrieved (sqlite mode)",
+                "artifact.transform_result": "JSON artifact with transformation result (data mode)",
+                "artifact.query_results": "JSON artifact with query results (sqlite mode)",
+            },
+            examples=[
+                {
+                    "label": "filter_data",
+                    "title": "Filter data by pattern",
+                    "task_kind": "tool",
+                    "tool_type": "data_query_transform",
+                    "tool_config": {
+                        "mode": "data",
+                        "operation": "filter",
+                        "pattern": "active",
+                        "input_data": [{"status": "active", "id": 1}, {"status": "inactive", "id": 2}],
+                    },
+                },
+            ],
+        )
+        registry.register(
+            "data_validator",
+            DataValidatorTool(),
+            description="Validate data against schemas and rules with comprehensive error reporting.",
+            config_shape='{"data": {"name": "John", "age": 30}, "validation_mode": "schema", "schema": {"required": ["name"], "properties": {"name": {"type": "string"}}}}',
+            config_schema={
+                "data": {"type": "any", "required": True},
+                "validation_mode": {"type": "string", "required": False, "default": "schema"},
+                "schema": {"type": "object", "required": False},
+                "rules": {"type": "list[object]", "required": False},
+            },
+            outputs={
+                "result.text": "JSON representation of validation results",
+                "result.data.valid": "boolean indicating overall validation status",
+                "result.data.errors": "list of validation errors",
+                "result.data.warnings": "list of validation warnings",
+                "result.data.error_count": "total number of errors",
+                "result.data.warning_count": "total number of warnings",
+                "artifact.validation_report": "JSON artifact with full validation report",
+            },
+            examples=[
+                {
+                    "label": "validate_user",
+                    "title": "Validate user data against schema",
+                    "task_kind": "tool",
+                    "tool_type": "data_validator",
+                    "tool_config": {
+                        "data": {"name": "Alice", "age": 25},
+                        "validation_mode": "schema",
+                        "schema": {
+                            "required": ["name", "age"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "age": {"type": "integer", "minimum": 0, "maximum": 150},
+                            },
+                        },
+                    },
                 }
             ],
         )

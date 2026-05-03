@@ -1,0 +1,17 @@
+tasks:
+  - label: validate
+    type: script
+    command: ./scripts/validate.sh
+    status: pending
+
+  - label: test
+    type: test
+    depends_on: validate
+    command: pytest tests/
+    status: pending
+
+  - label: deploy
+    type: deployment
+    depends_on: test
+    command: ./deploy.sh
+    status: pending

@@ -87,6 +87,15 @@ class Runner(ABC):
     @abstractmethod
     def cancel(self, handle: RunHandle) -> None: ...
 
+    def recover_result(self, task: Task) -> Optional[RunResult]:
+        """Try to recover a terminal result from persisted log files after handle loss.
+
+        Called when a task is RUNNING on disk but its handle is absent (e.g. after a
+        scheduler restart).  Returns a RunResult if the process already wrote a
+        parseable result to its stdout log; returns None if recovery is not possible.
+        """
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Kazi async runner
@@ -299,6 +308,40 @@ class KaziAsyncRunner(Runner):
         self._close_handles(handle)
         self._logger.log_kill(handle.task_id, "kazi", handle.pid or -1, "cancel")
 
+    def recover_result(self, task: Task) -> Optional[RunResult]:
+        """Recover a terminal result from the persisted stdout log file."""
+        if not task.log_stdout_path:
+            return None
+        stdout_path = Path(task.log_stdout_path)
+        if not stdout_path.exists() or stdout_path.stat().st_size == 0:
+            return None
+        stdout_text = self._read_log(stdout_path)
+        stderr_path = Path(task.log_stderr_path) if task.log_stderr_path else None
+        try:
+            parsed = parse_agent_json_envelope(stdout_text)
+        except AgentRuntimeError:
+            return None
+        payload = _result_payload_from_parsed(parsed)
+        if parsed["is_error"]:
+            return RunResult(
+                status=RunStatus.FAILED,
+                exit_code=1,
+                summary=parsed["text"],
+                error=parsed["text"] or "agent returned is_error=true",
+                error_type=_classify_envelope_error(parsed),
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                result_payload=payload,
+            )
+        return RunResult(
+            status=RunStatus.SUCCEEDED,
+            exit_code=0,
+            summary=parsed["text"],
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            result_payload=payload,
+        )
+
     # -- helpers --------------------------------------------------------
 
     @staticmethod
@@ -480,6 +523,7 @@ class MockRunner(Runner):
         self._on_poll = on_poll
         self._running: dict[str, RunHandle] = {}
         self._terminal: dict[str, RunResult] = {}
+        self._recoverable: dict[str, RunResult] = {}
         self._start_log: list[str] = []
 
     @property
@@ -513,6 +557,13 @@ class MockRunner(Runner):
     def cancel(self, handle: RunHandle) -> None:
         self._running.pop(handle.task_id, None)
         self._terminal.pop(handle.task_id, None)
+
+    def recover_result(self, task: Task) -> Optional[RunResult]:
+        return self._recoverable.get(task.task_id)
+
+    def set_recoverable(self, task_id: str, result: RunResult) -> None:
+        """Stage a result that recover_result() will return for the given task."""
+        self._recoverable[task_id] = result
 
     def complete(
         self,

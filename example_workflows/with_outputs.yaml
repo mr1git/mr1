@@ -1,0 +1,29 @@
+tasks:
+  - label: query
+    type: data_fetch
+    depends_on: []
+    query: SELECT * FROM data
+    outputs:
+      - name: result
+        path: ./result.json
+
+  - label: transform
+    type: transform
+    depends_on: query
+    input: $task.query.outputs.result
+    script: ./transform.py
+    outputs:
+      - name: transformed
+        path: ./transformed.json
+
+  - label: validate
+    type: validation
+    depends_on: transform
+    input: $task.transform.outputs.transformed
+    rules: ./validation.yml
+
+  - label: publish
+    type: publish
+    depends_on: [transform, validate]
+    source: $task.transform.outputs.transformed
+    target: s3://bucket/data

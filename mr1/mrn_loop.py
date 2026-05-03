@@ -37,6 +37,8 @@ from mr1.workflow_store import WorkflowStore
 _PKG_ROOT = Path(__file__).resolve().parent
 _MRN_CONFIG_PATH = _PKG_ROOT / "agents" / "mrn.yml"
 _DEFAULT_TIMEOUT_S = 300
+_MESSAGE_BODY_LIMIT = 4096
+_MESSAGE_BODY_TRUNCATION_SUFFIX = "...[truncated, use message_id for full]"
 ALLOWED_MRN_ACTIONS = frozenset({
     "create_workflow",
     "inspect_workflow",
@@ -164,6 +166,13 @@ def _compact(text: Any, *, limit: int = 240) -> str:
     if len(normalized) > limit:
         return normalized[:limit] + "..."
     return normalized
+
+
+def _truncate_message_body(text: str, *, limit: int = _MESSAGE_BODY_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    keep = max(0, limit - len(_MESSAGE_BODY_TRUNCATION_SUFFIX))
+    return text[:keep] + _MESSAGE_BODY_TRUNCATION_SUFFIX
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -482,8 +491,13 @@ class MRnStepRunner:
         events.sort(key=lambda item: item["timestamp"], reverse=True)
         return events[:10]
 
-    def _message_summary(self, message) -> dict[str, Any]:
-        return {
+    def _message_summary(
+        self,
+        message,
+        *,
+        include_body: bool = False,
+    ) -> dict[str, Any]:
+        payload = {
             "message_id": message.message_id,
             "from_agent_id": message.from_agent_id,
             "to_agent_id": message.to_agent_id,
@@ -491,12 +505,16 @@ class MRnStepRunner:
             "subject": message.subject,
             "status": message.status,
             "created_at": message.created_at,
-            "body_excerpt": _compact(message.body, limit=160),
         }
+        if include_body:
+            payload["body"] = _truncate_message_body(message.body)
+        else:
+            payload["body_excerpt"] = _compact(message.body, limit=160)
+        return payload
 
     def _inbox_messages(self, agent: PersistentAgent) -> list[dict[str, Any]]:
         messages = [
-            self._message_summary(message)
+            self._message_summary(message, include_body=True)
             for message in self._message_store.list_inbox(agent.agent_id)
             if message.status == "unread"
         ]
@@ -519,14 +537,14 @@ class MRnStepRunner:
                 continue
             if message.message_id in seen:
                 continue
-            summaries.append(self._message_summary(message))
+            summaries.append(self._message_summary(message, include_body=True))
             seen.add(message.message_id)
         for message in self._message_store.list_outbox(agent.agent_id)[:5]:
             if message.to_agent_id != parent_id:
                 continue
             if message.message_id in seen:
                 continue
-            summaries.append(self._message_summary(message))
+            summaries.append(self._message_summary(message, include_body=True))
             seen.add(message.message_id)
         summaries.sort(key=lambda item: (item["created_at"], item["message_id"]), reverse=True)
         return summaries[:5]
@@ -809,9 +827,11 @@ class MRnStepRunner:
             risks = list(authored.risks)
             needs_confirmation = bool(authored.needs_confirmation)
 
-        should_require_confirmation = (
-            bool(needs_confirmation) or self._require_confirmation_for_workflows
-        )
+        # When confirmation is explicitly required at the run-policy level,
+        # always stop for review. When that policy is disabled (for example
+        # after the parent already reviewed the plan), submit immediately
+        # even if the compiler envelope would normally ask for confirmation.
+        should_require_confirmation = bool(self._require_confirmation_for_workflows)
 
         if not should_require_confirmation:
             submission = self._workflow_authoring.submit(

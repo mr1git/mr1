@@ -43,12 +43,17 @@ sys.path.insert(0, str(_PKG_ROOT.parent))
 
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 from mr1 import kazi, mrn
+from mr1.capability_policy import (
+    CapabilityApprovalDecision,
+    CapabilityApprovalStore,
+)
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
 from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunRunner
 from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
 from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.event_log import EventLog
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 from mr1 import workflow_cli
@@ -88,6 +93,80 @@ _TERMINAL_TASK_STATUSES = {
 _MAX_DELEGATION_ROUNDS = 5
 _TEST_AGENT_MAX_HEIGHT = 5
 _TEST_AGENT_PREFIX = "test-agent"
+_GROUNDING_AGENT_LIMIT = 8
+_GROUNDING_WORKFLOW_LIMIT = 8
+_GROUNDING_MESSAGE_LIMIT = 8
+_GROUNDING_APPROVAL_LIMIT = 8
+_GROUNDING_EVENT_LIMIT = 10
+_GROUNDING_MESSAGE_BODY_LIMIT = 4096
+_GROUNDING_MESSAGE_TRUNCATION_SUFFIX = "...[truncated, use message_id for full]"
+_AGENT_ID_PATTERN = re.compile(r"\bag-\d{8}T\d{6}-[0-9a-f]{6}\b")
+_WORKFLOW_ID_PATTERN = re.compile(r"\bwf-\d{8}T\d{6}-[0-9a-f]{6}\b")
+_TASK_ID_PATTERN = re.compile(r"\btk-\d{8}T\d{6}-[0-9a-f]{6}\b")
+_MESSAGE_ID_PATTERN = re.compile(r"\bmsg-\d{8}T\d{6,}-[0-9a-f]{6}\b")
+_REPLY_INTENT_PATTERN = re.compile(
+    r"\b(reply|respond|clarify)(?:\s+to)?(?:\s+this)?(?:\s+message)?\b",
+    re.IGNORECASE,
+)
+_WORKFLOW_INSPECTION_INTENT_PHRASES = (
+    "check",
+    "inspect",
+    "summarize",
+    "summary",
+    "results",
+    "result",
+    "status",
+    "what happened",
+    "did it finish",
+    "did the workflow finish",
+    "why failed",
+    "what failed",
+    "show findings",
+    "findings",
+    "finish running",
+)
+_WORKFLOW_FINDINGS_INTENT_PHRASES = (
+    "findings",
+    "conclusion",
+    "what did it find",
+    "summarize findings",
+    "answer/result of the workflow",
+    "answer of the workflow",
+    "result of the workflow",
+    "what were the findings",
+)
+_WORKFLOW_AUTHORING_SUPPRESSION_PHRASES = (
+    "don't create a workflow",
+    "do not create a workflow",
+    "not asking you to create a workflow",
+    "this already ran",
+    "check existing workflow",
+    "inspect existing result",
+)
+_WORKFLOW_REFERENCE_ALIASES = (
+    "that workflow",
+    "the workflow",
+    "this workflow",
+)
+_BULK_AGENT_ACTIONS = (
+    "kill",
+    "terminate",
+    "resume",
+    "run",
+    "message",
+)
+_FINDINGS_PREFERRED_LABEL_TOKENS = (
+    "synthesize",
+    "summarize",
+    "analyze",
+    "final",
+    "report",
+    "answer",
+)
+
+
+def _has_workflow_pronoun_reference(normalized: str) -> bool:
+    return bool(re.search(r"\bit\b", normalized))
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +199,37 @@ _PERSISTENT_DELEGATION_MARKERS = (
     "let the agent",
     "child responsible for",
     "agent responsible for",
+)
+
+_PERSISTENT_CHILD_TITLE_PATTERNS = (
+    re.compile(r"\bchild(?:\s+of\s+yours)?(?:\s+agent)?[,\s]+(MR\d+)\b", re.IGNORECASE),
+    re.compile(r"\bagent\s+(MR\d+)\b", re.IGNORECASE),
+    re.compile(r"\bnamed\s+(MR\d+)\b", re.IGNORECASE),
+)
+
+_META_EXPLANATION_PATTERNS = (
+    re.compile(r"\bin what situation(?:s)? (?:would you|you would)\b", re.IGNORECASE),
+    re.compile(r"\bwhat situation(?:s)? would you use\b", re.IGNORECASE),
+    re.compile(r"\bwhen would you\b", re.IGNORECASE),
+    re.compile(r"\bwhen should (?:mr1|you)\b", re.IGNORECASE),
+    re.compile(r"\bcompare\b", re.IGNORECASE),
+    re.compile(r"\btools?\s+vs\.?\s+workflows?\s+vs\.?\s+agents?\b", re.IGNORECASE),
+    re.compile(r"\bwhat(?:'s| is) the difference between\b", re.IGNORECASE),
+)
+
+_PERSISTENT_DELEGATION_IMPERATIVE_PATTERNS = (
+    re.compile(r"\bcreate (?:a|an) (?:child|agent)\b", re.IGNORECASE),
+    re.compile(r"\bmake (?:mr\d+|the agent|that agent|an agent|a child)\b", re.IGNORECASE),
+    re.compile(r"\bdelegate\b", re.IGNORECASE),
+    re.compile(r"\bassign\b", re.IGNORECASE),
+    re.compile(r"\bhave (?:an agent|a child|mr\d+|the agent|that agent)\b", re.IGNORECASE),
+    re.compile(r"\blet (?:the agent|that agent)\b", re.IGNORECASE),
+    re.compile(r"\b(?:can|could|would|will)\s+you\s+create\b", re.IGNORECASE),
+    re.compile(r"\bi want you to create\b", re.IGNORECASE),
+    re.compile(r"\bi want (?:an|a) (?:owner )?agent\b", re.IGNORECASE),
+    re.compile(r"\bplease create\b", re.IGNORECASE),
+    re.compile(r"\bset up (?:a|an) agent\b", re.IGNORECASE),
+    re.compile(r"\bspin up (?:a|an) agent\b", re.IGNORECASE),
 )
 
 # Signal that MR1 has finished writing mr1_context.md during /memdltr.
@@ -350,6 +460,28 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _compact_text(value: Any, *, limit: int = 240) -> str:
+    if not isinstance(value, str):
+        return "-"
+    normalized = " ".join(value.split())
+    if not normalized:
+        return "-"
+    if len(normalized) > limit:
+        return normalized[:limit] + "..."
+    return normalized
+
+
+def _truncate_grounding_message_body(
+    text: str,
+    *,
+    limit: int = _GROUNDING_MESSAGE_BODY_LIMIT,
+) -> str:
+    if len(text) <= limit:
+        return text
+    keep = max(0, limit - len(_GROUNDING_MESSAGE_TRUNCATION_SUFFIX))
+    return text[:keep] + _GROUNDING_MESSAGE_TRUNCATION_SUFFIX
+
+
 # ---------------------------------------------------------------------------
 # MR1 Process — Claude session runner
 # ---------------------------------------------------------------------------
@@ -522,10 +654,12 @@ class StateManager:
         if self._path.exists():
             try:
                 with open(self._path) as f:
-                    return json.load(f)
+                    data = json.load(f)
+                self._ensure_reference_defaults(data)
+                return data
             except (json.JSONDecodeError, KeyError):
                 pass  # Corrupted — reinitialise.
-        return {
+        data = {
             "session_id": uuid.uuid4().hex[:12],
             "started_at": _now_iso(),
             "claude_session_id": None,
@@ -535,6 +669,23 @@ class StateManager:
             "conversation": [],
             "pending_workflow": None,
         }
+        self._ensure_reference_defaults(data)
+        return data
+
+    @staticmethod
+    def _ensure_reference_defaults(state: dict[str, Any]) -> None:
+        state.setdefault("last_created_agent_id", None)
+        state.setdefault("last_referenced_agent_id", None)
+        state.setdefault("last_created_workflow_id", None)
+        state.setdefault("last_referenced_workflow_id", None)
+        aliases = state.setdefault("reference_aliases", {})
+        if not isinstance(aliases, dict):
+            aliases = {}
+            state["reference_aliases"] = aliases
+        agents = aliases.get("agents")
+        workflows = aliases.get("workflows")
+        aliases["agents"] = dict(agents) if isinstance(agents, dict) else {}
+        aliases["workflows"] = dict(workflows) if isinstance(workflows, dict) else {}
 
     def save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -658,6 +809,43 @@ class StateManager:
     def clear_pending_workflow(self) -> None:
         self.set_pending_workflow(None)
 
+    def set_reference_state(self, key: str, value: Optional[str]) -> None:
+        self._state[key] = value
+        self.save()
+
+    def set_reference_alias(self, kind: str, alias: str, target_id: str) -> None:
+        normalized_alias = alias.strip().lower()
+        if not normalized_alias:
+            return
+        aliases = self._state.setdefault("reference_aliases", {})
+        bucket = aliases.setdefault(kind, {})
+        bucket[normalized_alias] = target_id
+        self.save()
+
+    @property
+    def reference_aliases(self) -> dict[str, dict[str, str]]:
+        aliases = self._state.get("reference_aliases", {})
+        return {
+            "agents": dict(aliases.get("agents", {})),
+            "workflows": dict(aliases.get("workflows", {})),
+        }
+
+    @property
+    def last_created_agent_id(self) -> Optional[str]:
+        return self._state.get("last_created_agent_id")
+
+    @property
+    def last_referenced_agent_id(self) -> Optional[str]:
+        return self._state.get("last_referenced_agent_id")
+
+    @property
+    def last_created_workflow_id(self) -> Optional[str]:
+        return self._state.get("last_created_workflow_id")
+
+    @property
+    def last_referenced_workflow_id(self) -> Optional[str]:
+        return self._state.get("last_referenced_workflow_id")
+
     # -- Agent PIDs --------------------------------------------------------
 
     def add_agent_pid(self, pid: int) -> None:
@@ -779,6 +967,8 @@ class MR1:
         workflow_authoring_backend: str = "local",
         workflow_compiler_client: Optional[WorkflowCompilerClient] = None,
         workflow_authoring_service: Optional[WorkflowAuthoringService] = None,
+        inbox_auto_triage: bool = True,
+        inbox_triage_interval_s: float = 30.0,
     ):
         self._dispatcher = Dispatcher()
         self._logger = Logger()
@@ -809,6 +999,10 @@ class MR1:
             root=self._workflow_store.root.parent / "messages",
             scoped_agent_store=self._scoped_agents,
         )
+        self._approval_store = CapabilityApprovalStore(
+            self._workflow_store.root.parent / "capability_approvals"
+        )
+        self._event_log = EventLog(self._workflow_store.root.parent / "events")
         self._root_agent_id = self._scoped_agents.root_agent_id
         runner = workflow_runner or KaziAsyncRunner(
             self._workflow_store,
@@ -831,6 +1025,17 @@ class MR1:
             authoring_backend=workflow_authoring_backend,
             workflow_compiler_client=workflow_compiler_client,
         )
+
+        self._inbox_triage_interval_s = inbox_triage_interval_s
+        self._inbox_stop = threading.Event()
+        self._inbox_thread: Optional[threading.Thread] = None
+        if inbox_auto_triage:
+            self._inbox_thread = threading.Thread(
+                target=self._run_inbox_loop,
+                name="inbox-triage",
+                daemon=True,
+            )
+            self._inbox_thread.start()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1036,6 +1241,1052 @@ class MR1:
             lane=entry["lane"],
         )
 
+    def _turn_artifacts_dir(self) -> Path:
+        path = self._state._path.parent / "mr1_turns"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _new_turn_id(self) -> str:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        return f"turn-{timestamp}-{uuid.uuid4().hex[:6]}"
+
+    def _write_turn_artifact(
+        self,
+        *,
+        turn_id: str,
+        user_input: str,
+        route: str,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+        brain_prompt: Optional[str] = None,
+        brain_response: Optional[str] = None,
+        full_payload: Optional[str] = None,
+    ) -> Path:
+        payload = {
+            "turn_id": turn_id,
+            "timestamp": _now_iso(),
+            "user_input": user_input,
+            "route": route,
+            "resolved_references": resolved_references,
+            "ambiguities": ambiguities,
+            "runtime_grounding": runtime_grounding,
+            "brain_prompt": brain_prompt,
+            "brain_response": brain_response,
+            "full_payload": full_payload,
+        }
+        path = self._turn_artifacts_dir() / f"{turn_id}.json"
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        tmp.replace(path)
+        return path
+
+    def _finalize_turn_response(
+        self,
+        text: str,
+        *,
+        turn_id: str,
+        route: str,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+        kind: str = "message",
+        brain_prompt: Optional[str] = None,
+        brain_response: Optional[str] = None,
+        full_payload: Optional[str] = None,
+    ) -> str:
+        self._write_turn_artifact(
+            turn_id=turn_id,
+            user_input=self._state.conversation[-1]["text"] if self._state.conversation else "",
+            route=route,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+            brain_prompt=brain_prompt,
+            brain_response=brain_response,
+            full_payload=full_payload,
+        )
+        return self._record_local_response(text, kind=kind)
+
+    def _remember_created_agent(self, agent) -> None:
+        self._state.set_reference_state("last_created_agent_id", agent.agent_id)
+        self._state.set_reference_alias("agents", agent.title, agent.agent_id)
+
+    def _remember_referenced_agent(self, agent) -> None:
+        self._state.set_reference_state("last_referenced_agent_id", agent.agent_id)
+        self._state.set_reference_alias("agents", agent.title, agent.agent_id)
+
+    def _remember_created_workflow(self, workflow_id: str, *, title: Optional[str] = None) -> None:
+        self._state.set_reference_state("last_created_workflow_id", workflow_id)
+        self._state.set_reference_state("last_referenced_workflow_id", workflow_id)
+        if title:
+            self._state.set_reference_alias("workflows", title, workflow_id)
+
+    def _remember_referenced_workflow(self, workflow_id: str, *, title: Optional[str] = None) -> None:
+        self._state.set_reference_state("last_referenced_workflow_id", workflow_id)
+        if title:
+            self._state.set_reference_alias("workflows", title, workflow_id)
+
+    def _prioritize_items(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        id_field: str,
+        pinned_ids: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        pinned_set = {item for item in pinned_ids if item}
+        prioritized = [item for item in items if item.get(id_field) in pinned_set]
+        remaining = [item for item in items if item.get(id_field) not in pinned_set]
+        return (prioritized + remaining)[:limit]
+
+    def _grounding_agents(
+        self,
+        *,
+        limit: int = _GROUNDING_AGENT_LIMIT,
+        pinned_agent_ids: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for agent in self._scoped_agents.list_visible_agents(self._root_agent_id):
+            unread_count = sum(
+                1
+                for message in self._message_store.list_inbox(agent.agent_id)
+                if message.status == "unread"
+            )
+            payload.append({
+                "agent_id": agent.agent_id,
+                "title": agent.title,
+                "agent_type": agent.agent_type,
+                "status": agent.status,
+                "run_status": agent.run_status,
+                "mission_summary": _compact_text(agent.mission, limit=240),
+                "last_action_summary": _compact_text(json.dumps(agent.last_action, sort_keys=True) if agent.last_action else "", limit=240),
+                "latest_run": dict(agent.last_run) if isinstance(agent.last_run, dict) else None,
+                "unread_inbox_count": unread_count,
+                "parent_agent_id": agent.parent_agent_id,
+                "scope_roots_summary": [
+                    _compact_text(path, limit=120)
+                    for path in list(agent.scope_roots or [])[:5]
+                ],
+                "created_at": agent.created_at,
+            })
+        payload.sort(key=lambda item: (item["created_at"], item["agent_id"]), reverse=True)
+        pinned = pinned_agent_ids or [
+            self._state.last_referenced_agent_id,
+            self._state.last_created_agent_id,
+        ]
+        return self._prioritize_items(payload, id_field="agent_id", pinned_ids=pinned, limit=limit)
+
+    def _grounding_workflows(
+        self,
+        *,
+        limit: int = _GROUNDING_WORKFLOW_LIMIT,
+        pinned_workflow_ids: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for workflow in self._workflow_store.list_workflows():
+            tasks = list(workflow.tasks.values())
+            tasks.sort(key=lambda item: item.created_at)
+            payload.append({
+                "workflow_id": workflow.workflow_id,
+                "title": workflow.title,
+                "status": workflow.status.value,
+                "owner_agent_id": workflow.owner_agent_id,
+                "created_at": workflow.created_at,
+                "recent_task_status_summary": [
+                    {
+                        "label": task.label,
+                        "status": task.status.value,
+                        "summary": task.result_summary,
+                    }
+                    for task in tasks[:5]
+                ],
+                "memory_refs_used": list(workflow.metadata.get("memory_refs_used", []))
+                if isinstance(workflow.metadata, dict) else [],
+            })
+        payload.sort(key=lambda item: (item["created_at"], item["workflow_id"]), reverse=True)
+        pinned = pinned_workflow_ids or [
+            self._state.last_referenced_workflow_id,
+            self._state.last_created_workflow_id,
+        ]
+        return self._prioritize_items(payload, id_field="workflow_id", pinned_ids=pinned, limit=limit)
+
+    def _grounding_messages(
+        self,
+        *,
+        limit: int = _GROUNDING_MESSAGE_LIMIT,
+        pinned_message_ids: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        pinned_ids = [item for item in (pinned_message_ids or []) if item]
+        messages = [
+            message
+            for message in self._message_store.list_inbox(self._root_agent_id)
+            if message.status == "unread"
+        ]
+        seen = {message.message_id for message in messages}
+        for message_id in pinned_ids:
+            message = self._message_store.get_message(message_id)
+            if message is None or message.message_id in seen:
+                continue
+            messages.append(message)
+            seen.add(message.message_id)
+        payload = [
+            {
+                "message_id": message.message_id,
+                "from_agent_id": message.from_agent_id,
+                "to_agent_id": message.to_agent_id,
+                "kind": message.kind,
+                "subject": message.subject,
+                "status": message.status,
+                "created_at": message.created_at,
+                "body": _truncate_grounding_message_body(message.body),
+            }
+            for message in messages
+        ]
+        payload.sort(key=lambda item: (item["created_at"], item["message_id"]), reverse=True)
+        return self._prioritize_items(payload, id_field="message_id", pinned_ids=pinned_ids, limit=limit)
+
+    def _grounding_approvals(self, *, limit: int = _GROUNDING_APPROVAL_LIMIT) -> list[dict[str, Any]]:
+        payload = []
+        for approval in self._approval_store.list_requests():
+            if approval.status != "pending":
+                continue
+            payload.append({
+                "approval_request_id": approval.approval_request_id,
+                "requesting_actor_id": approval.requesting_actor_id,
+                "capability_name": approval.capability_name,
+                "risk_score": approval.risk_score,
+                "designated_approver_id": approval.designated_approver_id,
+                "status": approval.status,
+                "created_at": approval.created_at,
+            })
+        payload.sort(key=lambda item: (item["created_at"], item["approval_request_id"]), reverse=True)
+        return payload[:limit]
+
+    def _grounding_events(self, *, limit: int = _GROUNDING_EVENT_LIMIT) -> list[dict[str, Any]]:
+        events = self._event_log.recent_activity(limit=limit)
+        return [
+            {
+                "event_index": event.event_index,
+                "event_type": event.event_type,
+                "actor_id": event.actor_id,
+                "target_id": event.target_id,
+                "status": event.status,
+                "summary": event.summary,
+            }
+            for event in events
+        ]
+
+    def build_runtime_grounding(
+        self,
+        *,
+        resolved_references: Optional[dict[str, Any]] = None,
+        ambiguities: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        resolved = dict(resolved_references or {})
+        pinned_agent_ids = [
+            item.get("id")
+            for item in resolved.values()
+            if item.get("kind") == "agent"
+        ]
+        pinned_workflow_ids = [
+            item.get("id")
+            for item in resolved.values()
+            if item.get("kind") == "workflow"
+        ]
+        pinned_message_ids = [
+            item.get("id")
+            for item in resolved.values()
+            if item.get("kind") == "message"
+        ]
+        return {
+            "agents": self._grounding_agents(pinned_agent_ids=pinned_agent_ids),
+            "workflows": self._grounding_workflows(pinned_workflow_ids=pinned_workflow_ids),
+            "messages": self._grounding_messages(pinned_message_ids=pinned_message_ids),
+            "approvals": self._grounding_approvals(),
+            "events": self._grounding_events(),
+            "resolved_references": resolved,
+            "ambiguities": list(ambiguities or []),
+        }
+
+    def _format_runtime_grounding_block(self, runtime_grounding: dict[str, Any]) -> str:
+        return "\n".join([
+            "RUNTIME STATE IS SOURCE OF TRUTH.",
+            "If this conflicts with remembered conversation context, trust runtime state.",
+            'Resolve references such as "that MR2" using the runtime state first.',
+            "",
+            "=== RUNTIME GROUNDING ===",
+            json.dumps(runtime_grounding, indent=2, sort_keys=True),
+            "=== END RUNTIME GROUNDING ===",
+        ])
+
+    def _agent_reference_payload(self, agent) -> dict[str, Any]:
+        return {
+            "kind": "agent",
+            "id": agent.agent_id,
+            "title": agent.title,
+        }
+
+    def _workflow_reference_payload(self, workflow) -> dict[str, Any]:
+        return {
+            "kind": "workflow",
+            "id": workflow.workflow_id,
+            "title": workflow.title,
+        }
+
+    def _message_reference_payload(self, message) -> dict[str, Any]:
+        return {
+            "kind": "message",
+            "id": message.message_id,
+            "subject": message.subject,
+            "from_agent_id": message.from_agent_id,
+            "to_agent_id": message.to_agent_id,
+        }
+
+    @staticmethod
+    def _is_mr_style_agent_title(title: str) -> bool:
+        return bool(re.fullmatch(r"mr\d+", title, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _bulk_agent_action(normalized: str) -> str:
+        for action in _BULK_AGENT_ACTIONS:
+            if re.search(rf"\b{action}\b", normalized):
+                return action
+        return "manage"
+
+    def _agent_title_reference_kind(self, normalized: str, title: str) -> Optional[str]:
+        escaped_title = re.escape(title)
+        if not re.search(rf"\b{escaped_title}\b", normalized):
+            return None
+
+        bulk_patterns = (
+            rf"\ball\s+{escaped_title}\s+agents\b",
+            rf"\b(?:all\s+(?:of\s+)?)?(?:those|these|the)\s+{escaped_title}\s+agents\b",
+            rf"\bevery\s+agent\s+named\s+{escaped_title}\b",
+        )
+        if any(re.search(pattern, normalized) for pattern in bulk_patterns):
+            return "bulk"
+        if (
+            re.search(rf"\b{escaped_title}\s+agents\b", normalized)
+            and any(re.search(rf"\b{action}\b", normalized) for action in _BULK_AGENT_ACTIONS)
+        ):
+            return "bulk"
+
+        single_patterns = (
+            rf"\bwhat\s+is\s+(?:that\s+|the\s+)?{escaped_title}\s+doing\b",
+            rf"\b(?:run|kill|terminate|resume|message|ask)\s+(?:that\s+|the\s+)?{escaped_title}\b",
+            rf"\b(?:status|inbox|approval)\s+(?:for|of)?\s*(?:that\s+|the\s+)?{escaped_title}\b",
+            rf"\bworkflow\s+owner\s+(?:for|of)?\s*(?:that\s+|the\s+)?{escaped_title}\b",
+            rf"\b(?:that|the)\s+{escaped_title}\s+(?:agent|child)\b",
+            rf"\b(?:agent|child)\s+(?:named\s+)?{escaped_title}\b",
+            rf"\b{escaped_title}\s+(?:agent|child)\b",
+        )
+        if any(re.search(pattern, normalized) for pattern in single_patterns):
+            return "single"
+        if self._is_mr_style_agent_title(title):
+            return "single"
+        return None
+
+    def resolve_runtime_references(
+        self,
+        user_input: str,
+        runtime_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        resolved: dict[str, Any] = {}
+        ambiguities: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        bulk_targets: list[dict[str, Any]] = []
+        normalized = _normalize_routing_text(user_input)
+        visible_agents = self._scoped_agents.list_visible_agents(self._root_agent_id)
+        agents_by_id = {agent.agent_id: agent for agent in visible_agents}
+        workflows = self._workflow_store.list_workflows()
+        workflows_by_id = {workflow.workflow_id: workflow for workflow in workflows}
+
+        for agent_id in sorted(set(_AGENT_ID_PATTERN.findall(user_input))):
+            agent = agents_by_id.get(agent_id)
+            if agent is None:
+                missing.append({"reference": agent_id, "kind": "agent"})
+                continue
+            resolved[agent_id] = self._agent_reference_payload(agent)
+
+        workflow_ids = set(re.findall(r"\bwf-\d{8}T\d{6}-[0-9a-f]{6}\b", user_input))
+        explicit_workflow_id = self._workflow_authoring.extract_workflow_id(user_input)
+        if explicit_workflow_id:
+            workflow_ids.add(explicit_workflow_id)
+        for workflow_id in sorted(workflow_ids):
+            workflow = workflows_by_id.get(workflow_id)
+            if workflow is None:
+                missing.append({"reference": workflow_id, "kind": "workflow"})
+                continue
+            resolved[workflow_id] = self._workflow_reference_payload(workflow)
+
+        for message_id in sorted(set(_MESSAGE_ID_PATTERN.findall(user_input))):
+            message = self._message_store.get_message(message_id)
+            if message is None:
+                missing.append({"reference": message_id, "kind": "message"})
+                continue
+            resolved[message_id] = self._message_reference_payload(message)
+
+        title_matches: dict[str, list[Any]] = {}
+        for agent in visible_agents:
+            title_matches.setdefault(agent.title.lower(), []).append(agent)
+
+        for title, candidates in title_matches.items():
+            plain_match = re.search(rf"\b{re.escape(title)}\b", normalized)
+            that_match = re.search(rf"\bthat\s+{re.escape(title)}\b", normalized)
+            if not plain_match and not that_match:
+                continue
+            reference_kind = self._agent_title_reference_kind(normalized, title)
+            if reference_kind is None:
+                continue
+            if reference_kind == "bulk":
+                bulk_targets.append({
+                    "reference": f"{candidates[0].title} agents",
+                    "kind": "agent",
+                    "action": self._bulk_agent_action(normalized),
+                    "candidates": [self._agent_reference_payload(item) for item in candidates],
+                })
+                continue
+            if len(candidates) == 1:
+                source = f"that {candidates[0].title}" if that_match else candidates[0].title
+                resolved[source] = self._agent_reference_payload(candidates[0])
+                continue
+            pinned_id = None
+            if that_match:
+                pinned_id = self._state.last_referenced_agent_id or self._state.last_created_agent_id
+            if pinned_id is not None:
+                pinned_candidate = next((item for item in candidates if item.agent_id == pinned_id), None)
+                if pinned_candidate is not None:
+                    resolved[f"that {pinned_candidate.title}"] = self._agent_reference_payload(pinned_candidate)
+                    continue
+            ambiguities.append({
+                "reference": f"that {candidates[0].title}" if that_match else candidates[0].title,
+                "kind": "agent",
+                "candidates": [self._agent_reference_payload(item) for item in candidates],
+            })
+
+        if "that agent" in normalized and "that agent" not in resolved:
+            target_id = self._state.last_referenced_agent_id or self._state.last_created_agent_id
+            if target_id and target_id in agents_by_id:
+                resolved["that agent"] = self._agent_reference_payload(agents_by_id[target_id])
+            else:
+                missing.append({"reference": "that agent", "kind": "agent"})
+
+        workflow_alias = "the workflow from earlier"
+        if workflow_alias in normalized and workflow_alias not in resolved:
+            workflow_id = self._state.last_referenced_workflow_id or self._state.last_created_workflow_id
+            workflow = workflows_by_id.get(workflow_id or "")
+            if workflow is not None:
+                resolved[workflow_alias] = self._workflow_reference_payload(workflow)
+            else:
+                missing.append({"reference": workflow_alias, "kind": "workflow"})
+
+        for alias, agent_id in self._state.reference_aliases.get("agents", {}).items():
+            if (
+                alias in normalized
+                and alias not in resolved
+                and agent_id in agents_by_id
+                and self._agent_title_reference_kind(normalized, alias) == "single"
+            ):
+                resolved[alias] = self._agent_reference_payload(agents_by_id[agent_id])
+        for alias, workflow_id in self._state.reference_aliases.get("workflows", {}).items():
+            workflow = workflows_by_id.get(workflow_id)
+            if alias in normalized and alias not in resolved and workflow is not None:
+                resolved[alias] = self._workflow_reference_payload(workflow)
+
+        return {
+            "resolved_references": resolved,
+            "ambiguities": ambiguities,
+            "missing": missing,
+            "bulk_targets": bulk_targets,
+        }
+
+    def _format_reference_ambiguity(self, ambiguities: list[dict[str, Any]]) -> str:
+        first = ambiguities[0]
+        candidates = ", ".join(
+            f"{item.get('title') or item.get('id')} ({item['id']})"
+            for item in first.get("candidates", [])
+        )
+        return f"Ambiguous reference '{first['reference']}'. Clarify one of: {candidates}"
+
+    def _format_bulk_agent_target_clarification(
+        self,
+        bulk_targets: list[dict[str, Any]],
+    ) -> str:
+        first = bulk_targets[0]
+        candidates = first.get("candidates", [])
+        candidate_list = ", ".join(
+            f"{item.get('title') or item.get('id')} ({item['id']})"
+            for item in candidates
+        )
+        action = first.get("action") or "manage"
+        if action in {"kill", "terminate"}:
+            return (
+                f"Bulk agent terminate request matches {len(candidates)} agent(s): {candidate_list}. "
+                "Confirm the exact agent_ids you want me to terminate with /agent kill <ag-id>."
+            )
+        return (
+            f"Bulk agent reference '{first.get('reference', 'agents')}' matches {len(candidates)} agent(s): "
+            f"{candidate_list}. Clarify the exact agent_ids you want me to {action}."
+        )
+
+    def _resolved_workflow_target_id(self, resolved_references: dict[str, Any]) -> Optional[str]:
+        for payload in resolved_references.values():
+            if payload.get("kind") == "workflow":
+                return payload.get("id")
+        return None
+
+    def _explicit_workflow_ids(
+        self,
+        user_input: str,
+        resolved_references: dict[str, Any],
+    ) -> list[str]:
+        workflow_ids = {
+            payload["id"]
+            for payload in resolved_references.values()
+            if payload.get("kind") == "workflow" and payload.get("id")
+        }
+        workflow_ids.update(_WORKFLOW_ID_PATTERN.findall(user_input))
+        explicit_workflow_id = self._workflow_authoring.extract_workflow_id(user_input)
+        if explicit_workflow_id:
+            workflow_ids.add(explicit_workflow_id)
+        return sorted(workflow_ids)
+
+    def _explicit_task_ids(self, user_input: str) -> list[str]:
+        return sorted(set(_TASK_ID_PATTERN.findall(user_input)))
+
+    def _is_runtime_inspection_request(
+        self,
+        user_input: str,
+        resolved_references: dict[str, Any],
+    ) -> bool:
+        normalized = _normalize_routing_text(user_input)
+        if not normalized:
+            return False
+        has_intent = any(phrase in normalized for phrase in _WORKFLOW_INSPECTION_INTENT_PHRASES)
+        has_intent = has_intent or bool(
+            re.search(r"\bdid\b.*\bfinish(?:\s+running)?\b", normalized)
+        )
+        has_intent = has_intent or bool(
+            re.search(r"\bwhy\b.*\bfail(?:ed)?\b", normalized)
+        )
+        suppresses_authoring = any(
+            phrase in normalized for phrase in _WORKFLOW_AUTHORING_SUPPRESSION_PHRASES
+        )
+        if not has_intent and not suppresses_authoring:
+            return False
+        return bool(
+            self._explicit_workflow_ids(user_input, resolved_references)
+            or self._explicit_task_ids(user_input)
+            or any(alias in normalized for alias in _WORKFLOW_REFERENCE_ALIASES)
+            or (_has_workflow_pronoun_reference(normalized) and self._state.last_referenced_workflow_id)
+        )
+
+    def _is_workflow_findings_request(self, user_input: str) -> bool:
+        normalized = _normalize_routing_text(user_input)
+        if not normalized:
+            return False
+        return any(phrase in normalized for phrase in _WORKFLOW_FINDINGS_INTENT_PHRASES)
+
+    def _approval_request_id_from_result(self, payload: Optional[dict[str, Any]]) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        direct_value = payload.get("approval_request_id")
+        if isinstance(direct_value, str) and direct_value:
+            return direct_value
+        data = payload.get("data")
+        if isinstance(data, dict):
+            nested_value = data.get("approval_request_id")
+            if isinstance(nested_value, str) and nested_value:
+                return nested_value
+        return None
+
+    def _task_summary_text(
+        self,
+        workflow_id: str,
+        task_id: str,
+    ) -> str:
+        workflow = self._workflow_store.load_workflow(workflow_id)
+        if workflow is None:
+            return f"workflow not found: {workflow_id}"
+        task = workflow.tasks.get(task_id)
+        if task is None:
+            return f"task not found: {task_id}"
+        result_payload = self._workflow_store.read_result(workflow_id, task_id)
+        output = self._workflow_store.load_task_output(workflow_id, task_id)
+        approval_request_id = self._approval_request_id_from_result(result_payload)
+        failure_type = None
+        error_text = None
+        summary_text = None
+        if isinstance(result_payload, dict):
+            failure_type = result_payload.get("failure_type") or result_payload.get("error_type")
+            error_text = result_payload.get("error") or task.last_error
+            summary_text = result_payload.get("summary")
+        if output is not None:
+            summary_text = output.summary or summary_text
+        summary_text = summary_text or task.result_summary
+        self._remember_referenced_workflow(workflow.workflow_id, title=workflow.title)
+
+        lines = [
+            f"task_id:   {task.task_id}",
+            f"label:     {task.label}",
+            f"title:     {task.title}",
+            f"workflow:  {workflow.workflow_id} ({workflow.title})",
+            f"status:    {task.status.value}",
+        ]
+        if failure_type == "semantic_mismatch" or task.last_error_type == "semantic_mismatch":
+            lines.append("semantic_validation: failed")
+        if failure_type:
+            lines.append(f"failure:   {failure_type}")
+        if error_text:
+            lines.append(f"error:     {_compact_text(error_text)}")
+        if summary_text:
+            lines.append(f"summary:   {_compact_text(summary_text)}")
+        if approval_request_id:
+            lines.append(f"approval:  {approval_request_id}")
+        if task.log_stdout_path:
+            lines.append(f"stdout:    {task.log_stdout_path}")
+        if task.log_stderr_path:
+            lines.append(f"stderr:    {task.log_stderr_path}")
+        if task.result_path:
+            lines.append(f"result:    {task.result_path}")
+        if task.output_path:
+            lines.append(f"output:    {task.output_path}")
+        suggestions = []
+        if task.status in {
+            TaskStatus.FAILED,
+            TaskStatus.TIMED_OUT,
+            TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED,
+        }:
+            suggestions.append(f"/workflow rerun {workflow.workflow_id} {task.task_id}")
+        if approval_request_id:
+            suggestions.append(f"/approvals show {approval_request_id}")
+        if suggestions:
+            lines.extend(["", "suggested_next:"])
+            lines.extend(f"- {item}" for item in suggestions)
+        return "\n".join(lines)
+
+    def _workflow_summary_text(self, workflow_id: str) -> str:
+        workflow = self._workflow_store.load_workflow(workflow_id)
+        if workflow is None:
+            return f"workflow not found: {workflow_id}"
+        self._remember_referenced_workflow(workflow.workflow_id, title=workflow.title)
+        task_lines: list[str] = []
+        result_lines: list[str] = []
+        failed_lines: list[str] = []
+        approval_lines: list[str] = []
+        semantic_lines: list[str] = []
+        first_retry_task_id: Optional[str] = None
+        first_approval_request_id: Optional[str] = None
+
+        for label, task_id in workflow.label_to_task_id.items():
+            task = workflow.tasks.get(task_id)
+            if task is None:
+                continue
+            result_payload = self._workflow_store.read_result(workflow.workflow_id, task.task_id)
+            output = self._workflow_store.load_task_output(workflow.workflow_id, task.task_id)
+            summary_text = None
+            if output is not None:
+                summary_text = output.summary
+            if summary_text is None and isinstance(result_payload, dict):
+                summary_text = result_payload.get("summary")
+            summary_text = summary_text or task.result_summary or task.last_error or task.blocked_reason
+            task_line = f"- {label} ({task.task_id}): {task.status.value}"
+            if summary_text:
+                task_line += f" | {_compact_text(summary_text)}"
+            task_lines.append(task_line)
+
+            if task.is_terminal() and summary_text:
+                result_lines.append(f"- {label}: {_compact_text(summary_text)}")
+
+            if task.status in {
+                TaskStatus.FAILED,
+                TaskStatus.TIMED_OUT,
+                TaskStatus.CANCELLED,
+                TaskStatus.BLOCKED,
+            }:
+                failure_text = None
+                if isinstance(result_payload, dict):
+                    failure_text = result_payload.get("failure_type") or result_payload.get("error_type")
+                failure_text = failure_text or task.last_error_type or task.blocked_reason or task.last_error
+                failed_lines.append(
+                    f"- {label} ({task.task_id}): {task.status.value}"
+                    + (f" | {_compact_text(failure_text)}" if failure_text else "")
+                )
+                if failure_text == "semantic_mismatch" or task.last_error_type == "semantic_mismatch":
+                    semantic_reason = task.last_error or summary_text or "task completed mechanically but did not satisfy intended postcondition"
+                    semantic_lines.append(
+                        f"- {label} ({task.task_id}): semantic_mismatch | {_compact_text(semantic_reason)}"
+                    )
+                if first_retry_task_id is None:
+                    first_retry_task_id = task.task_id
+
+            approval_request_id = self._approval_request_id_from_result(result_payload)
+            if approval_request_id:
+                approval_reason = None
+                if isinstance(result_payload, dict):
+                    decision_payload = result_payload.get("data", {}).get("decision")
+                    if isinstance(decision_payload, dict):
+                        approval_reason = decision_payload.get("reason")
+                approval_lines.append(
+                    f"- {label} ({task.task_id}): {approval_request_id}"
+                    + (f" | {_compact_text(approval_reason)}" if approval_reason else "")
+                )
+                if first_approval_request_id is None:
+                    first_approval_request_id = approval_request_id
+
+        lines = [
+            f"workflow_id: {workflow.workflow_id}",
+            f"title:       {workflow.title}",
+            f"status:      {workflow.status.value}",
+            f"tasks:       {len(workflow.tasks)}",
+        ]
+        if workflow.finished_at:
+            lines.append(f"finished:    {workflow.finished_at}")
+        if semantic_lines:
+            lines.extend(["", "semantic_validation: FAILED"])
+            lines.extend(semantic_lines)
+        lines.extend(["", "task_statuses:"])
+        lines.extend(task_lines or ["- none"])
+        if failed_lines:
+            lines.extend(["", "failed_or_blocked:"])
+            lines.extend(failed_lines)
+        if result_lines:
+            lines.extend(["", "result_summaries:"])
+            lines.extend(result_lines[:8])
+        if approval_lines:
+            lines.extend(["", "approval_blockers:"])
+            lines.extend(approval_lines)
+        suggestions = [f"/workflow {workflow.workflow_id}", f"/events {workflow.workflow_id}"]
+        if first_retry_task_id:
+            suggestions.append(f"/workflow rerun {workflow.workflow_id} {first_retry_task_id}")
+        if first_approval_request_id:
+            suggestions.append(f"/approvals show {first_approval_request_id}")
+        lines.extend(["", "suggested_next:"])
+        lines.extend(f"- {item}" for item in suggestions)
+        return "\n".join(lines)
+
+    def _task_full_result_text(self, workflow_id: str, task_id: str) -> Optional[str]:
+        output = self._workflow_store.load_task_output(workflow_id, task_id)
+        if output is not None and output.text.strip():
+            return output.text.strip()
+        result_payload = self._workflow_store.read_result(workflow_id, task_id)
+        if isinstance(result_payload, dict):
+            text_value = result_payload.get("text")
+            if isinstance(text_value, str) and text_value.strip():
+                return text_value.strip()
+            body_value = result_payload.get("body")
+            if isinstance(body_value, str) and body_value.strip():
+                return body_value.strip()
+        return None
+
+    def _findings_candidate_sort_key(
+        self,
+        workflow_id: str,
+        task,
+    ) -> tuple[int, int, str]:
+        label_text = f"{task.label} {task.title}".lower()
+        priority = 1
+        for index, token in enumerate(_FINDINGS_PREFERRED_LABEL_TOKENS):
+            if token in label_text:
+                priority = 0
+                return (priority, index, task.task_id)
+        has_full_text = 0 if self._task_full_result_text(workflow_id, task.task_id) else 1
+        return (priority, has_full_text, task.task_id)
+
+    def _select_workflow_findings_task(self, workflow) -> Optional[Any]:
+        succeeded_terminal = [
+            task
+            for task in workflow.tasks.values()
+            if task.status == TaskStatus.SUCCEEDED and task.is_terminal()
+        ]
+        if not succeeded_terminal:
+            return None
+        candidates = sorted(
+            succeeded_terminal,
+            key=lambda task: self._findings_candidate_sort_key(workflow.workflow_id, task),
+        )
+        return candidates[0] if candidates else None
+
+    def _workflow_findings_text(self, workflow_id: str) -> str:
+        workflow = self._workflow_store.load_workflow(workflow_id)
+        if workflow is None:
+            return f"workflow not found: {workflow_id}"
+        self._remember_referenced_workflow(workflow.workflow_id, title=workflow.title)
+        semantic_failures = [
+            task
+            for task in workflow.tasks.values()
+            if task.last_error_type == "semantic_mismatch"
+        ]
+        if semantic_failures:
+            lines = [
+                "semantic_validation: FAILED",
+                "This workflow completed mechanically but did not satisfy its intended postcondition.",
+                "",
+                f"workflow_id: {workflow.workflow_id}",
+                f"title:       {workflow.title}",
+                f"status:      {workflow.status.value}",
+            ]
+            if workflow.finished_at:
+                lines.append(f"finished:    {workflow.finished_at}")
+            lines.extend(["", "semantic_mismatches:"])
+            for task in semantic_failures:
+                lines.append(
+                    f"- {task.label} ({task.task_id}): {_compact_text(task.last_error or task.result_summary or 'semantic_mismatch')}"
+                )
+            return "\n".join(lines)
+        findings_task = self._select_workflow_findings_task(workflow)
+        findings_text = None
+        findings_summary = None
+        findings_label = None
+        if findings_task is not None:
+            findings_text = self._task_full_result_text(workflow.workflow_id, findings_task.task_id)
+            findings_summary = findings_task.result_summary
+            findings_label = findings_task.label
+
+        lines: list[str] = []
+        if findings_text:
+            lines.extend([
+                "findings:",
+                findings_text,
+            ])
+        elif findings_summary:
+            lines.extend([
+                "findings:",
+                findings_summary,
+            ])
+        else:
+            lines.append("findings: No final findings text is available for this workflow yet.")
+
+        status_lines = [
+            "",
+            f"workflow_id: {workflow.workflow_id}",
+            f"title:       {workflow.title}",
+            f"status:      {workflow.status.value}",
+        ]
+        if findings_task is not None:
+            status_lines.append(
+                f"findings_task: {findings_label} ({findings_task.task_id})"
+            )
+        if workflow.finished_at:
+            status_lines.append(f"finished:    {workflow.finished_at}")
+        lines.extend(status_lines)
+        return "\n".join(lines)
+
+    def _maybe_route_runtime_inspection(
+        self,
+        user_input: str,
+        *,
+        turn_id: str,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> Optional[str]:
+        if not self._is_runtime_inspection_request(user_input, resolved_references):
+            return None
+        task_ids = self._explicit_task_ids(user_input)
+        workflow_ids = self._explicit_workflow_ids(user_input, resolved_references)
+        normalized = _normalize_routing_text(user_input)
+
+        if len(task_ids) > 1:
+            return self._finalize_turn_response(
+                "Clarify which task you want me to inspect. Provide one task_id like tk-....",
+                turn_id=turn_id,
+                route="inspect_task_clarify",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        if len(workflow_ids) > 1:
+            return self._finalize_turn_response(
+                "Clarify which workflow you want me to inspect. Provide one workflow_id like wf-....",
+                turn_id=turn_id,
+                route="inspect_workflow_clarify",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        if task_ids:
+            task_id = task_ids[0]
+            workflow, task = workflow_cli._find_workflow_for_task(self._workflow_store, task_id)
+            if workflow is None or task is None:
+                return self._finalize_turn_response(
+                    f"task not found: {task_id}",
+                    turn_id=turn_id,
+                    route="inspect_task",
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+            return self._finalize_turn_response(
+                self._task_summary_text(workflow.workflow_id, task.task_id),
+                turn_id=turn_id,
+                route="inspect_task",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        if workflow_ids:
+            if self._is_workflow_findings_request(user_input):
+                return self._finalize_turn_response(
+                    self._workflow_findings_text(workflow_ids[0]),
+                    turn_id=turn_id,
+                    route="inspect_workflow_findings",
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+            return self._finalize_turn_response(
+                self._workflow_summary_text(workflow_ids[0]),
+                turn_id=turn_id,
+                route="inspect_workflow",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        if any(alias in normalized for alias in _WORKFLOW_REFERENCE_ALIASES):
+            remembered_workflow_id = (
+                self._state.last_referenced_workflow_id
+                or self._state.last_created_workflow_id
+            )
+            if remembered_workflow_id:
+                if self._is_workflow_findings_request(user_input):
+                    return self._finalize_turn_response(
+                        self._workflow_findings_text(remembered_workflow_id),
+                        turn_id=turn_id,
+                        route="inspect_workflow_findings",
+                        runtime_grounding=runtime_grounding,
+                        resolved_references=resolved_references,
+                        ambiguities=ambiguities,
+                    )
+                return self._finalize_turn_response(
+                    self._workflow_summary_text(remembered_workflow_id),
+                    turn_id=turn_id,
+                    route="inspect_workflow",
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+            return self._finalize_turn_response(
+                "Which workflow do you mean? Provide a workflow_id like wf-....",
+                turn_id=turn_id,
+                route="inspect_workflow_clarify",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        if _has_workflow_pronoun_reference(normalized):
+            remembered_workflow_id = (
+                self._state.last_referenced_workflow_id
+                or self._state.last_created_workflow_id
+            )
+            if remembered_workflow_id:
+                if self._is_workflow_findings_request(user_input):
+                    return self._finalize_turn_response(
+                        self._workflow_findings_text(remembered_workflow_id),
+                        turn_id=turn_id,
+                        route="inspect_workflow_findings",
+                        runtime_grounding=runtime_grounding,
+                        resolved_references=resolved_references,
+                        ambiguities=ambiguities,
+                    )
+                return self._finalize_turn_response(
+                    self._workflow_summary_text(remembered_workflow_id),
+                    turn_id=turn_id,
+                    route="inspect_workflow",
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+        return None
+
+    def _extract_message_reply_body(self, user_input: str, message_id: str) -> str:
+        text = re.sub(re.escape(message_id), "", user_input, count=1)
+        text = _REPLY_INTENT_PATTERN.sub("", text, count=1)
+        text = re.sub(r"^\s*(?:and\s+)?provide\s+[A-Za-z0-9_-]+\s+with\s+", "", text, count=1, flags=re.IGNORECASE)
+        return text.strip(" \n\t:,-")
+
+    def _maybe_route_message_reply(
+        self,
+        user_input: str,
+        *,
+        turn_id: str,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> Optional[str]:
+        if not _REPLY_INTENT_PATTERN.search(user_input):
+            return None
+        message_payload = next(
+            (item for item in resolved_references.values() if item.get("kind") == "message"),
+            None,
+        )
+        if message_payload is None:
+            return None
+        message = self._message_store.get_message(message_payload["id"])
+        if message is None:
+            return None
+        if message.to_agent_id != self._root_agent_id:
+            return None
+        child = self._scoped_agents.load_agent(message.from_agent_id)
+        if child is None or not self._scoped_agents.is_visible(self._root_agent_id, child.agent_id):
+            return None
+        reply_body = self._extract_message_reply_body(user_input, message.message_id)
+        if not reply_body:
+            return self._finalize_turn_response(
+                "I need the clarification text to send back to that child message.",
+                turn_id=turn_id,
+                route="message_reply",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        created = self._message_store.create_message(
+            from_agent_id=self._root_agent_id,
+            to_agent_id=child.agent_id,
+            kind="request",
+            subject=f"Re: {message.subject}",
+            body=reply_body,
+            workflow_id=message.workflow_id,
+            task_id=message.task_id,
+        )
+        self._remember_referenced_agent(child)
+        return self._finalize_turn_response(
+            f"sent clarification to {child.agent_id} for {message.message_id}",
+            turn_id=turn_id,
+            route="message_reply",
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+            full_payload=json.dumps({
+                "reply_to_message_id": message.message_id,
+                "created_message_id": created.message_id,
+                "to_agent_id": child.agent_id,
+            }, indent=2, sort_keys=True),
+        )
+
+    def _maybe_route_bulk_agent_operation(
+        self,
+        *,
+        turn_id: str,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+        bulk_targets: list[dict[str, Any]],
+    ) -> Optional[str]:
+        if not bulk_targets:
+            return None
+        return self._finalize_turn_response(
+            self._format_bulk_agent_target_clarification(bulk_targets),
+            turn_id=turn_id,
+            route="clarify_bulk_agent_operation",
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+
     def _send_to_brain(self, message: str) -> str:
         if self._process is None:
             return "[MR1 ERROR] Process is not running."
@@ -1043,6 +2294,26 @@ class MR1:
         session_id = self._process.session_id
         self._state.set_claude_session_id(session_id if isinstance(session_id, str) else None)
         return response
+
+    def _answer_directly_with_grounding(
+        self,
+        user_input: str,
+        runtime_grounding: dict[str, Any],
+    ) -> dict[str, str]:
+        grounding_block = self._format_runtime_grounding_block(runtime_grounding)
+        prompt = "\n\n".join([
+            grounding_block,
+            "Answer this request directly. Do not delegate to MR2 or Kazi.",
+            f"User request:\n{user_input}",
+        ])
+        raw = self._send_to_brain(prompt)
+        text, _ = self._parse_response(raw)
+        return {
+            "text": text,
+            "brain_prompt": prompt,
+            "brain_response": raw,
+            "full_payload": prompt,
+        }
 
     def _run_workflow_compiler(self, system_prompt: str, message: str) -> str:
         proc = MR1Process(system_prompt, self._mr1_config["model"], [])
@@ -1061,25 +2332,52 @@ class MR1:
             lines.extend(["", f"Confidence: {result.confidence}"])
         return "\n".join(lines)
 
+    def _is_meta_explanation_request(self, user_input: str) -> bool:
+        normalized = _normalize_routing_text(user_input)
+        if not normalized:
+            return False
+        if not any(
+            token in normalized
+            for token in (
+                "tool",
+                "tools",
+                "workflow",
+                "workflows",
+                "agent",
+                "agents",
+                "child",
+                "children",
+                "delegate",
+                "delegation",
+                "owner",
+                "ownership",
+                "route",
+                "routing",
+                "mr1",
+                "mr2",
+            )
+        ):
+            return False
+        return any(pattern.search(normalized) for pattern in _META_EXPLANATION_PATTERNS)
+
     def _is_persistent_delegation_request(self, user_input: str) -> bool:
         normalized = _normalize_routing_text(user_input)
         if not normalized:
+            return False
+        if self._is_meta_explanation_request(user_input):
+            return False
+        if not any(pattern.search(normalized) for pattern in _PERSISTENT_DELEGATION_IMPERATIVE_PATTERNS):
             return False
         if any(marker in normalized for marker in _PERSISTENT_DELEGATION_MARKERS):
             return True
 
         has_agent_target = any(token in normalized for token in ("mr2", "child", "agent"))
-        if has_agent_target and "responsible for" in normalized:
-            return True
         if has_agent_target and any(
             phrase in normalized
-            for phrase in (
-                "own this area",
-                "own this domain",
-                "own this responsibility",
-                "own this part",
-            )
+            for phrase in ("responsible for", "owner agent", "ownership")
         ):
+            return True
+        if has_agent_target and re.search(r"\bown\b", normalized):
             return True
         if "delegate" in normalized and any(
             token in normalized
@@ -1093,6 +2391,8 @@ class MR1:
         user_input: str,
         pending_draft: Optional[PendingWorkflowDraft],
     ) -> str:
+        if self._is_meta_explanation_request(user_input):
+            return "direct_answer"
         if pending_draft is None and self._is_persistent_delegation_request(user_input):
             return "persistent_delegation"
         return self._workflow_authoring.classify_request(
@@ -1100,9 +2400,22 @@ class MR1:
             pending_draft=pending_draft,
         )
 
-    def _build_persistent_delegation_mission(self, user_input: str) -> str:
+    @staticmethod
+    def _extract_requested_child_title(user_input: str) -> str:
+        for pattern in _PERSISTENT_CHILD_TITLE_PATTERNS:
+            match = pattern.search(user_input)
+            if match:
+                return match.group(1).upper()
+        fallback_matches = re.findall(r"\b(MR\d+)\b", user_input, flags=re.IGNORECASE)
+        for item in fallback_matches:
+            normalized = item.upper()
+            if normalized != "MR1":
+                return normalized
+        return "MR2"
+
+    def _build_persistent_delegation_mission(self, user_input: str, *, agent_title: str) -> str:
         return "\n".join([
-            "You are a persistent MR2-style child agent.",
+            f"You are a persistent {agent_title}-style child agent.",
             "Own the requested domain/responsibility instead of treating it as a one-shot execution.",
             "",
             "Parent request:",
@@ -1110,6 +2423,7 @@ class MR1:
             "",
             "Operating instructions:",
             "- Treat this as an ownership/delegation request.",
+            "- You are already the delegated child created for this request; do not create another child agent unless the parent explicitly asks in a follow-up.",
             "- Prefer creating workflows for execution when appropriate.",
             "- Keep responsibility for proposal quality, safety review, creation, and testing.",
             "- Use workflow creation when execution should become structured work.",
@@ -1117,15 +2431,21 @@ class MR1:
         ])
 
     def _route_to_persistent_delegation(self, user_input: str) -> str:
+        agent_title = self._extract_requested_child_title(user_input)
         try:
-            agent = self._scoped_agents.create_child_agent(self._root_agent_id, "MR2")
+            agent = self._scoped_agents.create_child_agent(self._root_agent_id, agent_title)
             agent = self._scoped_agents.assign_mission(
                 self._root_agent_id,
                 agent.agent_id,
-                self._build_persistent_delegation_mission(user_input),
+                self._build_persistent_delegation_mission(
+                    user_input,
+                    agent_title=agent.title,
+                ),
             )
         except (ValueError, AgentScopeError) as exc:
             return str(exc)
+        self._remember_created_agent(agent)
+        self._remember_referenced_agent(agent)
 
         runner = MRnRunRunner(
             workflow_store=self._workflow_store,
@@ -1352,7 +2672,68 @@ class MR1:
           3. For workflow turns: compile, validate, preview, submit
           4. For direct answers: ask MR1 to answer without delegation
         """
+        turn_id = self._new_turn_id()
         self._record_conversation("user", user_input)
+        initial_grounding = self.build_runtime_grounding()
+        resolution = self.resolve_runtime_references(user_input, initial_grounding)
+        runtime_grounding = self.build_runtime_grounding(
+            resolved_references=resolution["resolved_references"],
+            ambiguities=resolution["ambiguities"],
+        )
+        resolved_references = runtime_grounding["resolved_references"]
+        ambiguities = runtime_grounding["ambiguities"]
+        bulk_targets = list(resolution.get("bulk_targets", []))
+
+        for payload in resolved_references.values():
+            if payload.get("kind") == "agent":
+                agent = self._scoped_agents.load_agent(payload["id"])
+                if agent is not None:
+                    self._remember_referenced_agent(agent)
+            if payload.get("kind") == "workflow":
+                workflow = self._workflow_store.load_workflow(payload["id"])
+                if workflow is not None:
+                    self._remember_referenced_workflow(workflow.workflow_id, title=workflow.title)
+
+        reply_result = self._maybe_route_message_reply(
+            user_input,
+            turn_id=turn_id,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+        if reply_result is not None:
+            return reply_result
+
+        bulk_result = self._maybe_route_bulk_agent_operation(
+            turn_id=turn_id,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+            bulk_targets=bulk_targets,
+        )
+        if bulk_result is not None:
+            return bulk_result
+
+        if ambiguities:
+            return self._finalize_turn_response(
+                self._format_reference_ambiguity(ambiguities),
+                turn_id=turn_id,
+                route="clarify_reference",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+
+        inspection_result = self._maybe_route_runtime_inspection(
+            user_input,
+            turn_id=turn_id,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+        if inspection_result is not None:
+            return inspection_result
+
         pending = self._workflow_authoring.coerce_pending_draft(
             self._state.pending_workflow
         )
@@ -1363,29 +2744,71 @@ class MR1:
 
         if action == "direct_answer":
             self._state.add_decision(user_input, "direct_answer")
-            return self._record_local_response(self._answer_directly(user_input))
+            answer = self._answer_directly_with_grounding(user_input, runtime_grounding)
+            return self._finalize_turn_response(
+                answer["text"],
+                turn_id=turn_id,
+                route="direct_answer",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+                brain_prompt=answer["brain_prompt"],
+                brain_response=answer["brain_response"],
+                full_payload=answer["full_payload"],
+            )
 
         if action == "persistent_delegation":
-            return self._record_local_response(
-                self._route_to_persistent_delegation(user_input)
+            return self._finalize_turn_response(
+                self._route_to_persistent_delegation(user_input),
+                turn_id=turn_id,
+                route="persistent_delegation",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
             )
 
         if action == "show_json_preview":
             if pending is None:
-                return self._record_local_response("No pending workflow draft.")
-            return self._record_local_response(
+                return self._finalize_turn_response(
+                    "No pending workflow draft.",
+                    turn_id=turn_id,
+                    route="show_json_preview",
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+            return self._finalize_turn_response(
                 json.dumps(pending.spec, indent=2),
+                turn_id=turn_id,
+                route="show_json_preview",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
                 kind="workflow_json",
             )
 
         if action == "cancel_preview":
             self._state.clear_pending_workflow()
             self._state.add_decision(user_input, "cancel_workflow_preview")
-            return self._record_local_response("Cancelled pending workflow draft.")
+            return self._finalize_turn_response(
+                "Cancelled pending workflow draft.",
+                turn_id=turn_id,
+                route="cancel_preview",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
 
         if action == "confirm_preview":
             if pending is None:
-                return self._record_local_response("No pending workflow draft.")
+                return self._finalize_turn_response(
+                    "No pending workflow draft.",
+                    turn_id=turn_id,
+                    route="confirm_preview",
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
             result = self._workflow_authoring.submit(
                 pending.spec,
                 created_by=Provenance(type="agent", id="MR1"),
@@ -1405,10 +2828,25 @@ class MR1:
                 "submit_pending_workflow",
                 result.workflow_id,
             )
-            return self._record_local_response(result.message)
+            workflow = self._workflow_store.load_workflow(result.workflow_id)
+            self._remember_created_workflow(
+                result.workflow_id,
+                title=workflow.title if workflow is not None else None,
+            )
+            return self._finalize_turn_response(
+                result.message,
+                turn_id=turn_id,
+                route="confirm_preview",
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
 
         mode = "modify" if action == "modify_workflow" else "create"
-        target_workflow_id = self._workflow_authoring.extract_workflow_id(user_input)
+        target_workflow_id = (
+            self._workflow_authoring.extract_workflow_id(user_input)
+            or self._resolved_workflow_target_id(resolved_references)
+        )
         baseline_spec: Optional[dict[str, Any]] = None
         if pending is not None:
             baseline_spec = pending.spec
@@ -1416,18 +2854,29 @@ class MR1:
         elif target_workflow_id:
             workflow = self._workflow_store.load_workflow(target_workflow_id)
             if workflow is None:
-                return self._record_local_response(
-                    f"workflow not found: {target_workflow_id}"
+                return self._finalize_turn_response(
+                    f"workflow not found: {target_workflow_id}",
+                    turn_id=turn_id,
+                    route=action,
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
                 )
             baseline_spec = workflow_to_spec(workflow)
+            self._remember_referenced_workflow(workflow.workflow_id, title=workflow.title)
 
         if mode == "modify" and baseline_spec is None:
-            return self._record_local_response(
+            return self._finalize_turn_response(
                 self._workflow_authoring.clarify_message(
                     "missing workflow target",
                     mode=mode,
                     target_workflow_id=target_workflow_id,
-                )
+                ),
+                turn_id=turn_id,
+                route=action,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
             )
 
         try:
@@ -1440,12 +2889,17 @@ class MR1:
                 target_workflow_id=target_workflow_id,
             )
         except (RuntimeError, json.JSONDecodeError, WorkflowSpecError, ValueError) as exc:
-            return self._record_local_response(
+            return self._finalize_turn_response(
                 self._workflow_authoring.clarify_message(
                     str(exc),
                     mode=mode,
                     target_workflow_id=target_workflow_id,
-                )
+                ),
+                turn_id=turn_id,
+                route=action,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
             )
 
         if authoring.complexity == "simple" and not authoring.needs_confirmation:
@@ -1463,7 +2917,19 @@ class MR1:
                 "modify_workflow" if mode == "modify" else "submit_workflow",
                 result.workflow_id,
             )
-            return self._record_local_response(result.message)
+            workflow = self._workflow_store.load_workflow(result.workflow_id)
+            self._remember_created_workflow(
+                result.workflow_id,
+                title=workflow.title if workflow is not None else authoring.spec.get("title"),
+            )
+            return self._finalize_turn_response(
+                result.message,
+                turn_id=turn_id,
+                route=action,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
 
         draft = PendingWorkflowDraft(
             original_request=user_input,
@@ -1488,8 +2954,13 @@ class MR1:
             "preview_workflow_modification" if mode == "modify" else "preview_workflow",
             target_workflow_id,
         )
-        return self._record_local_response(
+        return self._finalize_turn_response(
             self._format_authoring_preview(authoring),
+            turn_id=turn_id,
+            route=action,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
             kind="workflow_preview",
         )
 
@@ -1677,6 +3148,14 @@ class MR1:
         self._state.add_decision("/test kill agents", "kill_test_agents")
         return f"Killed {killed} synthetic test agent(s)."
 
+    def _running_test_agent_count(self) -> int:
+        with self._test_agent_lock:
+            return sum(
+                1
+                for record in self._test_agents.values()
+                if record.process.poll() is None
+            )
+
     def _handle_builtin(self, cmd: str) -> Optional[str]:
         """
         Handle slash commands locally. Returns the output string,
@@ -1688,14 +3167,25 @@ class MR1:
         if cmd == "/tasks":
             return self._state.format_tasks()
         if cmd == "/kill":
+            running_synthetic = self._running_test_agent_count()
             killed = self._spawner.kill_all("user_kill")
-            synthetic_result = self.kill_test_agents()
-            synthetic_killed = 0 if synthetic_result.startswith("No synthetic") else int(synthetic_result.split()[1])
+            self.kill_test_agents()
+            synthetic_killed = running_synthetic
             # Mark all running tasks as killed.
             for tid in list(self._state.active_tasks):
                 self._state.complete_task(tid, "killed")
             total = killed + synthetic_killed
-            return f"Terminated {total} agent(s)." if total else "No agents running."
+            if total == 0:
+                return (
+                    "No running spawned processes/test agents to kill. "
+                    "Persistent agents are not affected. "
+                    "Use /agent kill <ag-id> to terminate a persistent agent."
+                )
+            return (
+                f"Killed {total} spawned process/test agent(s). "
+                "Persistent MRn agents are not affected. "
+                "Use /agent kill <ag-id> to terminate a persistent agent."
+            )
         if cmd == "/history":
             recent = self._state._state["decisions"][-10:]
             if not recent:
@@ -1740,6 +3230,8 @@ class MR1:
             return self._handle_message_builtin(cmd)
         if cmd.startswith("/message"):
             return self._handle_message_builtin(cmd)
+        if cmd == "/approvals" or cmd.startswith("/approvals "):
+            return self._handle_approval_builtin(cmd)
         if cmd == "/tools" or cmd.startswith("/tools "):
             return self._handle_capability_builtin(cmd)
         if cmd == "/capabilities" or cmd.startswith("/capabilities "):
@@ -2101,6 +3593,7 @@ class MR1:
                 agent,
                 reports=self._scoped_agents.list_reports(agent.agent_id),
                 message_store=self._message_store,
+                workflow_store=self._workflow_store,
                 json_output="--json" in flags,
                 brief="--brief" in flags,
             )
@@ -2174,7 +3667,7 @@ class MR1:
         return workflow_cli._format_mrn_run_result(result)
 
     def _handle_message_builtin(self, cmd: str) -> str:
-        inbox_usage = "usage: /inbox [--archived] | /inbox triage [--max-actions N] [--max-messages N]"
+        inbox_usage = "usage: /inbox [--archived] | /inbox triage [--max-actions N] [--max-messages N] | /inbox triage on | /inbox triage off | /inbox triage status"
         try:
             parts = shlex.split(cmd)
         except ValueError:
@@ -2188,6 +3681,29 @@ class MR1:
         flags = {part for part in parts[1:] if part.startswith("--")}
         positionals = [part for part in parts[1:] if not part.startswith("--")]
         if command == "/inbox":
+            if positionals and positionals[0] == "triage" and len(positionals) == 2:
+                sub = positionals[1]
+                if sub == "on":
+                    if self._inbox_thread and self._inbox_thread.is_alive():
+                        return "inbox auto-triage already running"
+                    self._inbox_stop.clear()
+                    self._inbox_thread = threading.Thread(
+                        target=self._run_inbox_loop,
+                        name="inbox-triage",
+                        daemon=True,
+                    )
+                    self._inbox_thread.start()
+                    return "inbox auto-triage started"
+                if sub == "off":
+                    self._inbox_stop.set()
+                    if self._inbox_thread:
+                        self._inbox_thread.join(timeout=2.0)
+                        self._inbox_thread = None
+                    return "inbox auto-triage stopped"
+                if sub == "status":
+                    running = bool(self._inbox_thread and self._inbox_thread.is_alive())
+                    return f"inbox auto-triage: {'running' if running else 'stopped'} (interval: {self._inbox_triage_interval_s}s)"
+                return inbox_usage
             if positionals and positionals[0] == "triage":
                 if "--archived" in flags:
                     return inbox_usage
@@ -2218,21 +3734,8 @@ class MR1:
                         index += 2
                         continue
                     return inbox_usage
-                compiler_client = getattr(self._workflow_authoring, "_workflow_compiler_client", None)
-                if compiler_client is None:
-                    compiler_client = WorkflowCompilerClient(
-                        compiler=getattr(self._workflow_authoring, "_compiler", None) or self._run_workflow_compiler,
-                        scoped_agent_store=self._scoped_agents,
-                    )
-                runner = InboxTriageRunner(
-                    workflow_store=self._workflow_store,
-                    scoped_agent_store=self._scoped_agents,
-                    message_store=self._message_store,
-                    workflow_compiler_client=compiler_client,
-                    workflow_authoring_service=self._workflow_authoring,
-                    pending_workflow_state=self._state,
-                )
                 try:
+                    runner = self._make_inbox_triage_runner()
                     result = runner.run(
                         InboxTriagePolicy(
                             max_messages=max_messages,
@@ -2328,6 +3831,119 @@ class MR1:
             return str(exc)
         return workflow_cli._format_message_detail(message)
 
+    def _handle_approval_builtin(self, cmd: str) -> str:
+        usage = (
+            "usage: /approvals list | /approvals show <approval_request_id> | "
+            "/approvals approve <approval_request_id> [--grant-scope] [--reason TEXT] | "
+            "/approvals deny <approval_request_id> [--reason TEXT]"
+        )
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            return usage
+        if len(parts) < 2:
+            return usage
+
+        subcommand = parts[1]
+        if subcommand == "list":
+            if len(parts) != 2:
+                return usage
+            approvals = workflow_cli._visible_approvals(
+                self._approval_store,
+                self._scoped_agents,
+                self._root_agent_id,
+            )
+            return workflow_cli._format_approvals_table(approvals)
+
+        if subcommand == "show":
+            if len(parts) != 3:
+                return usage
+            try:
+                approval = workflow_cli._require_visible_approval(
+                    self._approval_store,
+                    parts[2],
+                    self._scoped_agents,
+                    self._root_agent_id,
+                )
+            except (ValueError, AgentScopeError) as exc:
+                return str(exc)
+            return workflow_cli._format_approval(approval)
+
+        if subcommand not in {"approve", "deny"}:
+            return usage
+        if len(parts) < 3:
+            return usage
+
+        approval_request_id = parts[2]
+        grant_scope = False
+        reason = "approved" if subcommand == "approve" else "denied"
+        index = 3
+        while index < len(parts):
+            token = parts[index]
+            if token == "--grant-scope":
+                if subcommand != "approve":
+                    return usage
+                grant_scope = True
+                index += 1
+                continue
+            if token == "--reason":
+                if index + 1 >= len(parts):
+                    return usage
+                reason = parts[index + 1]
+                index += 2
+                continue
+            return usage
+
+        try:
+            workflow_cli._require_visible_approval(
+                self._approval_store,
+                approval_request_id,
+                self._scoped_agents,
+                self._root_agent_id,
+            )
+            decision = CapabilityApprovalDecision(
+                approval_request_id=approval_request_id,
+                decision="approved" if subcommand == "approve" else "denied",
+                decided_by=self._root_agent_id,
+                reason=reason,
+                timestamp=time.time(),
+                approval_scope="grant_scope" if grant_scope else "single_use",
+            )
+            updated = self._approval_store.apply_decision(
+                approval_request_id,
+                decision=decision,
+                scoped_agent_store=self._scoped_agents,
+            )
+        except (ValueError, AgentScopeError) as exc:
+            return str(exc)
+        if (
+            updated.requesting_actor_id != self._root_agent_id
+            and self._message_store.can_agent_send_message(
+                self._root_agent_id,
+                updated.requesting_actor_id,
+            )
+        ):
+            try:
+                self._message_store.create_message(
+                    from_agent_id=self._root_agent_id,
+                    to_agent_id=updated.requesting_actor_id,
+                    kind="request",
+                    subject=f"Capability approval {updated.status}: {updated.capability_name}",
+                    body=(
+                        f"Approval request {updated.approval_request_id} is now {updated.status}. "
+                        f"Reason: {reason}. "
+                        "Retry or continue your capability step accordingly."
+                    ),
+                    workflow_id=updated.workflow_id,
+                    task_id=updated.task_id,
+                )
+            except ValueError:
+                pass
+        return workflow_cli._format_approval_decision_result(
+            updated,
+            grant_scope=grant_scope,
+        )
+
     def _handle_schema_builtin(self, cmd: str) -> str:
         usage = "usage: /schema [workflow|task|inputs|refs|task-kinds] [--json] [--brief]"
         try:
@@ -2371,7 +3987,44 @@ class MR1:
             return f"invalid workflow: {exc}"
         return f"submitted: {wf_id}"
 
+    def _make_inbox_triage_runner(self) -> "InboxTriageRunner":
+        compiler_client = WorkflowCompilerClient(
+            compiler=getattr(self._workflow_authoring, "_compiler", None) or self._run_workflow_compiler,
+            scoped_agent_store=self._scoped_agents,
+        )
+        return InboxTriageRunner(
+            workflow_store=self._workflow_store,
+            scoped_agent_store=self._scoped_agents,
+            message_store=self._message_store,
+            workflow_compiler_client=compiler_client,
+            workflow_authoring_service=self._workflow_authoring,
+            pending_workflow_state=self._state,
+        )
+
+    def _run_inbox_loop(self) -> None:
+        while not self._inbox_stop.is_set():
+            self._inbox_stop.wait(self._inbox_triage_interval_s)
+            if self._inbox_stop.is_set():
+                break
+            try:
+                unread = [
+                    m for m in self._message_store.list_inbox(self._root_agent_id)
+                    if m.status == "unread"
+                ]
+                if not unread:
+                    continue
+                runner = self._make_inbox_triage_runner()
+                runner.run(
+                    InboxTriagePolicy(max_messages=10, max_actions=5),
+                    caller_agent_id=self._root_agent_id,
+                )
+            except Exception:
+                pass
+
     def shutdown(self, reason: str = "user") -> int:
+        self._inbox_stop.set()
+        if self._inbox_thread is not None:
+            self._inbox_thread.join(timeout=2.0)
         killed = self._spawner.kill_all(reason)
         self.kill_test_agents()
         self._scheduler.shutdown(cancel_running=True)
@@ -2380,7 +4033,6 @@ class MR1:
             self._web_viz_server = None
         if self._process:
             self._process.kill()
-        self._state.set_claude_session_id(None)
         self._state.save()
         return killed
 
@@ -2403,7 +4055,7 @@ class MR1:
             "/workflows  /watchers  /capabilities  /capability <name>  "
             "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  "
             "/agent step <ag-id>  /agent run <ag-id> --steps N  "
-            "/inbox  /outbox  /message <id>  /schema  /vizualize  /visualize-web  "
+            "/inbox  /outbox  /message <id>  /approvals  /schema  /vizualize  /visualize-web  "
             "/test spawn agents <h>  /test kill agents"
         )
         print("Type 'exit' or Ctrl+C to quit.\n")

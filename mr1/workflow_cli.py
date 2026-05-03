@@ -704,6 +704,7 @@ def _persistent_agent_payload(
     *,
     reports: Optional[list[Path]] = None,
     message_store: Optional[MessageStore] = None,
+    workflow_store: Optional[WorkflowStore] = None,
 ) -> dict[str, Any]:
     payload = agent.to_dict()
     last_run = agent.last_run or {}
@@ -711,6 +712,8 @@ def _persistent_agent_payload(
     payload["latest_run_stopped_reason"] = last_run.get("stopped_reason")
     payload["latest_run_step_count"] = last_run.get("step_count")
     payload["latest_run_at"] = last_run.get("finished_at")
+    if workflow_store is not None:
+        payload.update(_agent_runtime_activity_payload(agent, workflow_store))
     if reports is not None:
         payload["reports"] = [str(path) for path in reports]
         payload["latest_reports"] = [path.name for path in reports[:5]]
@@ -725,6 +728,17 @@ def _persistent_agent_payload(
         payload["latest_outbox_messages"] = [
             _message_preview_payload(item)
             for item in outbox[:3]
+        ]
+        pending_parent_messages = _pending_parent_messages(agent, message_store)
+        waiting_on_parent = bool(pending_parent_messages)
+        if agent.parent_agent_id and agent.run_status == "waiting":
+            action_name = (agent.last_action or {}).get("action")
+            waiting_on_parent = waiting_on_parent or action_name in {"ask_parent", "send_message"}
+        payload["waiting_on_parent"] = waiting_on_parent
+        payload["pending_parent_questions"] = len(pending_parent_messages)
+        payload["pending_parent_messages"] = [
+            _message_preview_payload(item)
+            for item in pending_parent_messages[:3]
         ]
     return payload
 
@@ -743,10 +757,16 @@ def _format_agent(
     *,
     reports: Optional[list[Path]] = None,
     message_store: Optional[MessageStore] = None,
+    workflow_store: Optional[WorkflowStore] = None,
     json_output: bool = False,
     brief: bool = False,
 ) -> str:
-    payload = _persistent_agent_payload(agent, reports=reports, message_store=message_store)
+    payload = _persistent_agent_payload(
+        agent,
+        reports=reports,
+        message_store=message_store,
+        workflow_store=workflow_store,
+    )
     if brief:
         payload = {
             "agent_id": payload["agent_id"],
@@ -765,6 +785,10 @@ def _format_agent(
         f"mission:      {_compact_text(agent.mission)}",
         f"mode:         {agent.mode}",
         f"run_status:   {agent.run_status}",
+        f"active_jobs:  {payload.get('active_jobs', 0)}",
+        f"active_workflows: {payload.get('active_workflows', 0)}",
+        f"runtime_activity: {payload.get('runtime_activity', 'no active jobs')}",
+        f"has_running_processes: {'yes' if payload.get('has_running_processes') else 'no'}",
         f"iteration:    {agent.current_iteration}",
         f"last_step_at: {_short_ts(agent.last_step_at)}",
         f"last_action:  {_summarize_last_action(agent.last_action)}",
@@ -773,6 +797,8 @@ def _format_agent(
         f"run_steps:    {payload.get('latest_run_step_count') or 0}",
         f"run_at:       {_short_ts(payload.get('latest_run_at'))}",
         f"parent_req:   {_compact_text(agent.parent_request)}",
+        f"waiting_on_parent: {'yes' if payload.get('waiting_on_parent') else 'no'}",
+        f"pending_parent_questions: {payload.get('pending_parent_questions', 0)}",
         f"tree_level:   {agent.tree_level}",
         f"parent:       {agent.parent_agent_id or '-'}",
         f"created_at:   {agent.created_at}",
@@ -797,7 +823,46 @@ def _format_agent(
         lines.append(f"  {_format_message_preview_line(item, direction='to')}")
     if not payload.get("latest_outbox_messages"):
         lines.append("  none")
+    lines.append("pending_parent_messages:")
+    for item in payload.get("pending_parent_messages", []):
+        lines.append(f"  {_format_message_preview_line(item, direction='to')}")
+    if not payload.get("pending_parent_messages"):
+        lines.append("  none")
     return "\n".join(lines)
+
+
+def _agent_runtime_activity_payload(
+    agent: PersistentAgent,
+    workflow_store: WorkflowStore,
+) -> dict[str, Any]:
+    active_jobs = 0
+    active_workflows = 0
+    has_running_processes = False
+    for workflow_id in agent.owned_workflow_ids:
+        workflow = workflow_store.load_workflow(workflow_id)
+        if workflow is None:
+            continue
+        workflow_is_active = False
+        for task in workflow.tasks.values():
+            if not task.is_terminal():
+                workflow_is_active = True
+            if task.status == TaskStatus.RUNNING:
+                active_jobs += 1
+                if task.pid is not None:
+                    has_running_processes = True
+        if workflow_is_active:
+            active_workflows += 1
+    runtime_activity = (
+        f"{active_jobs} active job(s)"
+        if active_jobs
+        else "no active jobs"
+    )
+    return {
+        "active_jobs": active_jobs,
+        "active_workflows": active_workflows,
+        "has_running_processes": has_running_processes,
+        "runtime_activity": runtime_activity,
+    }
 
 
 def _compact_text(text: Optional[str], *, limit: int = 120) -> str:
@@ -891,6 +956,23 @@ def _message_preview_payload(message: PersistentMessage) -> dict[str, str]:
         "created_at": message.created_at,
         "status": message.status,
     }
+
+
+def _pending_parent_messages(
+    agent: PersistentAgent,
+    message_store: MessageStore,
+) -> list[PersistentMessage]:
+    if not agent.parent_agent_id:
+        return []
+    action_name = (agent.last_action or {}).get("action")
+    if agent.run_status != "waiting" and action_name not in {"ask_parent", "send_message"}:
+        return []
+    return [
+        item
+        for item in message_store.list_outbox(agent.agent_id)
+        if item.to_agent_id == agent.parent_agent_id
+        and item.kind in {"question", "request"}
+    ]
 
 
 def _format_message_preview_line(item: dict[str, str], *, direction: str) -> str:
@@ -1038,6 +1120,27 @@ def _format_approvals_table(
             f"{item.risk_score:.2f}",
         ))
     return _render_table(rows)
+
+
+def _format_approval_decision_result(
+    approval: CapabilityApprovalRequest,
+    *,
+    grant_scope: bool = False,
+) -> str:
+    lines = ["Approved." if approval.status == "approved" else "Denied."]
+    if approval.status == "approved" and approval.workflow_id and approval.task_id:
+        lines.extend([
+            "This does not automatically rerun the failed task.",
+            "To retry:",
+            f"  /workflow rerun {approval.workflow_id} {approval.task_id}",
+        ])
+    if (
+        approval.status == "approved"
+        and approval.reason == "outside_actor_scope"
+        and not grant_scope
+    ):
+        lines.append("This was single-use. Use --grant-scope to persist scope access if intended.")
+    return "\n".join(lines)
 
 
 def _format_capability_audit_table(
@@ -2623,6 +2726,7 @@ def _cmd_agent(
         agent,
         reports=scoped_agents.list_reports(agent.agent_id),
         message_store=getattr(args, "message_store", None),
+        workflow_store=store,
         json_output=args.json,
         brief=args.brief,
     ))
@@ -2827,7 +2931,10 @@ def _cmd_approvals_decide(
     except (ValueError, AgentScopeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(approval.approval_request_id)
+    print(_format_approval_decision_result(
+        approval,
+        grant_scope=getattr(args, "grant_scope", False),
+    ))
     return 0
 
 

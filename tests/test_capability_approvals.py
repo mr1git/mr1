@@ -148,6 +148,34 @@ def test_approved_request_executes_on_retry_and_consumes_single_use(tmp_path, ag
     assert third.approval_request_id == approval_id
 
 
+def test_approved_request_matches_retry_across_step_ids(tmp_path, agent_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "child", security_clearance=0.1)
+    target = tmp_path / "secret.txt"
+    target.write_text("secret", encoding="utf-8")
+    runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)
+
+    first = runner.run_capability("read_file", {"path": str(target)}, child.agent_id, step_id="step-a")
+    approval_id = first.approval_request_id
+    runner._approval_store.apply_decision(
+        approval_id,
+        decision=CapabilityApprovalDecision(
+            approval_request_id=approval_id,
+            decision="approved",
+            decided_by=root.agent_id,
+            reason="one shot",
+            timestamp=1.0,
+            approval_scope="single_use",
+        ),
+        scoped_agent_store=agent_store,
+    )
+
+    second = runner.run_capability("read_file", {"path": str(target)}, child.agent_id, step_id="step-b")
+
+    assert second.status == "succeeded"
+    assert second.output["text"] == "secret"
+
+
 def test_denied_request_remains_blocked_on_retry(tmp_path, agent_store):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "child", security_clearance=0.1)

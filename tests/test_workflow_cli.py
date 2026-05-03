@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from mr1 import workflow_cli
+from mr1.capability_policy import CapabilityApprovalRequest, CapabilityRequest, build_scope_context
 from mr1.capability_runner import CapabilityRunner
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.kazi_runner import MockRunner, RunStatus
@@ -651,7 +652,7 @@ class TestApprovalAndAuditCli:
             scoped_agent_store=agent_store,
         )
         assert rc == 0
-        assert capsys.readouterr().out.strip() == approval_id
+        assert capsys.readouterr().out.strip() == "Approved."
 
         rc = workflow_cli.main(
             ["agent-scopes", child.agent_id, "--json"],
@@ -662,6 +663,54 @@ class TestApprovalAndAuditCli:
         scopes_payload = json.loads(capsys.readouterr().out)
         assert str(target.resolve()) in scopes_payload["scope_roots"]
         assert scopes_payload["scope_grants"][0]["granted_by"] == root.agent_id
+
+    def test_approvals_approve_prints_rerun_guidance_and_single_use_note(self, tmp_path, store, capsys):
+        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        root = agent_store.ensure_root_agent()
+        child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.1)
+        original_request = CapabilityRequest(
+            actor_id=child.agent_id,
+            actor_type="mrn",
+            invocation_mode="workflow",
+            capability_name="read_file",
+            args={"path": "README.md"},
+            scope=build_scope_context(
+                actor_id=child.agent_id,
+                workspace_root=tmp_path,
+                scoped_agent_store=agent_store,
+            ),
+            step_id="cli-approval-step",
+            workflow_id="wf-1",
+            task_id="tk-1",
+        )
+        approval = CapabilityApprovalRequest(
+            approval_request_id="cap_approval_cli",
+            requesting_actor_id=child.agent_id,
+            capability_name="read_file",
+            invocation_mode="workflow",
+            args={"path": "README.md"},
+            risk_score=0.1,
+            reason="outside_actor_scope",
+            scope_summary=original_request.scope.to_dict(),
+            original_request=original_request,
+            original_step_id="cli-approval-step",
+            designated_approver_id=root.agent_id,
+            workflow_id="wf-1",
+            task_id="tk-1",
+        )
+        workflow_cli._approval_store_for(store).save(approval)
+
+        rc = workflow_cli.main(
+            ["approvals", "approve", "cap_approval_cli", "--reason", "approved"],
+            store=store,
+            scoped_agent_store=agent_store,
+        )
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Approved." in out
+        assert "/workflow rerun wf-1 tk-1" in out
+        assert "Use --grant-scope to persist scope access if intended." in out
 
     def test_capability_audit_cli_lists_direct_and_workflow_audits(self, tmp_path, store, capsys):
         agent_store = PersistentAgentStore(root=tmp_path / "agents")

@@ -66,6 +66,8 @@ Rules:
 - Every action must include a non-empty reason.
 - Only use the allowed action types listed in the prompt.
 - Never propose loops, daemons, background jobs, or external messaging.
+- Child-agent questions may be summarized, surfaced, marked read, archived, assigned, or converted into ask_user/workflow suggestions.
+- Do not send substantive parent replies to child-agent questions unless reply_message is explicitly enabled by policy.
 - If user clarification is needed, use ask_user.
 - If nothing should happen, use idle.
 """
@@ -136,6 +138,7 @@ class InboxTriagePolicy:
     max_messages: int = 10
     max_actions: int = 3
     allowed_actions: Optional[list[str]] = None
+    allow_reply_messages: bool = False
     auto_mark_read: bool = True
     auto_archive: bool = False
     include_archived: bool = False
@@ -159,6 +162,7 @@ class InboxTriagePolicy:
             "max_messages": self.max_messages,
             "max_actions": self.max_actions,
             "allowed_actions": list(self.allowed_actions) if self.allowed_actions is not None else None,
+            "allow_reply_messages": self.allow_reply_messages,
             "auto_mark_read": self.auto_mark_read,
             "auto_archive": self.auto_archive,
             "include_archived": self.include_archived,
@@ -444,6 +448,7 @@ class InboxTriageRunner:
                 self._validate_action(
                     action,
                     index=index,
+                    policy=policy,
                     selected_message_ids=selected_message_ids,
                     caller_agent_id=caller_agent_id,
                 )
@@ -455,6 +460,7 @@ class InboxTriageRunner:
         action: Any,
         *,
         index: int,
+        policy: InboxTriagePolicy,
         selected_message_ids: set[str],
         caller_agent_id: str,
     ) -> dict[str, Any]:
@@ -489,6 +495,8 @@ class InboxTriageRunner:
             value = action.get(field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"action {index} must include a non-empty {field_name}")
+        if action_type == "reply_message" and not policy.allow_reply_messages:
+            raise ValueError("reply_message is disabled by policy")
         return dict(action)
 
     def _execute_action(

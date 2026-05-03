@@ -85,13 +85,13 @@ def _action(action: str, **extra) -> str:
     return json.dumps(payload)
 
 
-def _envelope(spec: dict) -> str:
+def _envelope(spec: dict, *, needs_confirmation: bool = False) -> str:
     return json.dumps({
         "preview": "Generated preview",
         "spec": spec,
         "assumptions": [],
         "risks": [],
-        "needs_confirmation": False,
+        "needs_confirmation": needs_confirmation,
         "confidence": "high",
         "memory_refs_used": [],
     })
@@ -433,6 +433,30 @@ def test_create_workflow_forced_confirmation_writes_report_and_parent_message(
     assert inbox[0].subject == f"Workflow confirmation needed from {child.title}"
 
 
+def test_create_workflow_no_confirm_policy_submits_even_if_compiler_requests_confirmation(
+    workflow_store,
+    agent_store,
+):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Create a workflow")
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        workflow_compiler=FakeCompiler(_envelope(COMPILE_SPEC, needs_confirmation=True)),
+        reasoner=FakeReasoner(_action("create_workflow", workflow_request="Read notes")),
+        require_confirmation_for_workflows=False,
+    )
+
+    result = runner.step(child.agent_id)
+    workflow = workflow_store.load_workflow(result.workflow_id)
+
+    assert result.confirmation_required is False
+    assert result.workflow_submitted is True
+    assert workflow is not None
+    assert workflow.owner_agent_id == child.agent_id
+
+
 def test_invalid_action_triggers_one_correction_pass(workflow_store, agent_store):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
@@ -485,6 +509,36 @@ def test_step_prompt_includes_bounded_message_context(workflow_store, agent_stor
     assert len(payload["recent_sent_messages"]) == 5
     assert payload["parent_messages"]
     assert payload["unread_messages"][0]["subject"] == "Inbox 5"
+    assert payload["unread_messages"][0]["body"] == "body"
+    assert "body_excerpt" not in payload["unread_messages"][0]
+    assert payload["parent_messages"][0]["body"] == "body"
+
+
+def test_step_prompt_truncates_long_selected_message_bodies(workflow_store, agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
+    long_body = "x" * 5000
+    message_store.create_message(
+        from_agent_id=root.agent_id,
+        to_agent_id=child.agent_id,
+        kind="request",
+        subject="Long body",
+        body=long_body,
+    )
+    reasoner = FakeReasoner(_action("idle"))
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        reasoner=reasoner,
+    )
+
+    runner.step(child.agent_id)
+    payload = json.loads(reasoner.calls[0][2].split("Scoped context:\n", 1)[1])
+
+    assert payload["unread_messages"][0]["body"].endswith("...[truncated, use message_id for full]")
+    assert len(payload["unread_messages"][0]["body"]) == 4096
 
 
 def test_second_invalid_action_blocks_agent(workflow_store, agent_store):
@@ -549,6 +603,34 @@ def test_agent_inspection_shows_mission_status_iteration_and_message_counts(agen
     assert "unread_inbox: 1" in formatted
     assert "Need update" in formatted
     assert "Update" in formatted
+
+
+def test_agent_inspection_keeps_read_parent_question_visible(workflow_store, agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    child.run_status = "waiting"
+    child.last_action = {"action": "ask_parent"}
+    agent_store.save_agent(child)
+    sent = message_store.create_message(
+        from_agent_id=child.agent_id,
+        to_agent_id=root.agent_id,
+        kind="question",
+        subject="Need approval",
+        body="Can I proceed?",
+    )
+    message_store.mark_read(sent.message_id, actor_id=root.agent_id)
+
+    formatted = _format_agent(
+        child,
+        reports=agent_store.list_reports(child.agent_id),
+        message_store=message_store,
+        workflow_store=workflow_store,
+    )
+
+    assert "waiting_on_parent: yes" in formatted
+    assert "pending_parent_questions: 1" in formatted
+    assert "pending_parent_messages:" in formatted
+    assert sent.message_id in formatted
 
 
 # ---------------------------------------------------------------------------

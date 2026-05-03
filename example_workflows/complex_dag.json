@@ -1,0 +1,29 @@
+{
+  "tasks": [
+    {
+      "label": "build",
+      "type": "build",
+      "depends_on": []
+    },
+    {
+      "label": "unit_test",
+      "type": "test",
+      "depends_on": "build"
+    },
+    {
+      "label": "integration_test",
+      "type": "test",
+      "depends_on": "build"
+    },
+    {
+      "label": "lint",
+      "type": "lint",
+      "depends_on": "build"
+    },
+    {
+      "label": "notify",
+      "type": "notification",
+      "depends_on": ["unit_test", "integration_test", "lint"]
+    }
+  ]
+}
