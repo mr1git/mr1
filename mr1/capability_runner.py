@@ -194,12 +194,22 @@ class CapabilityRunner:
             )
             if approval is not None:
                 approval_request_id, _ = self._route_approval(approval)
+                routed = self._approval_store.require(approval_request_id)
+                routing_outcome = (
+                    "needs_user_approval"
+                    if routed.designated_approver_id == self._agents.root_agent_id
+                    else "needs_escalation"
+                )
+            else:
+                routing_outcome = None
             output = {
                 "status": decision.status,
                 "reason": decision.reason,
             }
             if approval_request_id is not None:
                 output["approval_request_id"] = approval_request_id
+            if routing_outcome is not None:
+                output["routing_outcome"] = routing_outcome
             record.execution_result = dict(output)
             self._audit_writer.write(audit_path, record)
             self._append_audit_index(

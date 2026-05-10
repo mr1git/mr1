@@ -233,3 +233,80 @@ def test_mrn_cannot_grant_scope_it_does_not_have(tmp_path, agent_store):
 
     with pytest.raises(AgentScopeError, match="granting agent lacks access"):
         agent_store.grant_scope(child.agent_id, child.agent_id, target, reason="self")
+
+
+# --- Risk-threshold escalation tests ---
+
+def test_risk_threshold_exceeded_escalates_to_nearest_ancestor(tmp_path, agent_store):
+    root = agent_store.ensure_root_agent()
+    # parent has clearance >= condition_script risk_score (0.75)
+    parent = agent_store.create_child_agent(root.agent_id, "parent", security_clearance=0.8)
+    child = agent_store.create_child_agent(parent.agent_id, "child", security_clearance=0.1)
+    script = tmp_path / "check.py"
+    script.write_text("import sys; sys.exit(0)", encoding="utf-8")
+    runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)
+
+    result = runner.run_capability("condition_script", {"path": str(script)}, child.agent_id, step_id="step-t1")
+
+    assert result.status == "requires_approval"
+    assert result.output["reason"] == "risk_exceeds_direct_threshold"
+    assert result.output["routing_outcome"] == "needs_escalation"
+    approval = runner._approval_store.require(result.approval_request_id)
+    assert approval.designated_approver_id == parent.agent_id
+    assert runner._message_store.list_inbox(parent.agent_id) != []
+    assert runner._message_store.list_inbox(root.agent_id) == []
+
+
+def test_risk_threshold_exceeded_falls_back_to_root(tmp_path, agent_store):
+    root = agent_store.ensure_root_agent()
+    # parent clearance too low to approve condition_script (risk 0.75)
+    parent = agent_store.create_child_agent(root.agent_id, "parent", security_clearance=0.5)
+    child = agent_store.create_child_agent(parent.agent_id, "child", security_clearance=0.1)
+    script = tmp_path / "check.py"
+    script.write_text("import sys; sys.exit(0)", encoding="utf-8")
+    runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)
+
+    result = runner.run_capability("condition_script", {"path": str(script)}, child.agent_id, step_id="step-t2")
+
+    assert result.status == "requires_approval"
+    assert result.output["routing_outcome"] == "needs_user_approval"
+    approval = runner._approval_store.require(result.approval_request_id)
+    assert approval.designated_approver_id == root.agent_id
+
+
+def test_risk_threshold_exceeded_executes_on_approved_retry(tmp_path, agent_store):
+    root = agent_store.ensure_root_agent()
+    parent = agent_store.create_child_agent(root.agent_id, "parent", security_clearance=0.8)
+    child = agent_store.create_child_agent(parent.agent_id, "child", security_clearance=0.1)
+    script = tmp_path / "check.py"
+    script.write_text("import sys; sys.exit(0)", encoding="utf-8")
+    runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)
+
+    first = runner.run_capability("condition_script", {"path": str(script)}, child.agent_id, step_id="step-t3")
+    approval_id = first.approval_request_id
+    runner._approval_store.apply_decision(
+        approval_id,
+        decision=CapabilityApprovalDecision(
+            approval_request_id=approval_id,
+            decision="approved",
+            decided_by=parent.agent_id,
+            reason="ok",
+            timestamp=1.0,
+            approval_scope="single_use",
+        ),
+        scoped_agent_store=agent_store,
+    )
+
+    second = runner.run_capability("condition_script", {"path": str(script)}, child.agent_id, step_id="step-t3")
+
+    assert second.status == "succeeded"
+
+
+def test_direct_not_allowed_remains_denied(tmp_path, agent_store):
+    root = agent_store.ensure_root_agent()
+    runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)
+
+    result = runner.run_capability("write_file", {"path": str(tmp_path / "x.txt"), "content": "hi"}, root.agent_id)
+
+    assert result.status == "denied"
+    assert result.output["reason"] == "capability_not_allowed_in_direct_mode"

@@ -61,6 +61,22 @@ def test_message_creation_persists_and_lists_inbox_outbox(agent_store, message_s
     assert message_store.list_outbox(root.agent_id)[0].message_id == created.message_id
 
 
+def test_message_creation_normalizes_supported_alias_kind(agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+
+    created = message_store.create_message(
+        from_agent_id=root.agent_id,
+        to_agent_id=child.agent_id,
+        kind="proposal",
+        subject="Plan",
+        body="Proceed with the implementation.",
+    )
+
+    assert created.kind == "request"
+    assert message_store.get_message(created.message_id).kind == "request"
+
+
 def test_mark_read_and_archive(agent_store, message_store):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
@@ -246,6 +262,44 @@ def test_mr1_builtins_inbox_and_message(workflow_store, agent_store, message_sto
     assert read_output == message.message_id
     assert message_store.get_message(message.message_id).status == "read"
     assert send_output.startswith("msg-")
+
+
+def test_cli_agent_detail_stays_compact_while_message_detail_is_full(workflow_store, agent_store, message_store, capsys):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    long_mission = "Investigate " + ("repo " * 80)
+    child.mission = long_mission
+    agent_store.save_agent(child)
+    long_body = "Detailed body " + ("x" * 5000)
+    message = message_store.create_message(
+        from_agent_id=child.agent_id,
+        to_agent_id=root.agent_id,
+        kind="report",
+        subject="Long report",
+        body=long_body,
+    )
+
+    rc = workflow_cli.main(
+        ["agent", child.agent_id],
+        store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+    )
+    assert rc == 0
+    agent_output = capsys.readouterr().out
+    assert "mission:      " in agent_output
+    assert long_mission not in agent_output
+    assert "..." in agent_output
+
+    rc = workflow_cli.main(
+        ["message", message.message_id],
+        store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+    )
+    assert rc == 0
+    message_output = capsys.readouterr().out
+    assert long_body in message_output
 
 
 def test_require_message_denies_sibling_access(agent_store, message_store):

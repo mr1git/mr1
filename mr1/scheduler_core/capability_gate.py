@@ -327,6 +327,7 @@ class CapabilityGate:
                 "decision_status": decision["status"],
             },
         )
+        routing_outcome = None
         if approval is not None:
             approval_request_id, _ = maybe_route_approval_request(
                 approval,
@@ -334,12 +335,20 @@ class CapabilityGate:
                 message_store=self._message_store,
                 scoped_agent_store=self._scoped_agents,
             )
+            routed = self._approval_store.require(approval_request_id)
+            routing_outcome = (
+                "needs_user_approval"
+                if routed.designated_approver_id == self._scoped_agents.root_agent_id
+                else "needs_escalation"
+            )
         blocked_result = {
             "status": decision["status"],
             "reason": decision["reason"],
         }
         if approval_request_id is not None:
             blocked_result["approval_request_id"] = approval_request_id
+        if routing_outcome is not None:
+            blocked_result["routing_outcome"] = routing_outcome
         self.write_policy_audit(
             audit_path,
             capability_name=request.capability_name,

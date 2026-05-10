@@ -49,6 +49,216 @@ def new_run_id() -> str:
     return f"run-{timestamp}-{uuid.uuid4().hex[:6]}"
 
 
+def _clone_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _clone_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_json_value(item) for item in value]
+    return value
+
+
+def _clean_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _normalize_id_list(items: Any, *, keys: tuple[str, ...]) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        candidate: Optional[str] = None
+        if isinstance(item, str):
+            candidate = item.strip()
+        elif isinstance(item, dict):
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidate = value.strip()
+                    break
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized
+
+
+def _normalize_string_list(items: Any) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        value = item.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _normalize_assignment_context(context: Any) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        context = {}
+    return {
+        "assigned_clearance": context.get("assigned_clearance"),
+        "agents": _normalize_id_list(
+            context.get("agents"),
+            keys=("agent_id", "id"),
+        ),
+        "messages": _normalize_id_list(
+            context.get("messages"),
+            keys=("message_id", "id"),
+        ),
+        "workflows": _normalize_id_list(
+            context.get("workflows"),
+            keys=("workflow_id", "id"),
+        ),
+        "delegated_subtask": _clean_text(context.get("delegated_subtask")),
+        "reason_for_delegation": _clean_text(context.get("reason_for_delegation")),
+        "mission": _clean_text(context.get("mission")),
+        "responsibility": _clean_text(context.get("responsibility")),
+        "in_scope": _normalize_string_list(context.get("in_scope")),
+        "out_of_scope": _normalize_string_list(context.get("out_of_scope")),
+        "constraints": _normalize_string_list(context.get("constraints")),
+        "success_criteria": _normalize_string_list(context.get("success_criteria")),
+        "expected_first_action": _clean_text(context.get("expected_first_action")),
+        "escalation_rules": _clean_text(context.get("escalation_rules")),
+    }
+
+
+def build_assignment_packet(
+    parent_agent: "PersistentAgent",
+    child_title: str,
+    user_input: str,
+    context: Any,
+) -> dict[str, Any]:
+    normalized_context = _normalize_assignment_context(context)
+    normalized_title = _clean_text(child_title) or "MRn"
+    full_parent_request = user_input if isinstance(user_input, str) else ""
+    delegated_subtask = (
+        normalized_context["delegated_subtask"]
+        or _clean_text(user_input)
+        or f"Own the delegated responsibility for {normalized_title}."
+    )
+    reason_for_delegation = (
+        normalized_context["reason_for_delegation"]
+        or "The parent agent delegated this work so the child can own a scoped responsibility and execute it persistently."
+    )
+    mission = (
+        normalized_context["mission"]
+        or f"Own the delegated subtask for {normalized_title} and deliver the requested outcome within the defined scope."
+    )
+    responsibility = (
+        normalized_context["responsibility"]
+        or "Own the requested domain/responsibility instead of treating it as a one-shot execution."
+    )
+    in_scope = normalized_context["in_scope"] or [
+        delegated_subtask,
+        "Plan, execute, and report on the delegated work within the child agent's scope.",
+        "Create or manage workflows when structured execution is the best fit.",
+    ]
+    out_of_scope = normalized_context["out_of_scope"] or [
+        "Do not exceed the delegated scope or assigned clearance.",
+        "Do not redesign permissions, memory retrieval, or unrelated runtime systems unless explicitly delegated.",
+        "Escalate instead of inventing missing decisions that materially change the assignment.",
+    ]
+    constraints = normalized_context["constraints"] or [
+        "Preserve the full parent request without truncation.",
+        "Treat assigned_clearance as informational; enforcement is handled elsewhere.",
+        "Use relevant runtime references by ID only and fetch details through observation reads when needed.",
+        "Prefer workflow creation when execution should become structured work.",
+    ]
+    success_criteria = normalized_context["success_criteria"] or [
+        "The child can explain its mission, responsibility, scope boundaries, and escalation behavior.",
+        "The child uses relevant context IDs instead of embedded full runtime objects.",
+        "The delegated work stays within the assigned scope and escalates when blocked by missing decisions or clearance.",
+    ]
+    expected_first_action = (
+        normalized_context["expected_first_action"]
+        or "Review the full parent request and relevant context IDs, then either start direct work or create a workflow if structured execution is warranted."
+    )
+    escalation_rules = (
+        normalized_context["escalation_rules"]
+        or "Escalate to the parent when a missing decision, approval, or scope boundary blocks progress or would materially change the assignment."
+    )
+    assigned_clearance_raw = normalized_context["assigned_clearance"]
+    assigned_clearance = (
+        float(assigned_clearance_raw)
+        if assigned_clearance_raw is not None else
+        float(parent_agent.security_clearance)
+    )
+    return {
+        "parent_agent_id": parent_agent.agent_id,
+        "parent_level": int(parent_agent.tree_level),
+        "child_level": int(parent_agent.tree_level) + 1,
+        "assigned_clearance": assigned_clearance,
+        "child_title": normalized_title,
+        "full_parent_request": full_parent_request,
+        "delegated_subtask": delegated_subtask,
+        "reason_for_delegation": reason_for_delegation,
+        "mission": mission,
+        "responsibility": responsibility,
+        "scope": {
+            "in_scope": in_scope,
+            "out_of_scope": out_of_scope,
+        },
+        "constraints": constraints,
+        "success_criteria": success_criteria,
+        "expected_first_action": expected_first_action,
+        "relevant_context": {
+            "agents": list(normalized_context["agents"]),
+            "messages": list(normalized_context["messages"]),
+            "workflows": list(normalized_context["workflows"]),
+        },
+        "escalation_rules": escalation_rules,
+        "notes": "clearance is informational; enforcement handled elsewhere",
+    }
+
+
+def render_assignment_mission(assignment_packet: Optional[dict[str, Any]]) -> Optional[str]:
+    if not isinstance(assignment_packet, dict):
+        return None
+    child_title = _clean_text(assignment_packet.get("child_title")) or "MRn"
+    mission = _clean_text(assignment_packet.get("mission")) or "Own the delegated assignment."
+    responsibility = _clean_text(assignment_packet.get("responsibility")) or "-"
+    delegated_subtask = _clean_text(assignment_packet.get("delegated_subtask")) or "-"
+    expected_first_action = _clean_text(assignment_packet.get("expected_first_action")) or "-"
+    escalation_rules = _clean_text(assignment_packet.get("escalation_rules")) or "-"
+    assigned_clearance = float(assignment_packet.get("assigned_clearance", 0.0))
+    scope = assignment_packet.get("scope") if isinstance(assignment_packet.get("scope"), dict) else {}
+    in_scope = _normalize_string_list(scope.get("in_scope"))
+    out_of_scope = _normalize_string_list(scope.get("out_of_scope"))
+    constraints = _normalize_string_list(assignment_packet.get("constraints"))
+    success_criteria = _normalize_string_list(assignment_packet.get("success_criteria"))
+    lines = [
+        f"You are a persistent {child_title}-style child agent.",
+        f"Mission: {mission}",
+        f"Responsibility: {responsibility}",
+        f"Delegated subtask: {delegated_subtask}",
+        f"Assigned clearance: {assigned_clearance:.2f}",
+    ]
+    if in_scope:
+        lines.append("In scope:")
+        lines.extend(f"- {item}" for item in in_scope)
+    if out_of_scope:
+        lines.append("Out of scope:")
+        lines.extend(f"- {item}" for item in out_of_scope)
+    if constraints:
+        lines.append("Constraints:")
+        lines.extend(f"- {item}" for item in constraints)
+    if success_criteria:
+        lines.append("Success criteria:")
+        lines.extend(f"- {item}" for item in success_criteria)
+    lines.append(f"Expected first action: {expected_first_action}")
+    lines.append(f"Escalation: {escalation_rules}")
+    return "\n".join(lines)
+
+
 @dataclass
 class PersistentAgent:
     agent_id: str
@@ -71,6 +281,7 @@ class PersistentAgent:
     security_clearance: float = 1.0
     scope_roots: list[str] = field(default_factory=list)
     scope_grants: list[dict[str, Any]] = field(default_factory=list)
+    assignment_packet: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= float(self.security_clearance) <= 1.0:
@@ -98,6 +309,8 @@ class PersistentAgent:
             "security_clearance": float(self.security_clearance),
             "scope_roots": list(self.scope_roots),
             "scope_grants": [dict(item) for item in self.scope_grants],
+            "assignment_packet": _clone_json_value(self.assignment_packet)
+            if isinstance(self.assignment_packet, dict) else None,
         }
 
     @classmethod
@@ -133,6 +346,8 @@ class PersistentAgent:
                 for item in list(data.get("scope_grants", []))
                 if isinstance(item, dict)
             ],
+            assignment_packet=_clone_json_value(data["assignment_packet"])
+            if isinstance(data.get("assignment_packet"), dict) else None,
         )
 
 
@@ -291,6 +506,9 @@ class PersistentAgentStore:
                 if agent_id:
                     existing = self.load_agent(agent_id)
                     if existing is not None:
+                        if existing.status == "terminated":
+                            existing.status = "active"
+                            self.save_agent(existing)
                         return existing
             agent = PersistentAgent(
                 agent_id=new_agent_id(),
@@ -482,7 +700,7 @@ class PersistentAgentStore:
         if granter.security_clearance < 1.0:
             raise AgentScopeError("access denied: insufficient security clearance for scope grant")
         normalized_path = str(normalize_path(path))
-        if not self.can_agent_access_path(granting_agent_id, normalized_path):
+        if not (self.is_root_agent(granting_agent_id) or self.can_agent_access_path(granting_agent_id, normalized_path)):
             raise AgentScopeError("access denied: granting agent lacks access to requested scope")
         if (
             granting_agent_id == target_agent_id
@@ -562,18 +780,34 @@ class PersistentAgentStore:
         caller_agent_id: str,
         target_agent_id: str,
         mission: str,
+        *,
+        parent_request: Optional[str] = None,
+        assignment_packet: Optional[dict[str, Any]] = None,
     ) -> PersistentAgent:
         if not self.can_manage_agent(caller_agent_id, target_agent_id):
             raise AgentScopeError("access denied: agent not in scope")
         agent = self.require_agent(target_agent_id)
         if agent.status == "terminated":
             raise ValueError(f"agent terminated: {target_agent_id}")
+        normalized_assignment_packet = (
+            _clone_json_value(assignment_packet)
+            if isinstance(assignment_packet, dict) else None
+        )
+        resolved_parent_request = parent_request
+        if resolved_parent_request is None and normalized_assignment_packet is not None:
+            packet_parent_request = normalized_assignment_packet.get("full_parent_request")
+            if isinstance(packet_parent_request, str):
+                resolved_parent_request = packet_parent_request
         agent.mission = mission.strip() if isinstance(mission, str) else None
         agent.run_status = "idle"
         agent.current_iteration = 0
         agent.last_step_at = None
         agent.last_action = None
-        agent.parent_request = None
+        agent.parent_request = (
+            resolved_parent_request
+            if isinstance(resolved_parent_request, str) else None
+        )
+        agent.assignment_packet = normalized_assignment_packet
         self.save_agent(agent)
         return agent
 

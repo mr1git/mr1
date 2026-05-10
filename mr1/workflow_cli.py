@@ -79,9 +79,19 @@ from mr1.memory_queries import (
     memory_insight_show,
     memory_insights_search,
 )
+from mr1.memory_reset import MemoryResetResult, reset_memory
 from mr1.memory_retrieval import RetrievalStore, update_memory_retrieval
 from mr1.mrn_loop import MRnStepResult, MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunResult, MRnRunRunner
+from mr1.runtime_access import (
+    RuntimeAccess,
+    load_scoped_workflow as _load_scoped_workflow_shared,
+    require_visible_approval as _require_visible_approval_shared,
+    require_visible_message as _require_message_shared,
+    visible_approvals as _visible_approvals_shared,
+    visible_timeline_events as _visible_timeline_events_shared,
+    visible_workflows as _visible_workflows_shared,
+)
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import (
     WatcherTriggerError,
@@ -761,12 +771,49 @@ def _format_agent(
     json_output: bool = False,
     brief: bool = False,
 ) -> str:
-    payload = _persistent_agent_payload(
-        agent,
-        reports=reports,
-        message_store=message_store,
-        workflow_store=workflow_store,
-    )
+    if isinstance(agent, dict):
+        payload = dict(agent)
+        agent_id = str(payload["agent_id"])
+        agent_type = str(payload["agent_type"])
+        title = str(payload["title"])
+        status = str(payload["status"])
+        clearance = float(payload.get("security_clearance", 0.0))
+        mission = payload.get("mission")
+        mode = str(payload.get("mode", "-"))
+        run_status = str(payload.get("run_status", "-"))
+        current_iteration = int(payload.get("current_iteration", 0))
+        last_step_at = payload.get("last_step_at")
+        last_action = payload.get("last_action")
+        tree_level = int(payload.get("tree_level", 0))
+        parent_agent_id = payload.get("parent_agent_id")
+        created_at = str(payload.get("created_at", "-"))
+        owned_workflow_ids = list(payload.get("owned_workflow_ids", []))
+        scope_roots = list(payload.get("scope_roots", []))
+        report_names = [Path(str(path)).name for path in payload.get("reports", [])]
+    else:
+        payload = _persistent_agent_payload(
+            agent,
+            reports=reports,
+            message_store=message_store,
+            workflow_store=workflow_store,
+        )
+        agent_id = agent.agent_id
+        agent_type = agent.agent_type
+        title = agent.title
+        status = agent.status
+        clearance = agent.security_clearance
+        mission = agent.mission
+        mode = agent.mode
+        run_status = agent.run_status
+        current_iteration = agent.current_iteration
+        last_step_at = agent.last_step_at
+        last_action = agent.last_action
+        tree_level = agent.tree_level
+        parent_agent_id = agent.parent_agent_id
+        created_at = agent.created_at
+        owned_workflow_ids = list(agent.owned_workflow_ids)
+        scope_roots = list(agent.scope_roots)
+        report_names = [path.name for path in reports or []]
     if brief:
         payload = {
             "agent_id": payload["agent_id"],
@@ -777,41 +824,41 @@ def _format_agent(
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
     lines = [
-        f"agent_id:     {agent.agent_id}",
-        f"type:         {agent.agent_type}",
-        f"title:        {agent.title}",
-        f"status:       {agent.status}",
-        f"clearance:    {agent.security_clearance:.2f}",
-        f"mission:      {_compact_text(agent.mission)}",
-        f"mode:         {agent.mode}",
-        f"run_status:   {agent.run_status}",
+        f"agent_id:     {agent_id}",
+        f"type:         {agent_type}",
+        f"title:        {title}",
+        f"status:       {status}",
+        f"clearance:    {clearance:.2f}",
+        f"mission:      {_compact_text(mission)}",
+        f"mode:         {mode}",
+        f"run_status:   {run_status}",
         f"active_jobs:  {payload.get('active_jobs', 0)}",
         f"active_workflows: {payload.get('active_workflows', 0)}",
         f"runtime_activity: {payload.get('runtime_activity', 'no active jobs')}",
         f"has_running_processes: {'yes' if payload.get('has_running_processes') else 'no'}",
-        f"iteration:    {agent.current_iteration}",
-        f"last_step_at: {_short_ts(agent.last_step_at)}",
-        f"last_action:  {_summarize_last_action(agent.last_action)}",
+        f"iteration:    {current_iteration}",
+        f"last_step_at: {_short_ts(last_step_at)}",
+        f"last_action:  {_summarize_last_action(last_action if isinstance(last_action, dict) else None)}",
         f"latest_run:   {payload.get('latest_run_id') or '-'}",
         f"run_reason:   {payload.get('latest_run_stopped_reason') or '-'}",
         f"run_steps:    {payload.get('latest_run_step_count') or 0}",
         f"run_at:       {_short_ts(payload.get('latest_run_at'))}",
-        f"parent_req:   {_compact_text(agent.parent_request)}",
+        f"parent_req:   {_compact_text(payload.get('parent_request'))}",
         f"waiting_on_parent: {'yes' if payload.get('waiting_on_parent') else 'no'}",
         f"pending_parent_questions: {payload.get('pending_parent_questions', 0)}",
-        f"tree_level:   {agent.tree_level}",
-        f"parent:       {agent.parent_agent_id or '-'}",
-        f"created_at:   {agent.created_at}",
-        f"workflows:    {len(agent.owned_workflow_ids)}",
+        f"tree_level:   {tree_level}",
+        f"parent:       {parent_agent_id or '-'}",
+        f"created_at:   {created_at}",
+        f"workflows:    {len(owned_workflow_ids)}",
         f"unread_inbox: {payload.get('unread_inbox_count', 0)}",
     ]
-    if agent.owned_workflow_ids:
-        lines.append(f"owned_ids:    {', '.join(agent.owned_workflow_ids)}")
-    lines.append(f"scope_roots:  {', '.join(agent.scope_roots) or '-'}")
+    if owned_workflow_ids:
+        lines.append(f"owned_ids:    {', '.join(owned_workflow_ids)}")
+    lines.append(f"scope_roots:  {', '.join(scope_roots) or '-'}")
     lines.append("reports:")
-    for path in reports or []:
-        lines.append(f"  {path.name}")
-    if not reports:
+    for name in report_names:
+        lines.append(f"  {name}")
+    if not report_names:
         lines.append("  none")
     lines.append("latest_inbox:")
     for item in payload.get("latest_inbox_messages", []):
@@ -1013,22 +1060,23 @@ def _format_message_detail(
     *,
     json_output: bool = False,
 ) -> str:
+    payload = message if isinstance(message, dict) else message.to_dict()
     if json_output:
-        return json.dumps(message.to_dict(), indent=2, sort_keys=True)
+        return json.dumps(payload, indent=2, sort_keys=True)
     return "\n".join([
-        f"message_id:   {message.message_id}",
-        f"from:         {message.from_agent_id}",
-        f"to:           {message.to_agent_id}",
-        f"kind:         {message.kind}",
-        f"subject:      {message.subject}",
-        f"status:       {message.status}",
-        f"workflow_id:  {message.workflow_id or '-'}",
-        f"task_id:      {message.task_id or '-'}",
-        f"created_at:   {message.created_at}",
-        f"read_at:      {message.read_at or '-'}",
-        f"archived_at:  {message.archived_at or '-'}",
+        f"message_id:   {payload['message_id']}",
+        f"from:         {payload['from_agent_id']}",
+        f"to:           {payload['to_agent_id']}",
+        f"kind:         {payload['kind']}",
+        f"subject:      {payload['subject']}",
+        f"status:       {payload['status']}",
+        f"workflow_id:  {payload.get('workflow_id') or '-'}",
+        f"task_id:      {payload.get('task_id') or '-'}",
+        f"created_at:   {payload['created_at']}",
+        f"read_at:      {payload.get('read_at') or '-'}",
+        f"archived_at:  {payload.get('archived_at') or '-'}",
         "body:",
-        message.body,
+        str(payload.get("body", "")),
     ])
 
 
@@ -1218,12 +1266,11 @@ def _require_message(
     message_id: str,
     caller_agent_id: str,
 ) -> PersistentMessage:
-    message = message_store.get_message(message_id)
-    if message is None:
-        raise ValueError(f"message not found: {message_id}")
-    if not message_store.can_agent_access_message(caller_agent_id, message):
-        raise AgentScopeError("access denied: message not in agent scope")
-    return message
+    return _require_message_shared(
+        message_store,
+        message_id,
+        caller_agent_id,
+    )
 
 
 def _format_tool(
@@ -1757,12 +1804,11 @@ def _visible_workflows(
     scoped_agents: PersistentAgentStore,
     caller_agent_id: str,
 ) -> list[Workflow]:
-    workflows = []
-    for workflow in store.list_workflows():
-        workflow = scoped_agents.normalize_workflow_ownership(workflow)
-        if scoped_agents.can_agent_access_workflow(caller_agent_id, workflow):
-            workflows.append(workflow)
-    return workflows
+    return _visible_workflows_shared(
+        store,
+        scoped_agents,
+        caller_agent_id,
+    )
 
 
 def _load_scoped_workflow(
@@ -1771,13 +1817,12 @@ def _load_scoped_workflow(
     scoped_agents: PersistentAgentStore,
     caller_agent_id: str,
 ) -> Workflow:
-    workflow = store.load_workflow(workflow_id)
-    if workflow is None:
-        raise WorkflowSpecError(f"workflow not found: {workflow_id}")
-    workflow = scoped_agents.normalize_workflow_ownership(workflow)
-    if not scoped_agents.can_agent_access_workflow(caller_agent_id, workflow):
-        raise WorkflowSpecError("access denied: workflow not in agent scope")
-    return workflow
+    return _load_scoped_workflow_shared(
+        store,
+        workflow_id,
+        scoped_agents,
+        caller_agent_id,
+    )
 
 
 def _load_json_file(path_str: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
@@ -1837,17 +1882,11 @@ def _visible_approvals(
     scoped_agents: PersistentAgentStore,
     caller_agent_id: str,
 ) -> list[CapabilityApprovalRequest]:
-    visible_ids = {agent.agent_id for agent in scoped_agents.list_visible_agents(caller_agent_id)}
-    if scoped_agents.is_root_agent(caller_agent_id):
-        visible_ids = {agent.agent_id for agent in scoped_agents.list_agents()}
-    approvals = []
-    for approval in approval_store.list_requests():
-        if (
-            approval.requesting_actor_id in visible_ids
-            or (approval.designated_approver_id or "") in visible_ids
-        ):
-            approvals.append(approval)
-    return approvals
+    return _visible_approvals_shared(
+        approval_store,
+        scoped_agents,
+        caller_agent_id,
+    )
 
 
 def _event_visible(
@@ -1896,17 +1935,14 @@ def _visible_timeline_events(
     message_store: MessageStore,
     caller_agent_id: str,
 ) -> list[SystemEvent]:
-    events = _timeline_for(store).list_events()
-    return [
-        event for event in events
-        if _event_visible(
-            event,
-            store=store,
-            scoped_agents=scoped_agents,
-            message_store=message_store,
-            caller_agent_id=caller_agent_id,
-        )
-    ]
+    return _visible_timeline_events_shared(
+        store,
+        scoped_agents,
+        message_store,
+        caller_agent_id,
+        event_log=_timeline_for(store),
+        approval_store=_approval_store_for(store),
+    )
 
 
 def _require_visible_approval(
@@ -1915,14 +1951,28 @@ def _require_visible_approval(
     scoped_agents: PersistentAgentStore,
     caller_agent_id: str,
 ) -> CapabilityApprovalRequest:
-    approval = approval_store.require(approval_request_id)
-    visible = {
-        item.approval_request_id
-        for item in _visible_approvals(approval_store, scoped_agents, caller_agent_id)
-    }
-    if approval.approval_request_id not in visible:
-        raise AgentScopeError("access denied: approval not in agent scope")
-    return approval
+    return _require_visible_approval_shared(
+        approval_store,
+        approval_request_id,
+        scoped_agents,
+        caller_agent_id,
+    )
+
+
+def _runtime_access_for(
+    store: WorkflowStore,
+    scoped_agents: PersistentAgentStore,
+    message_store: MessageStore,
+    *,
+    approval_store: Optional[CapabilityApprovalStore] = None,
+) -> RuntimeAccess:
+    return RuntimeAccess(
+        workflow_store=store,
+        scoped_agent_store=scoped_agents,
+        message_store=message_store,
+        approval_store=approval_store or _approval_store_for(store),
+        event_log=_timeline_for(store),
+    )
 
 
 def _audit_entries_for_agent(agent_store: PersistentAgentStore, agent_id: str) -> list[dict[str, Any]]:
@@ -2718,15 +2768,19 @@ def _cmd_agent(
         print("error: usage: agent <ag-id>", file=sys.stderr)
         return 2
     try:
-        agent = scoped_agents.get_visible_agent(caller_agent_id, target)
+        agent = _runtime_access_for(
+            store,
+            scoped_agents,
+            getattr(args, "message_store", None),
+        ).read_agent(
+            target,
+            caller_agent_id=caller_agent_id,
+        )
     except (ValueError, AgentScopeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_agent(
         agent,
-        reports=scoped_agents.list_reports(agent.agent_id),
-        message_store=getattr(args, "message_store", None),
-        workflow_store=store,
         json_output=args.json,
         brief=args.brief,
     ))
@@ -2968,6 +3022,41 @@ def _cmd_capability_audit_show(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_capability_audit_detail(index_entry, record, json_output=args.json))
+    return 0
+
+
+def _cmd_memory_reset(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    del caller_agent_id, scoped_agents
+    memory_root = _runtime_root_for(store)
+    try:
+        result = reset_memory(memory_root, scope=args.scope)
+    except ValueError as exc:
+        print(f"error: {exc}", file=__import__("sys").stderr)
+        return 2
+    if args.json:
+        print(__import__("json").dumps(result.to_dict(), indent=2, sort_keys=True))
+        return 0
+    lines = [f"memory reset: scope={result.scope}"]
+    if result.deleted_paths:
+        lines.append(f"  deleted ({len(result.deleted_paths)}):")
+        for p in result.deleted_paths:
+            lines.append(f"    {p}")
+    if result.recreated_paths:
+        lines.append(f"  recreated ({len(result.recreated_paths)}):")
+        for p in result.recreated_paths:
+            lines.append(f"    {p}")
+    if result.skipped_paths:
+        lines.append(f"  skipped ({len(result.skipped_paths)} missing paths)")
+    if result.warnings:
+        lines.append(f"  warnings ({len(result.warnings)}):")
+        for w in result.warnings:
+            lines.append(f"    {w}")
+    print("\n".join(lines))
     return 0
 
 
@@ -3661,10 +3750,18 @@ def _cmd_message(
     caller_agent_id: str,
     scoped_agents: PersistentAgentStore,
 ) -> int:
-    del store, scoped_agents
+    runtime_access = _runtime_access_for(
+        store,
+        scoped_agents,
+        getattr(args, "message_store"),
+    )
     message_store = getattr(args, "message_store")
     try:
-        message = _require_message(message_store, args.message_id, caller_agent_id)
+        _require_message(message_store, args.message_id, caller_agent_id)
+        message = runtime_access.read_message(
+            args.message_id,
+            caller_agent_id=caller_agent_id,
+        )
     except (ValueError, AgentScopeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -4077,6 +4174,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_memory = subs.add_parser("memory", help="Inspect deterministic graph memory.")
     memory_subs = p_memory.add_subparsers(dest="memory_command", required=True)
+
+    p_memory_reset = memory_subs.add_parser("reset", help="Reset one or all memory scopes.")
+    p_memory_reset.add_argument(
+        "scope",
+        choices=["active", "graph", "insights", "rag", "all"],
+        help="Memory scope to reset.",
+    )
+    add_common_flags(p_memory_reset, include_example=False)
+    p_memory_reset.set_defaults(func=_cmd_memory_reset)
 
     p_memory_update = memory_subs.add_parser("update", help="Update graph memory from timeline events.")
     add_common_flags(p_memory_update, include_example=False)

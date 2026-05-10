@@ -1131,7 +1131,7 @@ class PolicyEngine:
         if metadata.risk_score > max_risk and not approved_override:
             return self._decision(
                 allowed=False,
-                status="denied",
+                status="requires_approval",
                 reason=f"risk_exceeds_{request.invocation_mode}_threshold",
                 risk_score=metadata.risk_score,
                 metadata_payload={"threshold": max_risk},

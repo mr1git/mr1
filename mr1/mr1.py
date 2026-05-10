@@ -48,11 +48,24 @@ from mr1.capability_policy import (
     CapabilityApprovalStore,
 )
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
-from mr1.messages import MessageStore
+from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunRunner
-from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.runtime_access import RuntimeAccess
+from mr1.runtime_observation import (
+    execute_observation_request,
+    format_observation_results_block,
+    invalid_observation_result,
+    parse_observation_request,
+)
+from mr1.routing_advisor import RouteAdvice, build_route_advice
+from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError, rerun_task_on_disk
+from mr1.scoped_agents import (
+    AgentScopeError,
+    PersistentAgentStore,
+    build_assignment_packet,
+    render_assignment_mission,
+)
 from mr1.event_log import EventLog
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
@@ -80,6 +93,8 @@ _KAZI_CONFIG_PATH = _AGENTS_DIR / "kazi.yml"
 # Maximum number of decisions retained in state.
 _MAX_DECISIONS = 50
 _MAX_CONVERSATION = 80
+# Long-output threshold for the chat UI: lines above this are summarised.
+_OUTPUT_TRUNCATE_LINES = 40
 _TERMINAL_TASK_STATUSES = {
     "completed",
     "failed",
@@ -91,6 +106,7 @@ _TERMINAL_TASK_STATUSES = {
 
 # Maximum delegation rounds per user turn.
 _MAX_DELEGATION_ROUNDS = 5
+_MAX_OBSERVATION_ROUNDS = 2
 _TEST_AGENT_MAX_HEIGHT = 5
 _TEST_AGENT_PREFIX = "test-agent"
 _GROUNDING_AGENT_LIMIT = 8
@@ -104,6 +120,7 @@ _AGENT_ID_PATTERN = re.compile(r"\bag-\d{8}T\d{6}-[0-9a-f]{6}\b")
 _WORKFLOW_ID_PATTERN = re.compile(r"\bwf-\d{8}T\d{6}-[0-9a-f]{6}\b")
 _TASK_ID_PATTERN = re.compile(r"\btk-\d{8}T\d{6}-[0-9a-f]{6}\b")
 _MESSAGE_ID_PATTERN = re.compile(r"\bmsg-\d{8}T\d{6,}-[0-9a-f]{6}\b")
+_APPROVAL_ID_PATTERN = re.compile(r"\bcap_approval_[A-Za-z0-9_]+\b")
 _REPLY_INTENT_PATTERN = re.compile(
     r"\b(reply|respond|clarify)(?:\s+to)?(?:\s+this)?(?:\s+message)?\b",
     re.IGNORECASE,
@@ -147,6 +164,41 @@ _WORKFLOW_REFERENCE_ALIASES = (
     "that workflow",
     "the workflow",
     "this workflow",
+)
+_AGENT_REFERENCE_ALIASES = (
+    "that agent",
+    "the agent",
+    "this agent",
+    "that child",
+    "the child",
+    "this child",
+    "the agent we just created",
+    "the child we just created",
+    "the agent we created",
+    "the child we created",
+)
+_AGENT_CREATED_REFERENCE_ALIASES = (
+    "the agent we just created",
+    "the child we just created",
+    "the agent we created",
+    "the child we created",
+)
+_AUTO_REPLY_SYNTHESIS_MARKERS = (
+    "what you think is right",
+    "what you think is accurate",
+    "what seems right",
+    "what seems accurate",
+    "using your judgment",
+    "based on the conversation",
+    "based on our conversation",
+    "using the context",
+)
+_DEFAULT_PERSISTENT_CHILD_TITLES = (
+    "Sentinel",
+    "Darwin",
+    "Architect",
+    "Curator",
+    "Sage",
 )
 _BULK_AGENT_ACTIONS = (
     "kill",
@@ -390,6 +442,59 @@ The following are handled by the system:
 If the user sends one of these:
 Respond EXACTLY with:
 Handled by MR1 system.
+
+---
+
+== INTERNAL OBSERVATIONS ==
+
+You have backend-only read-only runtime observations. These are internal backend capabilities, not slash commands, and they are never user-visible.
+
+Use them when runtime grounding shows a truncated preview or a *_full_available=true field and the user is asking for the full detail.
+
+When you need an observation, respond with EXACTLY this shape and nothing else:
+
+[OBSERVE]
+{"calls":[{"name":"read_message","args":{"message_id":"msg-..."}}]}
+[/OBSERVE]
+
+Allowed observation calls:
+- list_agents
+- read_agent
+- list_messages
+- read_message
+- list_workflows
+- read_workflow
+- list_pending_approvals
+- list_recent_errors
+- search_memory
+
+Rules:
+- The OBSERVE block must be your entire response when used.
+- Use observations only for read-only runtime inspection.
+- Never use observations for mutations, messaging, workflow changes, or side effects.
+- Do not claim you lack access to full runtime detail when a matching read/list observation is available.
+- If runtime grounding is already sufficient, answer normally without using OBSERVE.
+
+---
+
+== MEMORY SEARCH ==
+
+search_memory is a backend read-only observation, not a slash command.
+
+Use search_memory when:
+- The user references prior conversations, previous work, or says "last time", "before", "earlier".
+- The user asks MR1 to continue an old thread or recall a past outcome.
+- Debugging would benefit from remembered prior outcomes or known friction patterns.
+
+Do not use search_memory for purely current runtime state; use list/read observations instead.
+Do not claim memory is unavailable without trying search_memory when the user explicitly asks about prior system/project context.
+Keep results bounded; cite or summarize only relevant items.
+Do not auto-search memory every turn.
+
+Example observation call:
+[OBSERVE]
+{"calls":[{"name":"search_memory","args":{"query":"authentication bug from last week","limit":5}}]}
+[/OBSERVE]
 
 ---
 
@@ -1003,6 +1108,13 @@ class MR1:
             self._workflow_store.root.parent / "capability_approvals"
         )
         self._event_log = EventLog(self._workflow_store.root.parent / "events")
+        self._runtime_access = RuntimeAccess(
+            workflow_store=self._workflow_store,
+            scoped_agent_store=self._scoped_agents,
+            message_store=self._message_store,
+            approval_store=self._approval_store,
+            event_log=self._event_log,
+        )
         self._root_agent_id = self._scoped_agents.root_agent_id
         runner = workflow_runner or KaziAsyncRunner(
             self._workflow_store,
@@ -1259,6 +1371,8 @@ class MR1:
         runtime_grounding: dict[str, Any],
         resolved_references: dict[str, Any],
         ambiguities: list[dict[str, Any]],
+        route_advice: Optional[RouteAdvice] = None,
+        route_advice_override_reason: Optional[str] = None,
         brain_prompt: Optional[str] = None,
         brain_response: Optional[str] = None,
         full_payload: Optional[str] = None,
@@ -1268,6 +1382,8 @@ class MR1:
             "timestamp": _now_iso(),
             "user_input": user_input,
             "route": route,
+            "route_advice": route_advice.to_dict() if route_advice is not None else None,
+            "route_advice_override_reason": route_advice_override_reason,
             "resolved_references": resolved_references,
             "ambiguities": ambiguities,
             "runtime_grounding": runtime_grounding,
@@ -1291,6 +1407,7 @@ class MR1:
         runtime_grounding: dict[str, Any],
         resolved_references: dict[str, Any],
         ambiguities: list[dict[str, Any]],
+        route_advice: Optional[RouteAdvice] = None,
         kind: str = "message",
         brain_prompt: Optional[str] = None,
         brain_response: Optional[str] = None,
@@ -1300,9 +1417,14 @@ class MR1:
             turn_id=turn_id,
             user_input=self._state.conversation[-1]["text"] if self._state.conversation else "",
             route=route,
+            route_advice=route_advice,
             runtime_grounding=runtime_grounding,
             resolved_references=resolved_references,
             ambiguities=ambiguities,
+            route_advice_override_reason=self._route_advice_override_reason(
+                route_advice,
+                final_route=route,
+            ),
             brain_prompt=brain_prompt,
             brain_response=brain_response,
             full_payload=full_payload,
@@ -1347,36 +1469,15 @@ class MR1:
         limit: int = _GROUNDING_AGENT_LIMIT,
         pinned_agent_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
-        payload: list[dict[str, Any]] = []
-        for agent in self._scoped_agents.list_visible_agents(self._root_agent_id):
-            unread_count = sum(
-                1
-                for message in self._message_store.list_inbox(agent.agent_id)
-                if message.status == "unread"
-            )
-            payload.append({
-                "agent_id": agent.agent_id,
-                "title": agent.title,
-                "agent_type": agent.agent_type,
-                "status": agent.status,
-                "run_status": agent.run_status,
-                "mission_summary": _compact_text(agent.mission, limit=240),
-                "last_action_summary": _compact_text(json.dumps(agent.last_action, sort_keys=True) if agent.last_action else "", limit=240),
-                "latest_run": dict(agent.last_run) if isinstance(agent.last_run, dict) else None,
-                "unread_inbox_count": unread_count,
-                "parent_agent_id": agent.parent_agent_id,
-                "scope_roots_summary": [
-                    _compact_text(path, limit=120)
-                    for path in list(agent.scope_roots or [])[:5]
-                ],
-                "created_at": agent.created_at,
-            })
-        payload.sort(key=lambda item: (item["created_at"], item["agent_id"]), reverse=True)
         pinned = pinned_agent_ids or [
             self._state.last_referenced_agent_id,
             self._state.last_created_agent_id,
         ]
-        return self._prioritize_items(payload, id_field="agent_id", pinned_ids=pinned, limit=limit)
+        return self._runtime_access.list_agents(
+            caller_agent_id=self._root_agent_id,
+            limit=limit,
+            pinned_agent_ids=pinned,
+        )
 
     def _grounding_workflows(
         self,
@@ -1384,99 +1485,74 @@ class MR1:
         limit: int = _GROUNDING_WORKFLOW_LIMIT,
         pinned_workflow_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
-        payload: list[dict[str, Any]] = []
-        for workflow in self._workflow_store.list_workflows():
-            tasks = list(workflow.tasks.values())
-            tasks.sort(key=lambda item: item.created_at)
-            payload.append({
-                "workflow_id": workflow.workflow_id,
-                "title": workflow.title,
-                "status": workflow.status.value,
-                "owner_agent_id": workflow.owner_agent_id,
-                "created_at": workflow.created_at,
-                "recent_task_status_summary": [
-                    {
-                        "label": task.label,
-                        "status": task.status.value,
-                        "summary": task.result_summary,
-                    }
-                    for task in tasks[:5]
-                ],
-                "memory_refs_used": list(workflow.metadata.get("memory_refs_used", []))
-                if isinstance(workflow.metadata, dict) else [],
-            })
-        payload.sort(key=lambda item: (item["created_at"], item["workflow_id"]), reverse=True)
         pinned = pinned_workflow_ids or [
             self._state.last_referenced_workflow_id,
             self._state.last_created_workflow_id,
         ]
-        return self._prioritize_items(payload, id_field="workflow_id", pinned_ids=pinned, limit=limit)
+        return self._runtime_access.list_workflows(
+            caller_agent_id=self._root_agent_id,
+            limit=limit,
+            pinned_workflow_ids=pinned,
+        )
+
+    @staticmethod
+    def _grounding_message_ids_from_agents(agents: list[dict[str, Any]]) -> list[str]:
+        message_ids: list[str] = []
+        for agent in agents:
+            for field in (
+                "latest_inbox_messages",
+                "latest_outbox_messages",
+                "pending_parent_messages",
+            ):
+                for item in agent.get(field, []):
+                    message_id = item.get("message_id")
+                    if isinstance(message_id, str) and message_id:
+                        message_ids.append(message_id)
+        return message_ids
 
     def _grounding_messages(
         self,
         *,
         limit: int = _GROUNDING_MESSAGE_LIMIT,
         pinned_message_ids: Optional[list[str]] = None,
+        referenced_message_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         pinned_ids = [item for item in (pinned_message_ids or []) if item]
-        messages = [
-            message
-            for message in self._message_store.list_inbox(self._root_agent_id)
-            if message.status == "unread"
-        ]
-        seen = {message.message_id for message in messages}
-        for message_id in pinned_ids:
-            message = self._message_store.get_message(message_id)
-            if message is None or message.message_id in seen:
-                continue
-            messages.append(message)
-            seen.add(message.message_id)
-        payload = [
-            {
-                "message_id": message.message_id,
-                "from_agent_id": message.from_agent_id,
-                "to_agent_id": message.to_agent_id,
-                "kind": message.kind,
-                "subject": message.subject,
-                "status": message.status,
-                "created_at": message.created_at,
-                "body": _truncate_grounding_message_body(message.body),
-            }
-            for message in messages
-        ]
+        referenced_ids = [item for item in (referenced_message_ids or []) if item]
+        base = self._runtime_access.list_messages(
+            caller_agent_id=self._root_agent_id,
+            to_agent_id=self._root_agent_id,
+            status="unread",
+            include_archived=False,
+        )
+        extra = self._runtime_access.list_messages(
+            caller_agent_id=self._root_agent_id,
+            message_ids=sorted(set(pinned_ids + referenced_ids)),
+            include_archived=True,
+        )
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in base + extra:
+            deduped[item["message_id"]] = item
+        payload = list(deduped.values())
         payload.sort(key=lambda item: (item["created_at"], item["message_id"]), reverse=True)
-        return self._prioritize_items(payload, id_field="message_id", pinned_ids=pinned_ids, limit=limit)
+        return self._prioritize_items(
+            payload,
+            id_field="message_id",
+            pinned_ids=pinned_ids + referenced_ids,
+            limit=limit,
+        )
 
     def _grounding_approvals(self, *, limit: int = _GROUNDING_APPROVAL_LIMIT) -> list[dict[str, Any]]:
-        payload = []
-        for approval in self._approval_store.list_requests():
-            if approval.status != "pending":
-                continue
-            payload.append({
-                "approval_request_id": approval.approval_request_id,
-                "requesting_actor_id": approval.requesting_actor_id,
-                "capability_name": approval.capability_name,
-                "risk_score": approval.risk_score,
-                "designated_approver_id": approval.designated_approver_id,
-                "status": approval.status,
-                "created_at": approval.created_at,
-            })
-        payload.sort(key=lambda item: (item["created_at"], item["approval_request_id"]), reverse=True)
-        return payload[:limit]
+        return self._runtime_access.list_pending_approvals(
+            caller_agent_id=self._root_agent_id,
+            limit=limit,
+        )
 
     def _grounding_events(self, *, limit: int = _GROUNDING_EVENT_LIMIT) -> list[dict[str, Any]]:
-        events = self._event_log.recent_activity(limit=limit)
-        return [
-            {
-                "event_index": event.event_index,
-                "event_type": event.event_type,
-                "actor_id": event.actor_id,
-                "target_id": event.target_id,
-                "status": event.status,
-                "summary": event.summary,
-            }
-            for event in events
-        ]
+        return self._runtime_access.list_recent_events(
+            caller_agent_id=self._root_agent_id,
+            limit=limit,
+        )
 
     def build_runtime_grounding(
         self,
@@ -1500,10 +1576,17 @@ class MR1:
             for item in resolved.values()
             if item.get("kind") == "message"
         ]
+        agents = self._grounding_agents(pinned_agent_ids=pinned_agent_ids)
+        workflows = self._grounding_workflows(pinned_workflow_ids=pinned_workflow_ids)
+        referenced_message_ids = self._grounding_message_ids_from_agents(agents)
+        messages = self._grounding_messages(
+            pinned_message_ids=pinned_message_ids,
+            referenced_message_ids=referenced_message_ids,
+        )
         return {
-            "agents": self._grounding_agents(pinned_agent_ids=pinned_agent_ids),
-            "workflows": self._grounding_workflows(pinned_workflow_ids=pinned_workflow_ids),
-            "messages": self._grounding_messages(pinned_message_ids=pinned_message_ids),
+            "agents": agents,
+            "workflows": workflows,
+            "messages": messages,
             "approvals": self._grounding_approvals(),
             "events": self._grounding_events(),
             "resolved_references": resolved,
@@ -1515,11 +1598,80 @@ class MR1:
             "RUNTIME STATE IS SOURCE OF TRUTH.",
             "If this conflicts with remembered conversation context, trust runtime state.",
             'Resolve references such as "that MR2" using the runtime state first.',
+            "Preview fields may be truncated. If a preview says full_available=true, full detail exists in backend observations even if not shown here.",
             "",
             "=== RUNTIME GROUNDING ===",
             json.dumps(runtime_grounding, indent=2, sort_keys=True),
             "=== END RUNTIME GROUNDING ===",
         ])
+
+    def _format_routing_advice_block(self, route_advice: RouteAdvice) -> str:
+        return "\n".join([
+            "Routing advice is advisory but high priority.",
+            "Do not treat it as an executed command.",
+            "Use it to choose the correct route.",
+            "If you override it, explain why internally in the turn artifact.",
+            "",
+            "=== ROUTING ADVICE ===",
+            json.dumps(route_advice.to_dict(), indent=2, sort_keys=True),
+            "=== END ROUTING ADVICE ===",
+        ])
+
+    @staticmethod
+    def _route_matches_advice(
+        route_advice: Optional[RouteAdvice],
+        *,
+        final_route: str,
+    ) -> bool:
+        if route_advice is None:
+            return True
+        advice_route = route_advice.route
+        if advice_route == "direct_response":
+            return final_route == "direct_answer"
+        if advice_route == "persistent_agent":
+            return final_route == "persistent_delegation"
+        if advice_route == "inspect_existing_state":
+            return final_route in {
+                "inspect_task",
+                "inspect_task_clarify",
+                "inspect_workflow",
+                "inspect_workflow_findings",
+                "inspect_workflow_clarify",
+            }
+        if advice_route == "run_commands":
+            return final_route in {
+                "message_reply",
+                "approval_action",
+                "clarify_bulk_agent_operation",
+                "clarify_reference",
+                "run_commands",
+            }
+        if advice_route in {"create_workflow", "modify_workflow"}:
+            return final_route in {
+                "create_workflow",
+                "modify_workflow",
+                "show_json_preview",
+                "cancel_preview",
+                "confirm_preview",
+            }
+        if advice_route == "ask_clarification":
+            return final_route == "ask_clarification"
+        return final_route == advice_route
+
+    def _route_advice_override_reason(
+        self,
+        route_advice: Optional[RouteAdvice],
+        *,
+        final_route: str,
+    ) -> Optional[str]:
+        if self._route_matches_advice(route_advice, final_route=final_route):
+            return None
+        if route_advice is None:
+            return None
+        return (
+            f"Routing advice suggested '{route_advice.route}' "
+            f"but MR1 executed '{final_route}'."
+        )
 
     def _agent_reference_payload(self, agent) -> dict[str, Any]:
         return {
@@ -1630,7 +1782,8 @@ class MR1:
 
         title_matches: dict[str, list[Any]] = {}
         for agent in visible_agents:
-            title_matches.setdefault(agent.title.lower(), []).append(agent)
+            if agent.status != "terminated":
+                title_matches.setdefault(agent.title.lower(), []).append(agent)
 
         for title, candidates in title_matches.items():
             plain_match = re.search(rf"\b{re.escape(title)}\b", normalized)
@@ -1652,6 +1805,12 @@ class MR1:
                 source = f"that {candidates[0].title}" if that_match else candidates[0].title
                 resolved[source] = self._agent_reference_payload(candidates[0])
                 continue
+            explicit_agent_ids = set(_AGENT_ID_PATTERN.findall(user_input))
+            id_matched = [c for c in candidates if c.agent_id in explicit_agent_ids]
+            if len(id_matched) == 1:
+                source = f"that {id_matched[0].title}" if that_match else id_matched[0].title
+                resolved[source] = self._agent_reference_payload(id_matched[0])
+                continue
             pinned_id = None
             if that_match:
                 pinned_id = self._state.last_referenced_agent_id or self._state.last_created_agent_id
@@ -1672,6 +1831,14 @@ class MR1:
                 resolved["that agent"] = self._agent_reference_payload(agents_by_id[target_id])
             else:
                 missing.append({"reference": "that agent", "kind": "agent"})
+        for alias in _AGENT_CREATED_REFERENCE_ALIASES:
+            if alias not in normalized or alias in resolved:
+                continue
+            target_id = self._state.last_created_agent_id or self._state.last_referenced_agent_id
+            if target_id and target_id in agents_by_id:
+                resolved[alias] = self._agent_reference_payload(agents_by_id[target_id])
+            else:
+                missing.append({"reference": alias, "kind": "agent"})
 
         workflow_alias = "the workflow from earlier"
         if workflow_alias in normalized and workflow_alias not in resolved:
@@ -1694,6 +1861,25 @@ class MR1:
             workflow = workflows_by_id.get(workflow_id)
             if alias in normalized and alias not in resolved and workflow is not None:
                 resolved[alias] = self._workflow_reference_payload(workflow)
+
+        # Generic "kill/terminate all agents" — fires when no title-specific bulk target was
+        # matched but the text clearly asks to kill every agent (e.g. "kill all of them",
+        # "kill all active agents", "kill all agents").
+        if not bulk_targets and not resolved:
+            _kill_all_agents_patterns = (
+                r"\b(?:kill|terminate)\s+all\s+(?:of\s+(?:them|the\s+agents?)|agents?|(?:active|running|current)\s+agents?)\b",
+                r"\b(?:kill|terminate)\s+all\s+of\s+them\b",
+                r"\b(?:kill|terminate)\s+(?:all\s+)?(?:those|these|the)\s+agents?\b",
+                r"\b(?:yes[,.]?\s+)?(?:kill|terminate)\s+(?:all\s+)?(?:them|agents?)\b",
+            )
+            child_agents = [a for a in visible_agents if a.agent_id != self._root_agent_id and a.status != "terminated"]
+            if child_agents and any(re.search(p, normalized) for p in _kill_all_agents_patterns):
+                bulk_targets.append({
+                    "reference": "all agents",
+                    "kind": "agent",
+                    "action": "kill",
+                    "candidates": [self._agent_reference_payload(a) for a in child_agents],
+                })
 
         return {
             "resolved_references": resolved,
@@ -1721,11 +1907,6 @@ class MR1:
             for item in candidates
         )
         action = first.get("action") or "manage"
-        if action in {"kill", "terminate"}:
-            return (
-                f"Bulk agent terminate request matches {len(candidates)} agent(s): {candidate_list}. "
-                "Confirm the exact agent_ids you want me to terminate with /agent kill <ag-id>."
-            )
         return (
             f"Bulk agent reference '{first.get('reference', 'agents')}' matches {len(candidates)} agent(s): "
             f"{candidate_list}. Clarify the exact agent_ids you want me to {action}."
@@ -1756,6 +1937,17 @@ class MR1:
     def _explicit_task_ids(self, user_input: str) -> list[str]:
         return sorted(set(_TASK_ID_PATTERN.findall(user_input)))
 
+    def _explicit_agent_ids(
+        self,
+        user_input: str,
+        resolved_references: dict[str, Any],
+    ) -> list[str]:
+        agent_ids = set(_AGENT_ID_PATTERN.findall(user_input))
+        for payload in resolved_references.values():
+            if payload.get("kind") == "agent" and payload.get("id"):
+                agent_ids.add(str(payload["id"]))
+        return sorted(agent_ids)
+
     def _is_runtime_inspection_request(
         self,
         user_input: str,
@@ -1771,6 +1963,12 @@ class MR1:
         has_intent = has_intent or bool(
             re.search(r"\bwhy\b.*\bfail(?:ed)?\b", normalized)
         )
+        has_intent = has_intent or bool(
+            re.search(r"\bwhy\b.*\b(blocked|stuck|stop(?:ped)?)\b", normalized)
+        )
+        has_intent = has_intent or bool(
+            re.search(r"\bwhy did\b", normalized)
+        )
         suppresses_authoring = any(
             phrase in normalized for phrase in _WORKFLOW_AUTHORING_SUPPRESSION_PHRASES
         )
@@ -1779,8 +1977,11 @@ class MR1:
         return bool(
             self._explicit_workflow_ids(user_input, resolved_references)
             or self._explicit_task_ids(user_input)
+            or self._explicit_agent_ids(user_input, resolved_references)
             or any(alias in normalized for alias in _WORKFLOW_REFERENCE_ALIASES)
+            or any(alias in normalized for alias in _AGENT_REFERENCE_ALIASES)
             or (_has_workflow_pronoun_reference(normalized) and self._state.last_referenced_workflow_id)
+            or ("that agent" in normalized and (self._state.last_referenced_agent_id or self._state.last_created_agent_id))
         )
 
     def _is_workflow_findings_request(self, user_input: str) -> bool:
@@ -2075,11 +2276,29 @@ class MR1:
         lines.extend(status_lines)
         return "\n".join(lines)
 
+    def _resolve_route_local_references(
+        self,
+        user_input: str,
+        runtime_grounding: dict[str, Any],
+    ) -> dict[str, Any]:
+        resolution = self.resolve_runtime_references(user_input, runtime_grounding)
+        for payload in resolution["resolved_references"].values():
+            if payload.get("kind") == "agent":
+                agent = self._scoped_agents.load_agent(payload["id"])
+                if agent is not None:
+                    self._remember_referenced_agent(agent)
+            elif payload.get("kind") == "workflow":
+                workflow = self._workflow_store.load_workflow(payload["id"])
+                if workflow is not None:
+                    self._remember_referenced_workflow(workflow.workflow_id, title=workflow.title)
+        return resolution
+
     def _maybe_route_runtime_inspection(
         self,
         user_input: str,
         *,
         turn_id: str,
+        route_advice: Optional[RouteAdvice] = None,
         runtime_grounding: dict[str, Any],
         resolved_references: dict[str, Any],
         ambiguities: list[dict[str, Any]],
@@ -2088,6 +2307,7 @@ class MR1:
             return None
         task_ids = self._explicit_task_ids(user_input)
         workflow_ids = self._explicit_workflow_ids(user_input, resolved_references)
+        agent_ids = self._explicit_agent_ids(user_input, resolved_references)
         normalized = _normalize_routing_text(user_input)
 
         if len(task_ids) > 1:
@@ -2095,6 +2315,7 @@ class MR1:
                 "Clarify which task you want me to inspect. Provide one task_id like tk-....",
                 turn_id=turn_id,
                 route="inspect_task_clarify",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2104,6 +2325,17 @@ class MR1:
                 "Clarify which workflow you want me to inspect. Provide one workflow_id like wf-....",
                 turn_id=turn_id,
                 route="inspect_workflow_clarify",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        if len(agent_ids) > 1:
+            return self._finalize_turn_response(
+                "Clarify which agent you want me to inspect. Provide one agent_id like ag-....",
+                turn_id=turn_id,
+                route="inspect_agent_clarify",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2116,6 +2348,7 @@ class MR1:
                     f"task not found: {task_id}",
                     turn_id=turn_id,
                     route="inspect_task",
+                    route_advice=route_advice,
                     runtime_grounding=runtime_grounding,
                     resolved_references=resolved_references,
                     ambiguities=ambiguities,
@@ -2124,6 +2357,7 @@ class MR1:
                 self._task_summary_text(workflow.workflow_id, task.task_id),
                 turn_id=turn_id,
                 route="inspect_task",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2134,6 +2368,7 @@ class MR1:
                     self._workflow_findings_text(workflow_ids[0]),
                     turn_id=turn_id,
                     route="inspect_workflow_findings",
+                    route_advice=route_advice,
                     runtime_grounding=runtime_grounding,
                     resolved_references=resolved_references,
                     ambiguities=ambiguities,
@@ -2142,6 +2377,35 @@ class MR1:
                 self._workflow_summary_text(workflow_ids[0]),
                 turn_id=turn_id,
                 route="inspect_workflow",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+        if agent_ids:
+            try:
+                agent = self._scoped_agents.get_visible_agent(self._root_agent_id, agent_ids[0])
+            except (ValueError, AgentScopeError):
+                return self._finalize_turn_response(
+                    f"agent not found: {agent_ids[0]}",
+                    turn_id=turn_id,
+                    route="inspect_agent",
+                    route_advice=route_advice,
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+            self._remember_referenced_agent(agent)
+            return self._finalize_turn_response(
+                workflow_cli._format_agent(
+                    self._runtime_access.read_agent(
+                        agent.agent_id,
+                        caller_agent_id=self._root_agent_id,
+                    ),
+                ),
+                turn_id=turn_id,
+                route="inspect_agent",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2157,6 +2421,7 @@ class MR1:
                         self._workflow_findings_text(remembered_workflow_id),
                         turn_id=turn_id,
                         route="inspect_workflow_findings",
+                        route_advice=route_advice,
                         runtime_grounding=runtime_grounding,
                         resolved_references=resolved_references,
                         ambiguities=ambiguities,
@@ -2165,6 +2430,7 @@ class MR1:
                     self._workflow_summary_text(remembered_workflow_id),
                     turn_id=turn_id,
                     route="inspect_workflow",
+                    route_advice=route_advice,
                     runtime_grounding=runtime_grounding,
                     resolved_references=resolved_references,
                     ambiguities=ambiguities,
@@ -2173,6 +2439,45 @@ class MR1:
                 "Which workflow do you mean? Provide a workflow_id like wf-....",
                 turn_id=turn_id,
                 route="inspect_workflow_clarify",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+        if any(alias in normalized for alias in _AGENT_REFERENCE_ALIASES):
+            remembered_agent_id = (
+                self._state.last_referenced_agent_id
+                or self._state.last_created_agent_id
+            )
+            if remembered_agent_id:
+                try:
+                    agent = self._scoped_agents.get_visible_agent(
+                        self._root_agent_id,
+                        remembered_agent_id,
+                    )
+                except (ValueError, AgentScopeError):
+                    agent = None
+                if agent is not None:
+                    self._remember_referenced_agent(agent)
+                    return self._finalize_turn_response(
+                        workflow_cli._format_agent(
+                            self._runtime_access.read_agent(
+                                agent.agent_id,
+                                caller_agent_id=self._root_agent_id,
+                            ),
+                        ),
+                        turn_id=turn_id,
+                        route="inspect_agent",
+                        route_advice=route_advice,
+                        runtime_grounding=runtime_grounding,
+                        resolved_references=resolved_references,
+                        ambiguities=ambiguities,
+                    )
+            return self._finalize_turn_response(
+                "Which agent do you mean? Provide an agent_id like ag-....",
+                turn_id=turn_id,
+                route="inspect_agent_clarify",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2188,6 +2493,7 @@ class MR1:
                         self._workflow_findings_text(remembered_workflow_id),
                         turn_id=turn_id,
                         route="inspect_workflow_findings",
+                        route_advice=route_advice,
                         runtime_grounding=runtime_grounding,
                         resolved_references=resolved_references,
                         ambiguities=ambiguities,
@@ -2196,6 +2502,7 @@ class MR1:
                     self._workflow_summary_text(remembered_workflow_id),
                     turn_id=turn_id,
                     route="inspect_workflow",
+                    route_advice=route_advice,
                     runtime_grounding=runtime_grounding,
                     resolved_references=resolved_references,
                     ambiguities=ambiguities,
@@ -2208,11 +2515,55 @@ class MR1:
         text = re.sub(r"^\s*(?:and\s+)?provide\s+[A-Za-z0-9_-]+\s+with\s+", "", text, count=1, flags=re.IGNORECASE)
         return text.strip(" \n\t:,-")
 
+    def _should_synthesize_message_reply(self, user_input: str, reply_body: str) -> bool:
+        normalized = _normalize_routing_text(user_input)
+        if not reply_body:
+            return True
+        if any(marker in normalized for marker in _AUTO_REPLY_SYNTHESIS_MARKERS):
+            return True
+        lowered_reply = reply_body.lower()
+        if "message" in lowered_reply and "what you think" in lowered_reply:
+            return True
+        return False
+
+    def _recent_conversation_excerpt(self, *, limit: int = 8) -> str:
+        entries = self._state.conversation[-limit:]
+        lines = []
+        for entry in entries:
+            role = str(entry.get("role", "unknown"))
+            text = _compact_text(entry.get("text", ""), limit=400)
+            if text:
+                lines.append(f"{role}: {text}")
+        return "\n".join(lines) if lines else "-"
+
+    def _compose_message_reply_body(
+        self,
+        user_input: str,
+        message: PersistentMessage,
+        *,
+        runtime_grounding: dict[str, Any],
+    ) -> str:
+        prompt = "\n\n".join([
+            self._format_runtime_grounding_block(runtime_grounding),
+            "Compose the exact message body MR1 should send to a child agent.",
+            "Answer the child agent's pending question directly.",
+            "If the user delegated judgment, make reasonable assumptions from the recent conversation instead of asking another clarification question.",
+            "Do not add meta commentary. Do not mention that you are inferring. Return only the reply body text.",
+            f"Original child message subject:\n{message.subject}",
+            f"Original child message body:\n{message.body}",
+            f"Recent conversation:\n{self._recent_conversation_excerpt()}",
+            f"User instruction for the reply:\n{user_input}",
+        ])
+        raw = self._send_to_brain(prompt)
+        text, _ = self._parse_response(raw)
+        return text.strip()
+
     def _maybe_route_message_reply(
         self,
         user_input: str,
         *,
         turn_id: str,
+        route_advice: Optional[RouteAdvice] = None,
         runtime_grounding: dict[str, Any],
         resolved_references: dict[str, Any],
         ambiguities: list[dict[str, Any]],
@@ -2234,11 +2585,18 @@ class MR1:
         if child is None or not self._scoped_agents.is_visible(self._root_agent_id, child.agent_id):
             return None
         reply_body = self._extract_message_reply_body(user_input, message.message_id)
+        if self._should_synthesize_message_reply(user_input, reply_body):
+            reply_body = self._compose_message_reply_body(
+                user_input,
+                message,
+                runtime_grounding=runtime_grounding,
+            )
         if not reply_body:
             return self._finalize_turn_response(
                 "I need the clarification text to send back to that child message.",
                 turn_id=turn_id,
                 route="message_reply",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2257,6 +2615,7 @@ class MR1:
             f"sent clarification to {child.agent_id} for {message.message_id}",
             turn_id=turn_id,
             route="message_reply",
+            route_advice=route_advice,
             runtime_grounding=runtime_grounding,
             resolved_references=resolved_references,
             ambiguities=ambiguities,
@@ -2271,6 +2630,7 @@ class MR1:
         self,
         *,
         turn_id: str,
+        route_advice: Optional[RouteAdvice],
         runtime_grounding: dict[str, Any],
         resolved_references: dict[str, Any],
         ambiguities: list[dict[str, Any]],
@@ -2278,10 +2638,332 @@ class MR1:
     ) -> Optional[str]:
         if not bulk_targets:
             return None
+        first = bulk_targets[0]
+        action = first.get("action") or "manage"
+        if action in {"kill", "terminate"}:
+            candidates = first.get("candidates", [])
+            terminated = []
+            errors = []
+            for candidate in candidates:
+                agent_id = candidate.get("id")
+                if not agent_id:
+                    continue
+                try:
+                    self._scoped_agents.terminate_agent(self._root_agent_id, agent_id)
+                    terminated.append(agent_id)
+                except (ValueError, AgentScopeError) as exc:
+                    errors.append(f"{agent_id}: {exc}")
+            parts = [f"Terminated {len(terminated)} agent(s): {', '.join(terminated)}."] if terminated else []
+            if errors:
+                parts.append(f"Errors: {'; '.join(errors)}")
+            msg = " ".join(parts) if parts else "No agents terminated."
+            return self._finalize_turn_response(
+                msg,
+                turn_id=turn_id,
+                route="run_commands",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
         return self._finalize_turn_response(
             self._format_bulk_agent_target_clarification(bulk_targets),
             turn_id=turn_id,
             route="clarify_bulk_agent_operation",
+            route_advice=route_advice,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+
+    def _apply_approval_decision(
+        self,
+        approval_request_id: str,
+        *,
+        decision_text: str,
+        reason: str,
+        grant_scope: bool = False,
+    ):
+        workflow_cli._require_visible_approval(
+            self._approval_store,
+            approval_request_id,
+            self._scoped_agents,
+            self._root_agent_id,
+        )
+        decision = CapabilityApprovalDecision(
+            approval_request_id=approval_request_id,
+            decision=decision_text,
+            decided_by=self._root_agent_id,
+            reason=reason,
+            timestamp=time.time(),
+            approval_scope="grant_scope" if grant_scope else "single_use",
+        )
+        updated = self._approval_store.apply_decision(
+            approval_request_id,
+            decision=decision,
+            scoped_agent_store=self._scoped_agents,
+        )
+        if (
+            updated.requesting_actor_id != self._root_agent_id
+            and self._message_store.can_agent_send_message(
+                self._root_agent_id,
+                updated.requesting_actor_id,
+            )
+        ):
+            try:
+                self._message_store.create_message(
+                    from_agent_id=self._root_agent_id,
+                    to_agent_id=updated.requesting_actor_id,
+                    kind="request",
+                    subject=f"Capability approval {updated.status}: {updated.capability_name}",
+                    body=(
+                        f"Approval request {updated.approval_request_id} is now {updated.status}. "
+                        f"Reason: {reason}. "
+                        "Retry or continue your capability step accordingly."
+                    ),
+                    workflow_id=updated.workflow_id,
+                    task_id=updated.task_id,
+                )
+            except ValueError:
+                pass
+        return updated
+
+    def _parse_run_command_approval_intent(
+        self,
+        user_input: str,
+        *,
+        resolved_references: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        normalized = _normalize_routing_text(user_input)
+        action = None
+        if re.search(r"\bapprove\b", normalized):
+            action = "approved"
+        elif re.search(r"\bdeny\b", normalized):
+            action = "denied"
+        if action is None:
+            return None
+        approval_ids = _APPROVAL_ID_PATTERN.findall(user_input)
+        approval_request_id = approval_ids[0] if approval_ids else None
+        if approval_request_id is None and len(runtime_grounding_approvals := self._grounding_approvals(limit=1)) == 1:
+            approval_request_id = runtime_grounding_approvals[0]["approval_request_id"]
+        if approval_request_id is None:
+            return None
+        reason = "approved" if action == "approved" else "denied"
+        grant_scope = "--grant-scope" in user_input or "grant scope" in normalized
+        reason_match = re.search(r"(?:because|reason)\s+(.+)$", user_input.strip(), re.IGNORECASE)
+        if reason_match:
+            candidate_reason = reason_match.group(1).strip(" .")
+            if candidate_reason:
+                reason = candidate_reason
+        return {
+            "approval_request_id": approval_request_id,
+            "decision_text": action,
+            "reason": reason,
+            "grant_scope": grant_scope,
+        }
+
+    def _parse_workflow_rerun_intent(
+        self,
+        user_input: str,
+        *,
+        resolved_references: dict[str, Any],
+        runtime_grounding: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        normalized = _normalize_routing_text(user_input)
+        if not re.search(r"\b(rerun|re-run|retry|restart)\b", normalized):
+            return None
+        workflow_ids = _WORKFLOW_ID_PATTERN.findall(user_input)
+        workflow_id = workflow_ids[0] if workflow_ids else None
+        if workflow_id is None:
+            for ref in resolved_references.values():
+                if ref.get("kind") == "workflow":
+                    workflow_id = ref.get("id")
+                    break
+        if workflow_id is None:
+            owned = runtime_grounding.get("workflows", [])
+            failed = [w for w in owned if w.get("status") == "failed"]
+            if len(failed) == 1:
+                workflow_id = failed[0].get("workflow_id")
+        if workflow_id is None:
+            return None
+        return {"workflow_id": workflow_id}
+
+    def _parse_run_command_agent_action(
+        self,
+        user_input: str,
+        *,
+        resolved_references: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        normalized = _normalize_routing_text(user_input)
+        action = None
+        if re.search(r"\b(kill|terminate)\b", normalized):
+            action = "terminate"
+        elif re.search(r"\bresume\b", normalized):
+            action = "resume"
+        elif re.search(r"\b(message|send|ask)\b", normalized):
+            action = "message"
+        if action is None:
+            return None
+        agent_payloads = [
+            payload
+            for payload in resolved_references.values()
+            if payload.get("kind") == "agent"
+        ]
+        if len(agent_payloads) != 1:
+            return None
+        return {
+            "action": action,
+            "agent_id": agent_payloads[0]["id"],
+        }
+
+    def _route_run_commands(
+        self,
+        user_input: str,
+        *,
+        turn_id: str,
+        route_advice: RouteAdvice,
+        runtime_grounding: dict[str, Any],
+    ) -> str:
+        resolution = self._resolve_route_local_references(user_input, runtime_grounding)
+        resolved_references = resolution["resolved_references"]
+        ambiguities = resolution["ambiguities"]
+        bulk_targets = list(resolution.get("bulk_targets", []))
+
+        bulk_result = self._maybe_route_bulk_agent_operation(
+            turn_id=turn_id,
+            route_advice=route_advice,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+            bulk_targets=bulk_targets,
+        )
+        if bulk_result is not None:
+            return bulk_result
+
+        if ambiguities:
+            return self._finalize_turn_response(
+                self._format_reference_ambiguity(ambiguities),
+                turn_id=turn_id,
+                route="clarify_reference",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+
+        reply_result = self._maybe_route_message_reply(
+            user_input,
+            turn_id=turn_id,
+            route_advice=route_advice,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+        if reply_result is not None:
+            return reply_result
+
+        approval_intent = self._parse_run_command_approval_intent(
+            user_input,
+            resolved_references=resolved_references,
+        )
+        if approval_intent is not None:
+            try:
+                updated = self._apply_approval_decision(**approval_intent)
+            except (ValueError, AgentScopeError) as exc:
+                return self._finalize_turn_response(
+                    str(exc),
+                    turn_id=turn_id,
+                    route="approval_action",
+                    route_advice=route_advice,
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+            return self._finalize_turn_response(
+                workflow_cli._format_approval_decision_result(
+                    updated,
+                    grant_scope=approval_intent["grant_scope"],
+                ),
+                turn_id=turn_id,
+                route="approval_action",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+                full_payload=json.dumps({
+                    "approval_request_id": updated.approval_request_id,
+                    "status": updated.status,
+                    "decision": updated.decision,
+                }, indent=2, sort_keys=True),
+            )
+
+        rerun_intent = self._parse_workflow_rerun_intent(
+            user_input,
+            resolved_references=resolved_references,
+            runtime_grounding=runtime_grounding,
+        )
+        if rerun_intent is not None:
+            workflow_id = rerun_intent["workflow_id"]
+            try:
+                wf = self._workflow_store.load_workflow(workflow_id)
+                if wf is None:
+                    raise WorkflowSpecError(f"workflow not found: {workflow_id}")
+                failed_tasks = [t for t in wf.tasks if t.status in ("failed", "blocked")]
+                if not failed_tasks:
+                    raise WorkflowSpecError(f"no failed or blocked tasks in {workflow_id}")
+                rerun_ids = []
+                for task in failed_tasks:
+                    tid = rerun_task_on_disk(self._workflow_store, workflow_id, task.task_id, agent_id=self._root_agent_id)
+                    rerun_ids.append(tid)
+                msg = f"Requeued {len(rerun_ids)} task(s) in {workflow_id}: {', '.join(rerun_ids)}"
+            except WorkflowSpecError as exc:
+                msg = f"rerun failed: {exc}"
+            return self._finalize_turn_response(
+                msg,
+                turn_id=turn_id,
+                route="run_commands",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+
+        agent_action = self._parse_run_command_agent_action(
+            user_input,
+            resolved_references=resolved_references,
+        )
+        if agent_action is not None:
+            if agent_action["action"] == "terminate":
+                try:
+                    agent = self._scoped_agents.terminate_agent(
+                        self._root_agent_id,
+                        agent_action["agent_id"],
+                    )
+                except (ValueError, AgentScopeError) as exc:
+                    return self._finalize_turn_response(
+                        str(exc),
+                        turn_id=turn_id,
+                        route="run_commands",
+                        route_advice=route_advice,
+                        runtime_grounding=runtime_grounding,
+                        resolved_references=resolved_references,
+                        ambiguities=ambiguities,
+                    )
+                return self._finalize_turn_response(
+                    f"terminated agent: {agent.agent_id}",
+                    turn_id=turn_id,
+                    route="run_commands",
+                    route_advice=route_advice,
+                    runtime_grounding=runtime_grounding,
+                    resolved_references=resolved_references,
+                    ambiguities=ambiguities,
+                )
+
+        return self._finalize_turn_response(
+            "I need the exact execute-now command details to run this operation safely.",
+            turn_id=turn_id,
+            route="ask_clarification",
+            route_advice=route_advice,
             runtime_grounding=runtime_grounding,
             resolved_references=resolved_references,
             ambiguities=ambiguities,
@@ -2299,20 +2981,169 @@ class MR1:
         self,
         user_input: str,
         runtime_grounding: dict[str, Any],
+        route_advice: RouteAdvice,
     ) -> dict[str, str]:
-        grounding_block = self._format_runtime_grounding_block(runtime_grounding)
-        prompt = "\n\n".join([
-            grounding_block,
+        observation_payloads: list[dict[str, Any]] = []
+        last_prompt = ""
+        last_raw = ""
+        for attempt in range(_MAX_OBSERVATION_ROUNDS + 1):
+            prompt = self._build_direct_answer_prompt(
+                user_input,
+                runtime_grounding,
+                route_advice,
+                observation_payloads=observation_payloads,
+            )
+            raw = self._send_to_brain(prompt)
+            last_prompt = prompt
+            last_raw = raw
+            observation_request = parse_observation_request(raw)
+            if observation_request.status == "none":
+                text, _ = self._parse_response(raw)
+                return {
+                    "text": text,
+                    "brain_prompt": prompt,
+                    "brain_response": raw,
+                    "full_payload": prompt,
+                }
+            if attempt >= _MAX_OBSERVATION_ROUNDS:
+                break
+            if observation_request.status == "invalid":
+                observation_payloads.append(
+                    invalid_observation_result(
+                        observation_request.error or "invalid observation request",
+                    )
+                )
+                continue
+            observation_payloads.append(
+                execute_observation_request(
+                    observation_request.request,
+                    self._runtime_access,
+                    caller_agent_id=self._root_agent_id,
+                )
+            )
+        return {
+            "text": "MR1 could not safely inspect additional runtime detail for this answer.",
+            "brain_prompt": last_prompt,
+            "brain_response": last_raw,
+            "full_payload": last_prompt,
+        }
+
+    def _build_direct_answer_prompt(
+        self,
+        user_input: str,
+        runtime_grounding: dict[str, Any],
+        route_advice: RouteAdvice,
+        *,
+        observation_payloads: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
+        parts = [
+            self._format_runtime_grounding_block(runtime_grounding),
+            self._format_routing_advice_block(route_advice),
+        ]
+        for payload in observation_payloads or []:
+            parts.append(format_observation_results_block(payload))
+        if observation_payloads:
+            parts.append(
+                "Use the observation results above when answering. "
+                "Do not emit another OBSERVE block unless you still need additional read-only runtime detail."
+            )
+        parts.extend([
             "Answer this request directly. Do not delegate to MR2 or Kazi.",
             f"User request:\n{user_input}",
         ])
-        raw = self._send_to_brain(prompt)
-        text, _ = self._parse_response(raw)
+        return "\n\n".join(parts)
+
+    def _build_persistent_agent_design_prompt(
+        self,
+        user_input: str,
+        runtime_grounding: dict[str, Any],
+        route_advice: RouteAdvice,
+    ) -> str:
+        parts = [
+            self._format_runtime_grounding_block(runtime_grounding),
+            self._format_routing_advice_block(route_advice),
+            "\n".join([
+                "Design the persistent agent requested below.",
+                "First line of your response must be exactly: AGENT_TITLE: <title>",
+                "Choose a purpose-driven title that reflects the agent's responsibility (e.g. Genesis, Sentinel, Auditor).",
+                "Then write the complete mission: what the agent owns, how it operates, its scope, escalation rules, and first actions.",
+            ]),
+            f"User request:\n{user_input}",
+        ]
+        return "\n\n".join(parts)
+
+    def _design_and_delegate_persistent_agent(
+        self,
+        user_input: str,
+        runtime_grounding: dict[str, Any],
+        route_advice: RouteAdvice,
+    ) -> dict[str, str]:
+        design_prompt = self._build_persistent_agent_design_prompt(
+            user_input, runtime_grounding, route_advice
+        )
+        raw = self._send_to_brain(design_prompt)
+        design_text, _ = self._parse_response(raw)
+
+        first_line = (design_text or "").split("\n")[0].strip()
+        if first_line.upper().startswith("AGENT_TITLE:"):
+            agent_title = first_line.split(":", 1)[1].strip() or self._extract_requested_child_title(user_input)
+            mission_body = (design_text[len(first_line):]).strip()
+        else:
+            agent_title = self._extract_requested_child_title(user_input)
+            mission_body = design_text or ""
+
+        try:
+            parent_agent = self._scoped_agents.require_agent(self._root_agent_id)
+            agent = self._scoped_agents.create_child_agent(self._root_agent_id, agent_title)
+            assignment_packet = build_assignment_packet(
+                parent_agent,
+                agent.title,
+                user_input,
+                {
+                    **self._build_persistent_delegation_context(),
+                    "assigned_clearance": agent.security_clearance,
+                },
+            )
+            mission = mission_body or render_assignment_mission(assignment_packet) or ""
+            agent = self._scoped_agents.assign_mission(
+                self._root_agent_id,
+                agent.agent_id,
+                mission,
+                assignment_packet=assignment_packet,
+            )
+        except (ValueError, AgentScopeError) as exc:
+            return {"text": str(exc), "brain_prompt": design_prompt, "brain_response": raw}
+
+        self._remember_created_agent(agent)
+        self._remember_referenced_agent(agent)
+
+        runner = MRnRunRunner(
+            workflow_store=self._workflow_store,
+            scoped_agent_store=self._scoped_agents,
+            message_store=self._message_store,
+        )
+        policy = MRnRunPolicy(
+            max_steps=3,
+            max_workflows_created=2,
+            require_confirmation_for_workflows=True,
+        )
+        try:
+            result = runner.run(
+                agent.agent_id,
+                policy,
+                caller_agent_id=self._root_agent_id,
+            )
+        except (ValueError, AgentScopeError) as exc:
+            return {"text": str(exc), "brain_prompt": design_prompt, "brain_response": raw}
+
+        self._state.add_decision(user_input, "spawn_persistent_mr2", agent.agent_id)
         return {
-            "text": text,
-            "brain_prompt": prompt,
+            "text": "\n".join([
+                f"delegated to persistent agent: {agent.agent_id} ({agent.title})",
+                workflow_cli._format_mrn_run_result(result),
+            ]),
+            "brain_prompt": design_prompt,
             "brain_response": raw,
-            "full_payload": prompt,
         }
 
     def _run_workflow_compiler(self, system_prompt: str, message: str) -> str:
@@ -2400,47 +3231,126 @@ class MR1:
             pending_draft=pending_draft,
         )
 
-    @staticmethod
-    def _extract_requested_child_title(user_input: str) -> str:
+    def _extract_requested_child_title(self, user_input: str) -> str:
         for pattern in _PERSISTENT_CHILD_TITLE_PATTERNS:
             match = pattern.search(user_input)
             if match:
                 return match.group(1).upper()
+        generic_named_match = re.search(
+            r"\bnamed\s+([A-Za-z][A-Za-z0-9_-]{1,63})\b",
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if generic_named_match:
+            return generic_named_match.group(1)
         fallback_matches = re.findall(r"\b(MR\d+)\b", user_input, flags=re.IGNORECASE)
         for item in fallback_matches:
             normalized = item.upper()
             if normalized != "MR1":
                 return normalized
+        normalized = _normalize_routing_text(user_input)
+        if any(
+            marker in normalized
+            for marker in (
+                "unique special name",
+                "special name",
+                "unique name",
+                "memorable name",
+                "easily referencable",
+                "easily referenceable",
+            )
+        ):
+            existing_titles = {
+                agent.title.lower()
+                for agent in self._scoped_agents.list_visible_agents(self._root_agent_id)
+            }
+            for candidate in _DEFAULT_PERSISTENT_CHILD_TITLES:
+                if candidate.lower() not in existing_titles:
+                    return candidate
         return "MR2"
 
-    def _build_persistent_delegation_mission(self, user_input: str, *, agent_title: str) -> str:
-        return "\n".join([
-            f"You are a persistent {agent_title}-style child agent.",
-            "Own the requested domain/responsibility instead of treating it as a one-shot execution.",
-            "",
-            "Parent request:",
-            user_input.strip(),
-            "",
-            "Operating instructions:",
-            "- Treat this as an ownership/delegation request.",
-            "- You are already the delegated child created for this request; do not create another child agent unless the parent explicitly asks in a follow-up.",
-            "- Prefer creating workflows for execution when appropriate.",
-            "- Keep responsibility for proposal quality, safety review, creation, and testing.",
-            "- Use workflow creation when execution should become structured work.",
-            "- Escalate to MR1/user when clarification or confirmation is needed.",
-        ])
+    def _build_persistent_delegation_context(self) -> dict[str, Any]:
+        agent_ids: list[str] = []
+        seen_agent_ids: set[str] = set()
+        for agent_id in (
+            self._root_agent_id,
+            self._state.last_referenced_agent_id,
+            self._state.last_created_agent_id,
+        ):
+            if not agent_id or agent_id in seen_agent_ids:
+                continue
+            if self._scoped_agents.load_agent(agent_id) is None:
+                continue
+            seen_agent_ids.add(agent_id)
+            agent_ids.append(agent_id)
+
+        workflow_ids: list[str] = []
+        seen_workflow_ids: set[str] = set()
+        for workflow_id in (
+            self._state.last_referenced_workflow_id,
+            self._state.last_created_workflow_id,
+        ):
+            if not workflow_id or workflow_id in seen_workflow_ids:
+                continue
+            workflow = self._workflow_store.load_workflow(workflow_id)
+            if workflow is None:
+                continue
+            seen_workflow_ids.add(workflow_id)
+            workflow_ids.append(workflow_id)
+
+        message_ids: list[str] = []
+        seen_message_ids: set[str] = set()
+        recent_messages = (
+            self._message_store.list_inbox(self._root_agent_id)[:3]
+            + self._message_store.list_outbox(self._root_agent_id)[:3]
+        )
+        for message in recent_messages:
+            if message.message_id in seen_message_ids:
+                continue
+            seen_message_ids.add(message.message_id)
+            message_ids.append(message.message_id)
+
+        return {
+            "agents": agent_ids,
+            "messages": message_ids,
+            "workflows": workflow_ids,
+            "reason_for_delegation": (
+                "The parent delegated this work so the child can own the requested domain and operate persistently."
+            ),
+            "constraints": [
+                "Treat this as an ownership/delegation request.",
+                "Do not create another child agent unless the parent explicitly asks in a follow-up.",
+                "Default to reasonable assumptions from the parent request and recent runtime context; ask the parent only when a missing decision is genuinely blocking or high risk.",
+            ],
+            "success_criteria": [
+                "Own the delegated domain and keep responsibility for proposal quality, safety review, creation, and testing.",
+                "Prefer workflow creation when execution should become structured work.",
+                "Escalate to MR1/user when clarification or confirmation is needed.",
+            ],
+            "escalation_rules": (
+                "Escalate to MR1/user when clarification, confirmation, approval, or scope expansion is required."
+            ),
+        }
 
     def _route_to_persistent_delegation(self, user_input: str) -> str:
         agent_title = self._extract_requested_child_title(user_input)
         try:
+            parent_agent = self._scoped_agents.require_agent(self._root_agent_id)
             agent = self._scoped_agents.create_child_agent(self._root_agent_id, agent_title)
+            assignment_packet = build_assignment_packet(
+                parent_agent,
+                agent.title,
+                user_input,
+                {
+                    **self._build_persistent_delegation_context(),
+                    "assigned_clearance": agent.security_clearance,
+                },
+            )
             agent = self._scoped_agents.assign_mission(
                 self._root_agent_id,
                 agent.agent_id,
-                self._build_persistent_delegation_mission(
-                    user_input,
-                    agent_title=agent.title,
-                ),
+                render_assignment_mission(assignment_packet) or "",
+                assignment_packet=assignment_packet,
             )
         except (ValueError, AgentScopeError) as exc:
             return str(exc)
@@ -2674,81 +3584,42 @@ class MR1:
         """
         turn_id = self._new_turn_id()
         self._record_conversation("user", user_input)
-        initial_grounding = self.build_runtime_grounding()
-        resolution = self.resolve_runtime_references(user_input, initial_grounding)
-        runtime_grounding = self.build_runtime_grounding(
-            resolved_references=resolution["resolved_references"],
-            ambiguities=resolution["ambiguities"],
+        runtime_grounding = self.build_runtime_grounding()
+        pending = self._workflow_authoring.coerce_pending_draft(
+            self._state.pending_workflow
         )
-        resolved_references = runtime_grounding["resolved_references"]
-        ambiguities = runtime_grounding["ambiguities"]
-        bulk_targets = list(resolution.get("bulk_targets", []))
-
-        for payload in resolved_references.values():
-            if payload.get("kind") == "agent":
-                agent = self._scoped_agents.load_agent(payload["id"])
-                if agent is not None:
-                    self._remember_referenced_agent(agent)
-            if payload.get("kind") == "workflow":
-                workflow = self._workflow_store.load_workflow(payload["id"])
-                if workflow is not None:
-                    self._remember_referenced_workflow(workflow.workflow_id, title=workflow.title)
-
-        reply_result = self._maybe_route_message_reply(
+        pending_state = None if pending is None else {"mode": pending.mode}
+        route_advice = build_route_advice(
             user_input,
-            turn_id=turn_id,
             runtime_grounding=runtime_grounding,
-            resolved_references=resolved_references,
-            ambiguities=ambiguities,
+            pending_state=pending_state,
         )
-        if reply_result is not None:
-            return reply_result
+        resolved_references: dict[str, Any] = {}
+        ambiguities: list[dict[str, Any]] = []
 
-        bulk_result = self._maybe_route_bulk_agent_operation(
-            turn_id=turn_id,
-            runtime_grounding=runtime_grounding,
-            resolved_references=resolved_references,
-            ambiguities=ambiguities,
-            bulk_targets=bulk_targets,
-        )
-        if bulk_result is not None:
-            return bulk_result
-
-        if ambiguities:
+        if route_advice.route == "ask_clarification":
             return self._finalize_turn_response(
-                self._format_reference_ambiguity(ambiguities),
+                "Clarify the exact action you want me to take.",
                 turn_id=turn_id,
-                route="clarify_reference",
+                route="ask_clarification",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
             )
 
-        inspection_result = self._maybe_route_runtime_inspection(
-            user_input,
-            turn_id=turn_id,
-            runtime_grounding=runtime_grounding,
-            resolved_references=resolved_references,
-            ambiguities=ambiguities,
-        )
-        if inspection_result is not None:
-            return inspection_result
-
-        pending = self._workflow_authoring.coerce_pending_draft(
-            self._state.pending_workflow
-        )
-        action = self._classify_turn_route(
-            user_input,
-            pending,
-        )
-
-        if action == "direct_answer":
+        if route_advice.route == "direct_response":
             self._state.add_decision(user_input, "direct_answer")
-            answer = self._answer_directly_with_grounding(user_input, runtime_grounding)
+            answer = self._answer_directly_with_grounding(
+                user_input,
+                runtime_grounding,
+                route_advice,
+            )
             return self._finalize_turn_response(
                 answer["text"],
                 turn_id=turn_id,
                 route="direct_answer",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2757,15 +3628,76 @@ class MR1:
                 full_payload=answer["full_payload"],
             )
 
-        if action == "persistent_delegation":
+        if route_advice.route == "persistent_agent":
+            answer = self._design_and_delegate_persistent_agent(
+                user_input, runtime_grounding, route_advice
+            )
             return self._finalize_turn_response(
-                self._route_to_persistent_delegation(user_input),
+                answer["text"],
                 turn_id=turn_id,
                 route="persistent_delegation",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+                brain_prompt=answer["brain_prompt"],
+                brain_response=answer["brain_response"],
+            )
+
+        if route_advice.route == "run_commands":
+            return self._route_run_commands(
+                user_input,
+                turn_id=turn_id,
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+            )
+
+        if route_advice.route == "inspect_existing_state":
+            resolution = self._resolve_route_local_references(user_input, runtime_grounding)
+            resolved_references = resolution["resolved_references"]
+            ambiguities = resolution["ambiguities"]
+            inspection_result = self._maybe_route_runtime_inspection(
+                user_input,
+                turn_id=turn_id,
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
             )
+            if inspection_result is not None:
+                return inspection_result
+            return self._finalize_turn_response(
+                "Clarify which existing workflow or task you want me to inspect.",
+                turn_id=turn_id,
+                route="ask_clarification",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+
+        resolution = self._resolve_route_local_references(user_input, runtime_grounding)
+        resolved_references = resolution["resolved_references"]
+        ambiguities = resolution["ambiguities"]
+        if ambiguities:
+            return self._finalize_turn_response(
+                self._format_reference_ambiguity(ambiguities),
+                turn_id=turn_id,
+                route="clarify_reference",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+
+        action = self._workflow_authoring.classify_request(
+            user_input,
+            pending_draft=pending,
+        )
+        if route_advice.route == "modify_workflow" and action == "create_workflow":
+            action = "modify_workflow"
+        if route_advice.route == "create_workflow" and action == "modify_workflow" and pending is None:
+            action = "create_workflow"
 
         if action == "show_json_preview":
             if pending is None:
@@ -2773,6 +3705,7 @@ class MR1:
                     "No pending workflow draft.",
                     turn_id=turn_id,
                     route="show_json_preview",
+                    route_advice=route_advice,
                     runtime_grounding=runtime_grounding,
                     resolved_references=resolved_references,
                     ambiguities=ambiguities,
@@ -2781,6 +3714,7 @@ class MR1:
                 json.dumps(pending.spec, indent=2),
                 turn_id=turn_id,
                 route="show_json_preview",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2794,6 +3728,7 @@ class MR1:
                 "Cancelled pending workflow draft.",
                 turn_id=turn_id,
                 route="cancel_preview",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2805,6 +3740,7 @@ class MR1:
                     "No pending workflow draft.",
                     turn_id=turn_id,
                     route="confirm_preview",
+                    route_advice=route_advice,
                     runtime_grounding=runtime_grounding,
                     resolved_references=resolved_references,
                     ambiguities=ambiguities,
@@ -2837,12 +3773,13 @@ class MR1:
                 result.message,
                 turn_id=turn_id,
                 route="confirm_preview",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
             )
 
-        mode = "modify" if action == "modify_workflow" else "create"
+        mode = "modify" if route_advice.route == "modify_workflow" else "create"
         target_workflow_id = (
             self._workflow_authoring.extract_workflow_id(user_input)
             or self._resolved_workflow_target_id(resolved_references)
@@ -2857,7 +3794,8 @@ class MR1:
                 return self._finalize_turn_response(
                     f"workflow not found: {target_workflow_id}",
                     turn_id=turn_id,
-                    route=action,
+                    route=f"{mode}_workflow",
+                    route_advice=route_advice,
                     runtime_grounding=runtime_grounding,
                     resolved_references=resolved_references,
                     ambiguities=ambiguities,
@@ -2873,7 +3811,8 @@ class MR1:
                     target_workflow_id=target_workflow_id,
                 ),
                 turn_id=turn_id,
-                route=action,
+                route="modify_workflow",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2896,7 +3835,8 @@ class MR1:
                     target_workflow_id=target_workflow_id,
                 ),
                 turn_id=turn_id,
-                route=action,
+                route=f"{mode}_workflow",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2925,7 +3865,8 @@ class MR1:
             return self._finalize_turn_response(
                 result.message,
                 turn_id=turn_id,
-                route=action,
+                route=f"{mode}_workflow",
+                route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
@@ -2957,7 +3898,8 @@ class MR1:
         return self._finalize_turn_response(
             self._format_authoring_preview(authoring),
             turn_id=turn_id,
-            route=action,
+            route=f"{mode}_workflow",
+            route_advice=route_advice,
             runtime_grounding=runtime_grounding,
             resolved_references=resolved_references,
             ambiguities=ambiguities,
@@ -3394,6 +4336,37 @@ class MR1:
         if cmd == "/scheduler tick":
             self._scheduler.tick()
             return "scheduler ticked."
+        if cmd == "/help":
+            return (
+                "Commands: /status  /tasks  /kill  /stop  /history  /memdltr  "
+                "/workflows  /watchers  /capabilities  /capability <name>  "
+                "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  "
+                "/agent step <ag-id>  /agent run <ag-id> --steps N  "
+                "/inbox  /outbox  /message <id>  /approvals  /schema  "
+                "/vizualize  /visualize-web  /clear  /help  /exit  "
+                "/test spawn agents <h>  /test kill agents"
+            )
+        if cmd == "/clear":
+            print("\033[2J\033[H", end="", flush=True)
+            return ""
+        if cmd == "/stop":
+            running_synthetic = self._running_test_agent_count()
+            killed = self._spawner.kill_all("user_stop")
+            self.kill_test_agents()
+            synthetic_killed = running_synthetic
+            for tid in list(self._state.active_tasks):
+                self._state.complete_task(tid, "killed")
+            total = killed + synthetic_killed
+            if total == 0:
+                return (
+                    "No running spawned processes/test agents to stop. "
+                    "Persistent agents are not affected. "
+                    "Use /agent kill <ag-id> to terminate a persistent agent."
+                )
+            return (
+                f"Stopped {total} spawned process/test agent(s). "
+                "Persistent MRn agents are not affected."
+            )
         return None
 
     def _handle_capability_builtin(self, cmd: str) -> str:
@@ -3586,14 +4559,14 @@ class MR1:
             if len(positionals) != 1:
                 return "usage: /agent <ag-id>"
             try:
-                agent = self._scoped_agents.get_visible_agent(self._root_agent_id, agent_name)
+                agent = self._runtime_access.read_agent(
+                    agent_name,
+                    caller_agent_id=self._root_agent_id,
+                )
             except (ValueError, AgentScopeError) as exc:
                 return str(exc)
             return workflow_cli._format_agent(
                 agent,
-                reports=self._scoped_agents.list_reports(agent.agent_id),
-                message_store=self._message_store,
-                workflow_store=self._workflow_store,
                 json_output="--json" in flags,
                 brief="--brief" in flags,
             )
@@ -3822,10 +4795,14 @@ class MR1:
         if len(positionals) != 1:
             return "usage: /message <message_id>"
         try:
-            message = workflow_cli._require_message(
+            workflow_cli._require_message(
                 self._message_store,
                 positionals[0],
                 self._root_agent_id,
+            )
+            message = self._runtime_access.read_message(
+                positionals[0],
+                caller_agent_id=self._root_agent_id,
             )
         except (ValueError, AgentScopeError) as exc:
             return str(exc)
@@ -3895,50 +4872,14 @@ class MR1:
             return usage
 
         try:
-            workflow_cli._require_visible_approval(
-                self._approval_store,
+            updated = self._apply_approval_decision(
                 approval_request_id,
-                self._scoped_agents,
-                self._root_agent_id,
-            )
-            decision = CapabilityApprovalDecision(
-                approval_request_id=approval_request_id,
-                decision="approved" if subcommand == "approve" else "denied",
-                decided_by=self._root_agent_id,
+                decision_text="approved" if subcommand == "approve" else "denied",
                 reason=reason,
-                timestamp=time.time(),
-                approval_scope="grant_scope" if grant_scope else "single_use",
-            )
-            updated = self._approval_store.apply_decision(
-                approval_request_id,
-                decision=decision,
-                scoped_agent_store=self._scoped_agents,
+                grant_scope=grant_scope,
             )
         except (ValueError, AgentScopeError) as exc:
             return str(exc)
-        if (
-            updated.requesting_actor_id != self._root_agent_id
-            and self._message_store.can_agent_send_message(
-                self._root_agent_id,
-                updated.requesting_actor_id,
-            )
-        ):
-            try:
-                self._message_store.create_message(
-                    from_agent_id=self._root_agent_id,
-                    to_agent_id=updated.requesting_actor_id,
-                    kind="request",
-                    subject=f"Capability approval {updated.status}: {updated.capability_name}",
-                    body=(
-                        f"Approval request {updated.approval_request_id} is now {updated.status}. "
-                        f"Reason: {reason}. "
-                        "Retry or continue your capability step accordingly."
-                    ),
-                    workflow_id=updated.workflow_id,
-                    task_id=updated.task_id,
-                )
-            except ValueError:
-                pass
         return workflow_cli._format_approval_decision_result(
             updated,
             grant_scope=grant_scope,
@@ -4040,6 +4981,34 @@ class MR1:
     # Main loop
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Chat UI helpers
+    # ------------------------------------------------------------------
+
+    def _list_agent_ids(self) -> list[str]:
+        try:
+            return [a.agent_id for a in self._scoped_agents.list_agents()]
+        except Exception:
+            return []
+
+    def _list_message_ids(self) -> list[str]:
+        try:
+            return [m.message_id for m in self._message_store.list_messages()]
+        except Exception:
+            return []
+
+    def _list_workflow_ids(self) -> list[str]:
+        try:
+            return [w.workflow_id for w in self._workflow_store.list_workflows()]
+        except Exception:
+            return []
+
+    def _list_approval_ids(self) -> list[str]:
+        try:
+            return [a.approval_request_id for a in self._approval_store.list_requests()]
+        except Exception:
+            return []
+
     def run(self) -> None:
         """
         Start MR1 and enter the persistent conversation loop.
@@ -4050,15 +5019,7 @@ class MR1:
 
         print("MR1 Orchestrator v0.2")
         print(f"Session: {self._state.session_id}")
-        print(
-            "Commands: /status  /tasks  /kill  /history  /memdltr  "
-            "/workflows  /watchers  /capabilities  /capability <name>  "
-            "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  "
-            "/agent step <ag-id>  /agent run <ag-id> --steps N  "
-            "/inbox  /outbox  /message <id>  /approvals  /schema  /vizualize  /visualize-web  "
-            "/test spawn agents <h>  /test kill agents"
-        )
-        print("Type 'exit' or Ctrl+C to quit.\n")
+        print("Type /help for commands, 'exit' or Ctrl+C to quit.\n")
 
         def shutdown(killed_by: str = "user") -> None:
             killed = self.shutdown("shutdown")
@@ -4069,27 +5030,85 @@ class MR1:
 
         signal.signal(signal.SIGINT, lambda *_: shutdown("sigint"))
 
-        while True:
+        # Set up enhanced chat input when running interactively.
+        _chat_input = None
+        _trace_emitter = None
+        if sys.stdin.isatty():
             try:
-                user_input = input("\nyou > ").strip()
-            except EOFError:
-                shutdown("eof")
+                from mr1.chat_input import ChatInput
+                _chat_input = ChatInput(id_fetchers={
+                    "agent": self._list_agent_ids,
+                    "agents": self._list_agent_ids,
+                    "message": self._list_message_ids,
+                    "inbox": self._list_message_ids,
+                    "outbox": self._list_message_ids,
+                    "workflow": self._list_workflow_ids,
+                    "approval": self._list_approval_ids,
+                    "approvals": self._list_approval_ids,
+                })
+                from mr1.trace_emitter import TraceEmitter
+                _trace_emitter = TraceEmitter()
+                _trace_emitter.start(self._event_log.path)
+            except ImportError:
+                pass
 
-            if not user_input:
-                continue
+        def _run_loop() -> None:
+            while True:
+                try:
+                    if _chat_input is not None:
+                        raw = _chat_input.get_input()
+                    else:
+                        raw = input("\nyou > ")
+                except EOFError:
+                    shutdown("eof")
+                    return
+                except KeyboardInterrupt:
+                    shutdown("sigint")
+                    return
 
-            if user_input.lower() in ("exit", "quit"):
-                shutdown()
+                user_input = raw.strip()
+                if not user_input:
+                    continue
 
-            # Check for built-in slash commands first.
-            builtin_result = self._handle_builtin(user_input)
-            if builtin_result is not None:
-                print(f"\n{builtin_result}")
-                continue
+                if user_input.lower() in ("exit", "quit"):
+                    shutdown()
+                    return
 
-            # Normal conversation turn — goes through the persistent process.
-            response = self.step(user_input, announce=True)
-            print(f"\nmr1 > {response}")
+                # Show a compact summary when multiline text was submitted.
+                if "\n" in user_input:
+                    n = len(user_input.splitlines())
+                    print(f"[Pasted {n} lines]")
+
+                # Check for built-in slash commands first.
+                builtin_result = self._handle_builtin(user_input)
+                if builtin_result is not None:
+                    if builtin_result:
+                        lines = builtin_result.splitlines()
+                        if len(lines) > _OUTPUT_TRUNCATE_LINES:
+                            head = "\n".join(lines[:5])
+                            print(f"\n[Output {len(lines)} lines]\n{head}\n...")
+                        else:
+                            print(f"\n{builtin_result}")
+                    continue
+
+                # Normal conversation turn — goes through the persistent process.
+                response = self.step(user_input, announce=True)
+                resp_lines = (response or "").splitlines()
+                if len(resp_lines) > _OUTPUT_TRUNCATE_LINES:
+                    head = "\n".join(resp_lines[:5])
+                    print(f"\nmr1 > [Output {len(resp_lines)} lines]\n{head}\n...")
+                else:
+                    print(f"\nmr1 > {response}")
+
+        if _chat_input is not None:
+            try:
+                from prompt_toolkit.patch_stdout import patch_stdout as _pt_patch_stdout
+                with _pt_patch_stdout():
+                    _run_loop()
+            except ImportError:
+                _run_loop()
+        else:
+            _run_loop()
 
 
 # ---------------------------------------------------------------------------

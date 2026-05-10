@@ -665,6 +665,95 @@ class TestStep:
         assert "Answer this request directly" in sent
         assert "what is 2+2?" in sent
 
+    def test_direct_answer_observation_loop_reads_full_message_body(self, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mock_process = MagicMock(spec=MR1Process)
+        mock_process.alive = True
+        mr1_instance._process = mock_process
+
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "Sentinel")
+        long_body = ("Parent review " + ("needed " * 900)).strip()
+        message = mr1_instance._message_store.create_message(
+            from_agent_id=child.agent_id,
+            to_agent_id=root.agent_id,
+            kind="question",
+            subject="Need parent review",
+            body=long_body,
+        )
+        grounding = mr1_instance.build_runtime_grounding()
+        grounded_message = next(
+            item for item in grounding["messages"] if item["message_id"] == message.message_id
+        )
+        assert grounded_message["body_full_available"] is True
+        assert grounded_message["body_truncated"] is True
+        assert grounded_message["body_preview"] != long_body
+
+        mock_process.send.side_effect = [
+            f'[OBSERVE]{{"calls":[{{"name":"read_message","args":{{"message_id":"{message.message_id}"}}}}]}}[/OBSERVE]',
+            f"The child message said in full: {long_body}",
+        ]
+
+        result = mr1_instance.step("What did that child message say exactly?")
+
+        assert result == f"The child message said in full: {long_body}"
+        assert "[OBSERVE]" not in result
+        assert mock_process.send.call_count == 2
+        second_prompt = mock_process.send.call_args_list[1].args[0]
+        assert "=== OBSERVATION RESULTS ===" in second_prompt
+        assert '"request_valid": true' in second_prompt
+        assert f'"message_id": "{message.message_id}"' in second_prompt
+        assert long_body in second_prompt
+
+    def test_direct_answer_invalid_observation_returns_error_to_brain_without_execution(self, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mock_process = MagicMock(spec=MR1Process)
+        mock_process.alive = True
+        mock_process.send.side_effect = [
+            '[OBSERVE]{"calls":[{"name":"read_message","args":{"message_id":"msg-123","full":true}}]}[/OBSERVE]',
+            "Final answer after invalid observation.",
+        ]
+        mr1_instance._process = mock_process
+        mr1_instance._runtime_access.read_message = MagicMock(
+            side_effect=AssertionError("invalid observation should not execute")
+        )
+
+        result = mr1_instance.step("What is the full message?")
+
+        assert result == "Final answer after invalid observation."
+        assert mock_process.send.call_count == 2
+        mr1_instance._runtime_access.read_message.assert_not_called()
+        second_prompt = mock_process.send.call_args_list[1].args[0]
+        assert "=== OBSERVATION RESULTS ===" in second_prompt
+        assert '"request_valid": false' in second_prompt
+        assert '"executed": false' in second_prompt
+        assert "unexpected args: full" in second_prompt
+
+    def test_direct_answer_observation_loop_is_capped(self, mr1_with_mock_process):
+        mr1_instance, mock_process = mr1_with_mock_process
+        mock_process.send.side_effect = [
+            '[OBSERVE]{"calls":[{"name":"list_agents","args":{"limit":1}}]}[/OBSERVE]',
+            '[OBSERVE]{"calls":[{"name":"list_agents","args":{"limit":1}}]}[/OBSERVE]',
+            '[OBSERVE]{"calls":[{"name":"list_agents","args":{"limit":1}}]}[/OBSERVE]',
+        ]
+
+        result = mr1_instance.step("what is the current runtime state?")
+
+        assert result == "MR1 could not safely inspect additional runtime detail for this answer."
+        assert mock_process.send.call_count == 3
+
     @pytest.mark.parametrize(
         "user_text",
         [
@@ -760,6 +849,8 @@ class TestStep:
         assert "RUNTIME STATE IS SOURCE OF TRUTH." in sent
         assert "=== RUNTIME GROUNDING ===" in sent
         assert "=== END RUNTIME GROUNDING ===" in sent
+        assert "=== ROUTING ADVICE ===" in sent
+        assert "=== END ROUTING ADVICE ===" in sent
         assert '"agents": [' in sent
         assert '"workflows": [' in sent
         assert '"messages": [' in sent
@@ -770,12 +861,50 @@ class TestStep:
         assert len(artifacts) == 1
         artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
         assert artifact["route"] == "direct_answer"
+        assert artifact["route_advice"]["route"] == "direct_response"
         assert artifact["runtime_grounding"]["agents"]
         assert artifact["runtime_grounding"]["workflows"]
         assert artifact["runtime_grounding"]["messages"]
         assert artifact["runtime_grounding"]["approvals"]
         assert artifact["runtime_grounding"]["events"]
         assert artifact["brain_prompt"] == sent
+
+    def test_runtime_grounding_includes_referenced_pending_parent_message_ids(self, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "Sentinel")
+        child.run_status = "waiting"
+        child.last_action = {
+            "action": "send_message",
+            "reason": "Waiting for parent review of the long message body",
+            "next_status": "waiting",
+        }
+        mr1_instance._scoped_agents.save_agent(child)
+        long_body = "Parent review " + ("needed " * 900)
+        message = mr1_instance._message_store.create_message(
+            from_agent_id=child.agent_id,
+            to_agent_id=root.agent_id,
+            kind="question",
+            subject="Need parent review",
+            body=long_body,
+        )
+        mr1_instance._message_store.mark_read(message.message_id, actor_id=root.agent_id)
+
+        grounding = mr1_instance.build_runtime_grounding()
+
+        sentinel = next(item for item in grounding["agents"] if item["agent_id"] == child.agent_id)
+        assert sentinel["pending_parent_messages"][0]["message_id"] == message.message_id
+        assert grounding["messages"]
+        grounded_message = next(item for item in grounding["messages"] if item["message_id"] == message.message_id)
+        assert grounded_message["body_full_available"] is True
+        assert grounded_message["body_truncated"] is True
 
     @pytest.mark.parametrize(
         "user_text",
@@ -833,6 +962,20 @@ class TestStep:
             "Create a child of yours, MR3, to own README inspection",
         ) == "MR3"
 
+    def test_named_persistent_child_title_is_preserved(self, mr1_with_mock_process):
+        mr1_instance, _mock_process = mr1_with_mock_process
+
+        assert mr1_instance._extract_requested_child_title(
+            "Create a persistent agent named Sage to own README inspection",
+        ) == "Sage"
+
+    def test_special_name_request_uses_memorable_default_title(self, mr1_with_mock_process):
+        mr1_instance, _mock_process = mr1_with_mock_process
+
+        assert mr1_instance._extract_requested_child_title(
+            "Create a persistent agent with a unique special name to own MR1 evolution",
+        ) == "Sentinel"
+
     @patch("mr1.mr1.MRnRunRunner.run")
     def test_persistent_delegation_creates_child_and_runs_persistent_mrn(self, mock_run, tmp_path):
         compiler = MagicMock()
@@ -863,6 +1006,9 @@ class TestStep:
             )
 
         mock_run.side_effect = _fake_run
+        mr1_instance._process.send.return_value = (
+            "AGENT_TITLE: MR2\nOwn tool creation: propose, implement, and test new capabilities."
+        )
 
         request = "create a child responsible for tool creation and let that agent propose/create/test"
         response = mr1_instance.step(request)
@@ -875,17 +1021,21 @@ class TestStep:
         policy = mock_run.call_args.args[1]
         child = mr1_instance._scoped_agents.require_agent(agent_id)
         assert child.title == "MR2"
-        assert request in (child.mission or "")
-        assert "Own the requested domain/responsibility" in (child.mission or "")
-        assert "do not create another child agent" in (child.mission or "")
-        assert "Prefer creating workflows for execution when appropriate." in (child.mission or "")
-        assert "Keep responsibility for proposal quality, safety review, creation, and testing." in (child.mission or "")
-        assert "Escalate to MR1/user when clarification or confirmation is needed." in (child.mission or "")
+        assert child.assignment_packet is not None
+        assert child.parent_request == request
+        assert child.assignment_packet["full_parent_request"] == request
+        assert child.assignment_packet["parent_agent_id"] == mr1_instance._root_agent_id
+        assert child.assignment_packet["parent_level"] == 1
+        assert child.assignment_packet["child_level"] == 2
+        assert child.assignment_packet["assigned_clearance"] == child.security_clearance
+        assert child.assignment_packet["child_title"] == "MR2"
+        assert child.assignment_packet["relevant_context"]["agents"][0] == mr1_instance._root_agent_id
+        assert "Own tool creation" in (child.mission or "")
         assert policy.max_steps == 3
         assert policy.max_workflows_created == 2
         assert policy.require_confirmation_for_workflows is True
         assert compiler.call_count == 0
-        assert mr1_instance._process.send.call_count == 0
+        assert mr1_instance._process.send.call_count == 1
 
     @patch("mr1.mr1.MRnRunRunner.run")
     def test_persistent_delegation_uses_requested_child_title(self, mock_run, tmp_path):
@@ -898,6 +1048,9 @@ class TestStep:
         mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
         mr1_instance._process = MagicMock(spec=MR1Process)
         mr1_instance._process.alive = True
+        mr1_instance._process.send.return_value = (
+            "AGENT_TITLE: MR3\nOwn README inspection and produce structured summaries."
+        )
         mock_run.return_value = MRnRunResult(
             run_id="run-1",
             agent_id="ag-test",
@@ -920,7 +1073,50 @@ class TestStep:
         assert response.startswith("delegated to persistent agent: ag-")
         child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
         assert child.title == "MR3"
-        assert "persistent MR3-style child agent" in (child.mission or "")
+        assert "README inspection" in (child.mission or "")
+        assert child.assignment_packet is not None
+        assert child.assignment_packet["child_level"] == 2
+
+    @patch("mr1.mr1.MRnRunRunner.run")
+    def test_persistent_delegation_named_agent_routes_without_workflow_authoring(self, mock_run, tmp_path):
+        compiler = MagicMock()
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+        mr1_instance._process.send.return_value = (
+            "AGENT_TITLE: Sage\nOwn self-evolution: propose, test, and integrate system improvements."
+        )
+        mock_run.return_value = MRnRunResult(
+            run_id="run-1",
+            agent_id="ag-test",
+            caller_agent_id=mr1_instance._root_agent_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00",
+            policy={},
+            steps=[],
+            workflows_created=0,
+            messages_created=0,
+            stopped_reason="waiting",
+            status="stopped",
+            final_run_status="waiting",
+        )
+
+        response = mr1_instance.step(
+            "Create a persistent agent named Sage to own self-evolution.",
+        )
+
+        assert response.startswith("delegated to persistent agent: ag-")
+        child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
+        assert child.title == "Sage"
+        assert "self-evolution" in (child.mission or "")
+        assert compiler.call_count == 0
+        assert mr1_instance._process.send.call_count == 1
 
     def test_existing_workflow_finish_question_routes_to_inspection(self, mr1_with_mock_process, tmp_path):
         mr1_instance, mock_process = mr1_with_mock_process
@@ -1052,6 +1248,106 @@ class TestStep:
         assert compiler.call_count == 0
         assert mock_process.send.call_count == 0
 
+    def test_message_reply_can_be_synthesized_from_context(self, tmp_path):
+        compiler = MagicMock()
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mock_process = MagicMock(spec=MR1Process)
+        mock_process.alive = True
+        mock_process.send.return_value = (
+            "Use the name Darwin. Build Discord send/read tools plus a Discord watcher. "
+            "Assume two-way integration and proceed directly with implementation."
+        )
+        mr1_instance._process = mock_process
+
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        message = mr1_instance._message_store.create_message(
+            from_agent_id=child.agent_id,
+            to_agent_id=root.agent_id,
+            kind="question",
+            subject="Need clarification",
+            body="What should I name myself and should I proceed with the Discord tool/watcher work?",
+        )
+        mr1_instance._record_conversation("user", "We should use Discord, not Slack.")
+        mr1_instance._record_conversation("mr1", "Discord is the better default for your setup.")
+
+        response = mr1_instance.step(
+            f"Respond to {message.message_id} with what you think is right based on the conversation.",
+        )
+
+        assert response == f"sent clarification to {child.agent_id} for {message.message_id}"
+        inbox = mr1_instance._message_store.list_inbox(child.agent_id)
+        assert "Darwin" in inbox[0].body
+        assert "Discord watcher" in inbox[0].body
+        assert compiler.call_count == 0
+        assert mock_process.send.call_count == 1
+
+    def test_freeform_approval_routes_through_run_commands_without_brain(self, tmp_path):
+        compiler = MagicMock()
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=compiler,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mock_process = MagicMock(spec=MR1Process)
+        mock_process.alive = True
+        mr1_instance._process = mock_process
+
+        child = mr1_instance._scoped_agents.create_child_agent(mr1_instance._root_agent_id, "research")
+        original_request = CapabilityRequest(
+            actor_id=child.agent_id,
+            actor_type="mrn",
+            invocation_mode="direct",
+            capability_name="read_file",
+            args={"path": "README.md"},
+            scope=build_scope_context(
+                actor_id=child.agent_id,
+                workspace_root=tmp_path,
+                scoped_agent_store=mr1_instance._scoped_agents,
+            ),
+            step_id=f"{child.agent_id}:1",
+        )
+        approval = CapabilityApprovalRequest(
+            approval_request_id="cap_approval_test",
+            requesting_actor_id=child.agent_id,
+            capability_name="read_file",
+            invocation_mode="direct",
+            args={"path": "README.md"},
+            risk_score=0.1,
+            reason="outside_actor_scope",
+            scope_summary=original_request.scope.to_dict(),
+            original_request=original_request,
+            original_step_id=f"{child.agent_id}:1",
+            designated_approver_id=mr1_instance._root_agent_id,
+            workflow_id="wf-1",
+            task_id="tk-1",
+        )
+        mr1_instance._approval_store.save(approval)
+
+        response = mr1_instance.step("approve cap_approval_test because approved")
+
+        assert "Approved." in response
+        assert mr1_instance._approval_store.require("cap_approval_test").status == "approved"
+        assert compiler.call_count == 0
+        assert mock_process.send.call_count == 0
+
+    def test_meta_command_question_routes_direct_answer(self, mr1_with_mock_process):
+        mr1_instance, mock_process = mr1_with_mock_process
+        mock_process.send.return_value = "You would clarify exact agent ids before termination."
+
+        result = mr1_instance.step("how would you kill all research agents")
+
+        assert result == "You would clarify exact agent ids before termination."
+        assert mock_process.send.call_count == 1
+
 
 class TestRuntimeReferenceResolution:
     def _mr1_instance(self, tmp_path):
@@ -1118,6 +1414,19 @@ class TestRuntimeReferenceResolution:
 
         assert resolution["resolved_references"]["that agent"]["id"] == child.agent_id
 
+    def test_resolve_runtime_references_agent_we_just_created_uses_last_created_agent(self, tmp_path):
+        mr1_instance = self._mr1_instance(tmp_path)
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        mr1_instance._state.set_reference_state("last_created_agent_id", child.agent_id)
+
+        resolution = mr1_instance.resolve_runtime_references(
+            "why did the agent we just created get blocked?",
+            mr1_instance.build_runtime_grounding(),
+        )
+
+        assert resolution["resolved_references"]["the agent we just created"]["id"] == child.agent_id
+
     def test_resolve_runtime_references_ambiguous_mr2_flags_clarification(self, tmp_path):
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
@@ -1178,7 +1487,7 @@ class TestRuntimeReferenceResolution:
         assert resolution["ambiguities"]
         assert resolution["ambiguities"][0]["reference"] == "research"
 
-    def test_bulk_research_agent_kill_routes_to_bulk_clarification(self, tmp_path):
+    def test_bulk_research_agent_kill_terminates_all_matching_agents(self, tmp_path):
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         older = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
@@ -1187,9 +1496,24 @@ class TestRuntimeReferenceResolution:
         response = mr1_instance.step("kill all research agents")
 
         assert "Ambiguous reference 'research'" not in response
-        assert "Confirm the exact agent_ids you want me to terminate" in response
+        assert "Terminated 2 agent(s)" in response
         assert older.agent_id in response
         assert newer.agent_id in response
+
+    def test_agent_block_question_routes_to_runtime_inspection_without_brain(self, tmp_path):
+        mr1_instance = self._mr1_instance(tmp_path)
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        child.run_status = "blocked"
+        child.last_action = {"action": "invalid", "reason": "invalid message kind: proposal"}
+        mr1_instance._scoped_agents.save_agent(child)
+        mr1_instance._state.set_reference_state("last_created_agent_id", child.agent_id)
+
+        response = mr1_instance.step("why did the agent we just created get blocked after i ran it?")
+
+        assert f"agent_id:     {child.agent_id}" in response
+        assert "run_status:   blocked" in response
+        assert "invalid message kind: proposal" in response
         assert mr1_instance._process.send.call_count == 0
 
     def test_approvals_builtin_lists_shows_and_approves_visible_requests(self, tmp_path):
@@ -1252,6 +1576,9 @@ class TestRuntimeReferenceResolution:
         assert "PERSISTENT DELEGATION / OWNERSHIP" in _ORCHESTRATOR_PROMPT
         assert '{"agent": "mr2"' in _ORCHESTRATOR_PROMPT
         assert "If the user wants an agent to own an area" in _ORCHESTRATOR_PROMPT
+        assert "INTERNAL OBSERVATIONS" in _ORCHESTRATOR_PROMPT
+        assert '[OBSERVE]' in _ORCHESTRATOR_PROMPT
+        assert "Do not claim you lack access to full runtime detail" in _ORCHESTRATOR_PROMPT
 
     def test_workflow_request_uses_compiler_first_not_brain(self, tmp_path):
         compiler = FakeCompiler(
@@ -1547,3 +1874,62 @@ class TestRuntimeReferenceResolution:
         assert response.startswith("Read the notes, then summarize them.")
         assert mr1_instance._state.pending_workflow is not None
         assert mr1_instance._process.send.call_count == 0
+
+    def test_explicit_agent_id_bypasses_title_ambiguity(self, tmp_path):
+        mr1_instance = self._mr1_instance(tmp_path)
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        agent_a = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        agent_b = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+
+        resolution = mr1_instance.resolve_runtime_references(
+            f"message {agent_a.agent_id} to report status",
+            mr1_instance.build_runtime_grounding(),
+        )
+
+        assert not resolution["ambiguities"]
+        assert resolution["resolved_references"][agent_a.agent_id]["id"] == agent_a.agent_id
+        assert agent_b.agent_id not in resolution["resolved_references"]
+
+    def test_single_active_with_terminated_duplicate_resolves_directly(self, tmp_path):
+        mr1_instance = self._mr1_instance(tmp_path)
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        dead = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        alive = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        mr1_instance._scoped_agents.terminate_agent(root.agent_id, dead.agent_id)
+
+        resolution = mr1_instance.resolve_runtime_references(
+            "what is MR2 doing?",
+            mr1_instance.build_runtime_grounding(),
+        )
+
+        assert not resolution["ambiguities"]
+        assert resolution["resolved_references"]["MR2"]["id"] == alive.agent_id
+
+    def test_multiple_active_same_title_asks_clarification(self, tmp_path):
+        mr1_instance = self._mr1_instance(tmp_path)
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        mr1_instance._state.set_reference_state("last_created_agent_id", None)
+        mr1_instance._state.set_reference_state("last_referenced_agent_id", None)
+
+        resolution = mr1_instance.resolve_runtime_references(
+            "kill MR2",
+            mr1_instance.build_runtime_grounding(),
+        )
+
+        assert resolution["ambiguities"]
+        assert resolution["ambiguities"][0]["reference"] == "MR2"
+
+    def test_default_child_title_matches_tree_level(self, tmp_path):
+        mr1_instance = self._mr1_instance(tmp_path)
+        mr1_instance._scoped_agents.ensure_root_agent()
+
+        # MRn denotes tree level, not a unique sequence — all level-2 children default to "MR2"
+        title_a = mr1_instance._extract_requested_child_title("create a persistent agent to own discord")
+        title_b = mr1_instance._extract_requested_child_title("create a persistent agent to own github")
+        title_c = mr1_instance._extract_requested_child_title("create a persistent agent to own reporting")
+
+        assert title_a == "MR2"
+        assert title_b == "MR2"
+        assert title_c == "MR2"

@@ -9,7 +9,12 @@ import pytest
 
 from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import (
+    AgentScopeError,
+    PersistentAgentStore,
+    build_assignment_packet,
+    render_assignment_mission,
+)
 from mr1.scheduler import submit_spec_to_disk
 from mr1.workflow_cli import _format_agent
 from mr1.workflow_compiler import WorkflowCompilerClient
@@ -131,6 +136,37 @@ def test_assign_mission_persists_fields(agent_store):
     assert reloaded.last_step_at is None
     assert reloaded.last_action is None
     assert reloaded.parent_request is None
+    assert reloaded.assignment_packet is None
+
+
+def test_assign_mission_persists_assignment_packet_and_parent_request(agent_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "MR2", security_clearance=0.7)
+    assignment_packet = build_assignment_packet(
+        root,
+        child.title,
+        "Own runtime stabilization and report status." + (" full" * 120),
+        {
+            "assigned_clearance": child.security_clearance,
+            "agents": [root.agent_id],
+            "messages": ["msg-1"],
+            "workflows": ["wf-1"],
+        },
+    )
+
+    updated = agent_store.assign_mission(
+        root.agent_id,
+        child.agent_id,
+        render_assignment_mission(assignment_packet) or "",
+        assignment_packet=assignment_packet,
+    )
+    reloaded = agent_store.require_agent(child.agent_id)
+
+    assert updated.assignment_packet == assignment_packet
+    assert reloaded.assignment_packet == assignment_packet
+    assert reloaded.parent_request == assignment_packet["full_parent_request"]
+    assert reloaded.assignment_packet["assigned_clearance"] == 0.7
+    assert "Mission:" in (reloaded.mission or "")
 
 
 def test_step_rejects_terminated_agent(workflow_store, agent_store):
@@ -307,6 +343,31 @@ def test_send_message_action_can_target_descendant(workflow_store, agent_store, 
     result = runner.step(parent.agent_id)
 
     assert message_store.list_inbox(child.agent_id)[0].message_id == result.message_id
+
+
+def test_send_message_action_normalizes_proposal_kind_to_request(workflow_store, agent_store, message_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "research")
+    agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+        reasoner=FakeReasoner(_action(
+            "send_message",
+            message_kind="proposal",
+            message_subject="Discord plan",
+            message_body="I will implement the Discord integration with default assumptions.",
+            next_status="waiting",
+        )),
+    )
+
+    result = runner.step(child.agent_id)
+    message = message_store.list_inbox(root.agent_id)[0]
+
+    assert result.error is None
+    assert message.kind == "request"
+    assert message.subject == "Discord plan"
 
 
 def test_send_message_action_to_sibling_blocks_agent(workflow_store, agent_store, message_store):
@@ -817,6 +878,50 @@ def test_step_context_included_in_scoped_prompt(workflow_store, agent_store):
     context_text = captured_prompts[0]
     assert "step_context" in context_text
     assert "key1" in context_text
+
+
+def test_assignment_packet_fields_included_in_step_prompt(workflow_store, agent_store):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "MR2", security_clearance=0.8)
+    assignment_packet = build_assignment_packet(
+        root,
+        child.title,
+        "Own workflow inspection for failing runs.",
+        {
+            "assigned_clearance": child.security_clearance,
+            "agents": [root.agent_id, child.agent_id],
+            "messages": ["msg-1"],
+            "workflows": ["wf-1"],
+        },
+    )
+    agent_store.assign_mission(
+        root.agent_id,
+        child.agent_id,
+        render_assignment_mission(assignment_packet) or "",
+        assignment_packet=assignment_packet,
+    )
+
+    captured_prompts: list[str] = []
+
+    def capturing_reasoner(agent, system_prompt, prompt):
+        captured_prompts.append(prompt)
+        return _action("idle")
+
+    runner = MRnStepRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        reasoner=capturing_reasoner,
+    )
+    runner.step(child.agent_id)
+
+    assert captured_prompts
+    prompt_text = captured_prompts[0]
+    assert "Assignment:" in prompt_text
+    assert "clearance: 0.80" in prompt_text
+    assert "full_parent_request:" in prompt_text
+    assert "relevant_context_ids: agents=['" in prompt_text
+    assert "in_scope:" in prompt_text
+    assert "out_of_scope:" in prompt_text
 
 def test_call_capability_preflight_error_produces_blocked_step(
     workflow_store, agent_store

@@ -17,13 +17,22 @@ from mr1.scoped_agents import PersistentAgentStore
 
 
 _DEFAULT_ROOT = Path(__file__).resolve().parent / "memory" / "messages"
-_ALLOWED_MESSAGE_KINDS = frozenset({
+ALLOWED_MESSAGE_KINDS = frozenset({
     "report",
     "question",
     "alert",
     "status",
     "request",
 })
+_MESSAGE_KIND_ALIASES = {
+    "clarification": "question",
+    "notify": "alert",
+    "notification": "alert",
+    "proposal": "request",
+    "question": "question",
+    "reply": "request",
+    "update": "status",
+}
 _ALLOWED_MESSAGE_STATUSES = frozenset({
     "unread",
     "read",
@@ -38,6 +47,11 @@ def _now_iso() -> str:
 def new_message_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     return f"msg-{timestamp}-{uuid.uuid4().hex[:6]}"
+
+
+def normalize_message_kind(kind: str) -> str:
+    normalized = kind.strip().lower()
+    return _MESSAGE_KIND_ALIASES.get(normalized, normalized)
 
 
 @dataclass(frozen=True)
@@ -92,7 +106,7 @@ class PersistentMessage:
 
 
 def _validate_message(message: PersistentMessage) -> None:
-    if message.kind not in _ALLOWED_MESSAGE_KINDS:
+    if message.kind not in ALLOWED_MESSAGE_KINDS:
         raise ValueError(f"invalid message kind: {message.kind}")
     if message.status not in _ALLOWED_MESSAGE_STATUSES:
         raise ValueError(f"invalid message status: {message.status}")
@@ -159,8 +173,8 @@ class MessageStore:
         workflow_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> PersistentMessage:
-        kind = kind.strip()
-        if kind not in _ALLOWED_MESSAGE_KINDS:
+        kind = normalize_message_kind(kind)
+        if kind not in ALLOWED_MESSAGE_KINDS:
             raise ValueError(f"invalid message kind: {kind}")
         message = PersistentMessage(
             message_id=new_message_id(),
@@ -237,6 +251,13 @@ class MessageStore:
             and (include_archived or message.status != "archived")
         ]
         return sorted(messages, key=lambda item: (item.created_at, item.message_id), reverse=True)
+
+    def list_messages(self) -> list[PersistentMessage]:
+        return sorted(
+            self._list_messages(),
+            key=lambda item: (item.created_at, item.message_id),
+            reverse=True,
+        )
 
     def mark_read(
         self,

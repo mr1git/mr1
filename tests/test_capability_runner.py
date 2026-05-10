@@ -180,7 +180,7 @@ class TestPolicyDenials:
         assert result.output["status"] == "denied"
         assert "reason" in result.output
 
-    def test_condition_script_is_denied_for_root_direct_risk(self, tmp_path, runner, root_agent_id):
+    def test_condition_script_requires_approval_for_root_direct_risk(self, tmp_path, runner, root_agent_id):
         script = tmp_path / "check.py"
         script.write_text("import sys; sys.exit(0)", encoding="utf-8")
 
@@ -190,8 +190,9 @@ class TestPolicyDenials:
             root_agent_id,
         )
 
-        assert result.status == "denied"
+        assert result.status == "requires_approval"
         assert result.output["reason"] == "risk_exceeds_direct_threshold"
+        assert result.output["routing_outcome"] == "needs_user_approval"
 
     def test_missing_required_arg_is_denied(self, runner, root_agent_id):
         result = runner.run_capability("read_file", {}, root_agent_id)

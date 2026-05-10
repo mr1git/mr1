@@ -22,7 +22,7 @@ from mr1.capability_runner import CapabilityResult, CapabilityRunner
 from mr1.core import Dispatcher, PermissionDenied
 from mr1.event_log import EventLog, bind_correlation_id, mrn_step_correlation_id
 from mr1.kazi_runner import MockRunner
-from mr1.messages import MessageStore
+from mr1.messages import ALLOWED_MESSAGE_KINDS, MessageStore, normalize_message_kind
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import Scheduler, WorkflowSpecError
 from mr1.tools import ToolRegistry, default_tool_registry
@@ -39,6 +39,7 @@ _MRN_CONFIG_PATH = _PKG_ROOT / "agents" / "mrn.yml"
 _DEFAULT_TIMEOUT_S = 300
 _MESSAGE_BODY_LIMIT = 4096
 _MESSAGE_BODY_TRUNCATION_SUFFIX = "...[truncated, use message_id for full]"
+_ALLOWED_MESSAGE_KIND_TEXT = " | ".join(f'"{kind}"' for kind in sorted(ALLOWED_MESSAGE_KINDS))
 ALLOWED_MRN_ACTIONS = frozenset({
     "create_workflow",
     "inspect_workflow",
@@ -67,27 +68,27 @@ _ACTION_DEFAULT_STATUS = {
     "call_capability": "working",
 }
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = f"""\
 You are MRn, a persistent scoped orchestrator inside MR1.
 
 You must return JSON only with this exact shape:
-{
+{{
   "action": "create_workflow" | "inspect_workflow" | "write_report" | "send_message" | "ask_parent" | "idle" | "call_capability",
   "reason": "short reason",
   "workflow_request": "optional natural-language workflow request",
   "workflow_context": "optional extra context",
   "workflow_id": "optional existing workflow id",
   "report": "optional markdown report",
-  "message_kind": "optional message kind",
+  "message_kind": optional one of {_ALLOWED_MESSAGE_KIND_TEXT},
   "message_subject": "optional message subject",
   "message_body": "optional message body",
   "to_agent_id": "optional message recipient",
   "parent_request": "optional question/request for parent",
   "capability": "optional direct-callable capability name for call_capability",
-  "config": {},
+  "config": {{}},
   "store_as": "optional step_context key to store call_capability result",
   "next_status": "idle" | "working" | "waiting" | "reporting" | "blocked"
-}
+}}
 
 Rules:
 - Return exactly one JSON object and nothing else.
@@ -98,6 +99,7 @@ Rules:
 - You may request workflow creation, but runtime validation decides whether submission is allowed.
 - If you do not have enough information, use "ask_parent" or "idle".
 - For call_capability, set "capability" to a direct-callable capability name; optionally set "config" and "store_as".
+- For send_message, use only the allowed message kinds listed above. If you are sending a proposal or clarification to the parent, use "request" or "question" rather than inventing a new kind.
 """
 
 ReasonerFn = Callable[[PersistentAgent, str, str], str]
@@ -405,12 +407,68 @@ class MRnStepRunner:
                 )
 
     def _build_step_prompt(self, agent: PersistentAgent) -> str:
-        return "\n\n".join([
+        parts = [
             "Mission:",
             agent.mission or "",
+        ]
+        assignment_prompt = self._build_assignment_prompt(agent)
+        if assignment_prompt:
+            parts.extend([
+                "Assignment:",
+                assignment_prompt,
+            ])
+        parts.extend([
             "Scoped context:",
             self._build_scoped_context(agent),
         ])
+        return "\n\n".join(parts)
+
+    def _build_assignment_prompt(self, agent: PersistentAgent) -> str:
+        assignment = (
+            agent.assignment_packet
+            if isinstance(agent.assignment_packet, dict) else None
+        )
+        if assignment is None:
+            return ""
+        scope = assignment.get("scope") if isinstance(assignment.get("scope"), dict) else {}
+        relevant_context = (
+            assignment.get("relevant_context")
+            if isinstance(assignment.get("relevant_context"), dict) else {}
+        )
+        in_scope = scope.get("in_scope") if isinstance(scope.get("in_scope"), list) else []
+        out_of_scope = scope.get("out_of_scope") if isinstance(scope.get("out_of_scope"), list) else []
+        agent_ids = relevant_context.get("agents") if isinstance(relevant_context.get("agents"), list) else []
+        message_ids = relevant_context.get("messages") if isinstance(relevant_context.get("messages"), list) else []
+        workflow_ids = relevant_context.get("workflows") if isinstance(relevant_context.get("workflows"), list) else []
+        lines = [
+            f"child_title: {assignment.get('child_title') or agent.title}",
+            f"clearance: {float(assignment.get('assigned_clearance', agent.security_clearance)):.2f}",
+            f"mission: {_compact(assignment.get('mission'), limit=400)}",
+            f"responsibility: {_compact(assignment.get('responsibility'), limit=400)}",
+            f"delegated_subtask: {_compact(assignment.get('delegated_subtask'), limit=400)}",
+            "full_parent_request:",
+            assignment.get("full_parent_request") or "",
+            "in_scope:",
+        ]
+        lines.extend(
+            f"- {item}" for item in in_scope if isinstance(item, str) and item.strip()
+        )
+        if lines[-1] == "in_scope:":
+            lines.append("- none")
+        lines.append("out_of_scope:")
+        lines.extend(
+            f"- {item}" for item in out_of_scope if isinstance(item, str) and item.strip()
+        )
+        if lines[-1] == "out_of_scope:":
+            lines.append("- none")
+        lines.append(f"escalation_rules: {_compact(assignment.get('escalation_rules'), limit=400)}")
+        lines.append(
+            "relevant_context_ids: "
+            f"agents={agent_ids or []} "
+            f"messages={message_ids or []} "
+            f"workflows={workflow_ids or []}"
+        )
+        return "\n".join(lines)
 
     def _build_scoped_context(self, agent: PersistentAgent) -> str:
         payload = {
@@ -419,6 +477,7 @@ class MRnStepRunner:
                 "title": agent.title,
                 "tree_level": agent.tree_level,
                 "mission": agent.mission,
+                "security_clearance": agent.security_clearance,
                 "mode": agent.mode,
                 "run_status": agent.run_status,
                 "current_iteration": agent.current_iteration,
@@ -603,6 +662,10 @@ class MRnStepRunner:
             "parent_request": agent.parent_request,
             "owned_workflow_ids": list(agent.owned_workflow_ids),
             "step_context": dict(agent.step_context),
+            "assignment_packet": (
+                dict(agent.assignment_packet)
+                if isinstance(agent.assignment_packet, dict) else None
+            ),
             "system_prompt": system_prompt,
             "prompt": prompt,
             "full_payload": f"{system_prompt}\n\n{prompt}",
@@ -655,6 +718,10 @@ class MRnStepRunner:
         elif action_name == "send_message":
             if not isinstance(normalized["message_kind"], str) or not normalized["message_kind"].strip():
                 raise ValueError("send_message requires message_kind")
+            normalized["message_kind"] = normalize_message_kind(normalized["message_kind"])
+            if normalized["message_kind"] not in ALLOWED_MESSAGE_KINDS:
+                allowed = ", ".join(sorted(ALLOWED_MESSAGE_KINDS))
+                raise ValueError(f"send_message message_kind must be one of: {allowed}")
             if not isinstance(normalized["message_subject"], str) or not normalized["message_subject"].strip():
                 raise ValueError("send_message requires message_subject")
             if not isinstance(normalized["message_body"], str) or not normalized["message_body"].strip():

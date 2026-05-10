@@ -15,6 +15,7 @@ from mr1.kazi_runner import MockRunner
 from mr1.mrn_loop import MRnStepResult
 from mr1.mrn_run import MRnRunResult
 from mr1.mr1 import MR1, StateManager
+from mr1.scoped_agents import build_assignment_packet, render_assignment_mission
 from mr1.workflow_store import WorkflowStore
 
 
@@ -255,6 +256,35 @@ class TestAgentBuiltins:
         assert output == child.agent_id
         reloaded = mr1._scoped_agents.require_agent(child.agent_id)
         assert reloaded.mission == "Investigate the repo"
+
+    def test_runtime_agent_json_builtin_includes_assignment_packet(self, tmp_path):
+        mr1 = _build_mr1(tmp_path)
+        root = mr1._scoped_agents.ensure_root_agent()
+        child = mr1._scoped_agents.create_child_agent(root.agent_id, "MR2", security_clearance=0.9)
+        assignment_packet = build_assignment_packet(
+            root,
+            child.title,
+            "Own runtime stabilization for this repo.",
+            {
+                "assigned_clearance": child.security_clearance,
+                "agents": [root.agent_id, child.agent_id],
+                "messages": ["msg-1"],
+                "workflows": ["wf-1"],
+            },
+        )
+        mr1._scoped_agents.assign_mission(
+            root.agent_id,
+            child.agent_id,
+            render_assignment_mission(assignment_packet) or "",
+            assignment_packet=assignment_packet,
+        )
+
+        output = mr1._handle_builtin(f"/agent {child.agent_id} --json")
+        payload = json.loads(output)
+
+        assert payload["agent_id"] == child.agent_id
+        assert payload["assignment_packet"]["full_parent_request"] == "Own runtime stabilization for this repo."
+        assert payload["assignment_packet"]["relevant_context"]["agents"] == [root.agent_id, child.agent_id]
 
     @patch("mr1.mr1.MRnStepRunner.step")
     def test_agent_step_builtin(self, mock_step, tmp_path):

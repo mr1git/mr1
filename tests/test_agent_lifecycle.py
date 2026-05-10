@@ -7,7 +7,12 @@ import json
 import pytest
 
 from mr1.kazi_runner import MockRunner
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import (
+    AgentScopeError,
+    PersistentAgentStore,
+    build_assignment_packet,
+    render_assignment_mission,
+)
 from mr1.scheduler import Scheduler, WorkflowSpecError, submit_spec_to_disk
 from mr1.workflow_models import Provenance
 from mr1.workflow_store import WorkflowStore
@@ -91,6 +96,82 @@ class TestHierarchy:
         child = agent_store.create_child_agent(parent.agent_id, "research", security_clearance=0.5)
 
         assert child.security_clearance == 0.5
+
+    def test_structured_assignment_packet_has_required_fields_and_nested_recursion(self, agent_store):
+        root = agent_store.ensure_root_agent()
+        parent = agent_store.create_child_agent(root.agent_id, "MR2", security_clearance=0.6)
+        parent_packet = build_assignment_packet(
+            root,
+            parent.title,
+            "Own repository inspection and report issues.",
+            {
+                "assigned_clearance": parent.security_clearance,
+                "agents": [root.agent_id, {"agent_id": "ag-ignore", "name": "ignored"}],
+                "messages": [{"message_id": "msg-1", "body": "ignored"}],
+                "workflows": [{"workflow_id": "wf-1", "title": "ignored"}],
+            },
+        )
+        parent = agent_store.assign_mission(
+            root.agent_id,
+            parent.agent_id,
+            render_assignment_mission(parent_packet) or "",
+            assignment_packet=parent_packet,
+        )
+        child = agent_store.create_child_agent(parent.agent_id, "MR3", security_clearance=0.5)
+        child_request = "Investigate failing workflows and synthesize findings." + (" detail" * 200)
+        child_packet = build_assignment_packet(
+            parent,
+            child.title,
+            child_request,
+            {
+                "assigned_clearance": child.security_clearance,
+                "agents": [
+                    parent.agent_id,
+                    {"agent_id": child.agent_id, "full": {"ignored": True}},
+                ],
+                "messages": ["msg-2", {"message_id": "msg-3", "body": {"ignored": True}}],
+                "workflows": ["wf-2", {"workflow_id": "wf-3", "tasks": [{"ignored": True}]}],
+            },
+        )
+        child = agent_store.assign_mission(
+            parent.agent_id,
+            child.agent_id,
+            render_assignment_mission(child_packet) or "",
+            assignment_packet=child_packet,
+        )
+        reloaded = agent_store.require_agent(child.agent_id)
+
+        assert reloaded.assignment_packet is not None
+        assert set(reloaded.assignment_packet) == {
+            "parent_agent_id",
+            "parent_level",
+            "child_level",
+            "assigned_clearance",
+            "child_title",
+            "full_parent_request",
+            "delegated_subtask",
+            "reason_for_delegation",
+            "mission",
+            "responsibility",
+            "scope",
+            "constraints",
+            "success_criteria",
+            "expected_first_action",
+            "relevant_context",
+            "escalation_rules",
+            "notes",
+        }
+        assert reloaded.assignment_packet["parent_agent_id"] == parent.agent_id
+        assert reloaded.assignment_packet["parent_level"] == parent.tree_level
+        assert reloaded.assignment_packet["child_level"] == child.tree_level
+        assert reloaded.assignment_packet["assigned_clearance"] == child.security_clearance
+        assert reloaded.assignment_packet["full_parent_request"] == child_request
+        assert reloaded.assignment_packet["relevant_context"]["agents"] == [parent.agent_id, child.agent_id]
+        assert reloaded.assignment_packet["relevant_context"]["messages"] == ["msg-2", "msg-3"]
+        assert reloaded.assignment_packet["relevant_context"]["workflows"] == ["wf-2", "wf-3"]
+        assert reloaded.parent_request == reloaded.assignment_packet["full_parent_request"]
+        assert reloaded.mission is not None
+        assert "persistent MR3-style child agent" in reloaded.mission
 
     def test_visibility_is_self_and_descendants_only(self, agent_store):
         root = agent_store.ensure_root_agent()
