@@ -23,6 +23,26 @@ from mr1.core import Dispatcher, PermissionDenied
 from mr1.event_log import EventLog, bind_correlation_id, mrn_step_correlation_id
 from mr1.kazi_runner import MockRunner
 from mr1.messages import ALLOWED_MESSAGE_KINDS, MessageStore, normalize_message_kind
+from mr1.orchestrator.loop.actions import (
+    ACTION_DEFAULT_STATUS as _ACTION_DEFAULT_STATUS,
+    ALLOWED_MRN_ACTIONS,
+    ALLOWED_STATUSES as _ALLOWED_STATUSES,
+    dispatch_action as _dispatch_action,
+    parse_and_validate_action as _parse_and_validate_action_impl,
+)
+from mr1.orchestrator.loop.actions._text import (
+    _MESSAGE_BODY_LIMIT,
+    _MESSAGE_BODY_TRUNCATION_SUFFIX,
+    _compact,
+    _json_dumps,
+    _truncate_message_body,
+)
+from mr1.orchestrator.identity import (
+    _MRN_CONFIG_PATH,
+    _PKG_ROOT,
+    _now_iso as _orchestrator_now_iso,
+)
+from mr1.orchestrator.prompts import MRN_SYSTEM_PROMPT as _SYSTEM_PROMPT
 from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
 from mr1.scheduler import Scheduler, WorkflowSpecError
 from mr1.tools import ToolRegistry, default_tool_registry
@@ -34,73 +54,10 @@ from mr1.workflow_schema import WorkflowSchemaRegistry, default_workflow_schema_
 from mr1.workflow_store import WorkflowStore
 
 
-_PKG_ROOT = Path(__file__).resolve().parent
-_MRN_CONFIG_PATH = _PKG_ROOT / "agents" / "mrn.yml"
 _DEFAULT_TIMEOUT_S = 300
-_MESSAGE_BODY_LIMIT = 4096
-_MESSAGE_BODY_TRUNCATION_SUFFIX = "...[truncated, use message_id for full]"
 _ALLOWED_MESSAGE_KIND_TEXT = " | ".join(f'"{kind}"' for kind in sorted(ALLOWED_MESSAGE_KINDS))
-ALLOWED_MRN_ACTIONS = frozenset({
-    "create_workflow",
-    "inspect_workflow",
-    "write_report",
-    "send_message",
-    "ask_parent",
-    "idle",
-    "call_capability",
-})
 _ALLOWED_ACTIONS = ALLOWED_MRN_ACTIONS
-_ALLOWED_STATUSES = frozenset({
-    "idle",
-    "working",
-    "waiting",
-    "reporting",
-    "blocked",
-    "terminated",
-})
-_ACTION_DEFAULT_STATUS = {
-    "create_workflow": "working",
-    "inspect_workflow": "working",
-    "write_report": "reporting",
-    "send_message": "waiting",
-    "ask_parent": "waiting",
-    "idle": "idle",
-    "call_capability": "working",
-}
 
-_SYSTEM_PROMPT = f"""\
-You are MRn, a persistent scoped orchestrator inside MR1.
-
-You must return JSON only with this exact shape:
-{{
-  "action": "create_workflow" | "inspect_workflow" | "write_report" | "send_message" | "ask_parent" | "idle" | "call_capability",
-  "reason": "short reason",
-  "workflow_request": "optional natural-language workflow request",
-  "workflow_context": "optional extra context",
-  "workflow_id": "optional existing workflow id",
-  "report": "optional markdown report",
-  "message_kind": optional one of {_ALLOWED_MESSAGE_KIND_TEXT},
-  "message_subject": "optional message subject",
-  "message_body": "optional message body",
-  "to_agent_id": "optional message recipient",
-  "parent_request": "optional question/request for parent",
-  "capability": "optional direct-callable capability name for call_capability",
-  "config": {{}},
-  "store_as": "optional step_context key to store call_capability result",
-  "next_status": "idle" | "working" | "waiting" | "reporting" | "blocked"
-}}
-
-Rules:
-- Return exactly one JSON object and nothing else.
-- Do not use markdown fences.
-- Choose exactly one action.
-- Stay inside your scoped workflows and reports.
-- You cannot access workflows outside your scope.
-- You may request workflow creation, but runtime validation decides whether submission is allowed.
-- If you do not have enough information, use "ask_parent" or "idle".
-- For call_capability, set "capability" to a direct-callable capability name; optionally set "config" and "store_as".
-- For send_message, use only the allowed message kinds listed above. If you are sending a proposal or clarification to the parent, use "request" or "question" rather than inventing a new kind.
-"""
 
 ReasonerFn = Callable[[PersistentAgent, str, str], str]
 
@@ -153,49 +110,6 @@ class MRnStepResult:
             "stored_as": self.stored_as,
             "prompt_artifact_path": self.prompt_artifact_path,
         }
-
-
-def _json_dumps(value: Any) -> str:
-    return json.dumps(value, indent=2, sort_keys=True)
-
-
-def _compact(text: Any, *, limit: int = 240) -> str:
-    if not isinstance(text, str):
-        return "-"
-    normalized = " ".join(text.split())
-    if not normalized:
-        return "-"
-    if len(normalized) > limit:
-        return normalized[:limit] + "..."
-    return normalized
-
-
-def _truncate_message_body(text: str, *, limit: int = _MESSAGE_BODY_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    keep = max(0, limit - len(_MESSAGE_BODY_TRUNCATION_SUFFIX))
-    return text[:keep] + _MESSAGE_BODY_TRUNCATION_SUFFIX
-
-
-def _extract_json_object(text: str) -> dict[str, Any]:
-    payload = text.strip()
-    if not payload:
-        raise ValueError("empty output")
-    if payload.startswith("```"):
-        parts = payload.split("```")
-        for part in parts:
-            part = part.strip()
-            if not part or part == "json":
-                continue
-            payload = part.removeprefix("json").strip()
-            break
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError("response must be a JSON object")
-    return data
 
 
 def _load_mrn_config(path: Path = _MRN_CONFIG_PATH) -> dict[str, Any]:
@@ -677,85 +591,7 @@ class MRnStepRunner:
         )
 
     def _parse_and_validate_action(self, raw: str) -> dict[str, Any]:
-        action = _extract_json_object(raw)
-        action_name = action.get("action")
-        if action_name not in _ALLOWED_ACTIONS:
-            raise ValueError("field 'action' must be one of: create_workflow, inspect_workflow, write_report, send_message, ask_parent, idle, call_capability")
-        reason = action.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("field 'reason' must be a non-empty string")
-        next_status = action.get("next_status", _ACTION_DEFAULT_STATUS[action_name])
-        if next_status not in _ALLOWED_STATUSES:
-            raise ValueError("field 'next_status' must be one of: idle, working, waiting, reporting, blocked, terminated")
-
-        normalized = {
-            "action": action_name,
-            "reason": reason.strip(),
-            "workflow_request": action.get("workflow_request"),
-            "workflow_context": action.get("workflow_context"),
-            "workflow_id": action.get("workflow_id"),
-            "report": action.get("report"),
-            "message_kind": action.get("message_kind"),
-            "message_subject": action.get("message_subject"),
-            "message_body": action.get("message_body"),
-            "to_agent_id": action.get("to_agent_id"),
-            "parent_request": action.get("parent_request"),
-            "capability": action.get("capability"),
-            "config": action.get("config"),
-            "store_as": action.get("store_as"),
-            "next_status": next_status,
-        }
-
-        if action_name == "create_workflow":
-            if not isinstance(normalized["workflow_request"], str) or not normalized["workflow_request"].strip():
-                raise ValueError("create_workflow requires workflow_request")
-        elif action_name == "inspect_workflow":
-            if not isinstance(normalized["workflow_id"], str) or not normalized["workflow_id"].strip():
-                raise ValueError("inspect_workflow requires workflow_id")
-        elif action_name == "write_report":
-            if not isinstance(normalized["report"], str) or not normalized["report"].strip():
-                raise ValueError("write_report requires report")
-        elif action_name == "send_message":
-            if not isinstance(normalized["message_kind"], str) or not normalized["message_kind"].strip():
-                raise ValueError("send_message requires message_kind")
-            normalized["message_kind"] = normalize_message_kind(normalized["message_kind"])
-            if normalized["message_kind"] not in ALLOWED_MESSAGE_KINDS:
-                allowed = ", ".join(sorted(ALLOWED_MESSAGE_KINDS))
-                raise ValueError(f"send_message message_kind must be one of: {allowed}")
-            if not isinstance(normalized["message_subject"], str) or not normalized["message_subject"].strip():
-                raise ValueError("send_message requires message_subject")
-            if not isinstance(normalized["message_body"], str) or not normalized["message_body"].strip():
-                raise ValueError("send_message requires message_body")
-        elif action_name == "ask_parent":
-            if not isinstance(normalized["parent_request"], str) or not normalized["parent_request"].strip():
-                raise ValueError("ask_parent requires parent_request")
-            normalized["next_status"] = "waiting"
-        elif action_name == "call_capability":
-            if not isinstance(normalized["capability"], str) or not normalized["capability"].strip():
-                raise ValueError("call_capability requires capability")
-            if normalized["config"] is None:
-                normalized["config"] = {}
-            elif not isinstance(normalized["config"], dict):
-                raise ValueError("call_capability config must be a JSON object")
-            if normalized["store_as"] is not None:
-                if not isinstance(normalized["store_as"], str) or not normalized["store_as"].strip():
-                    raise ValueError("call_capability store_as must be a non-empty string when present")
-        elif action_name == "idle":
-            extra_fields = (
-                normalized["workflow_request"],
-                normalized["workflow_context"],
-                normalized["workflow_id"],
-                normalized["report"],
-                normalized["message_kind"],
-                normalized["message_subject"],
-                normalized["message_body"],
-                normalized["to_agent_id"],
-                normalized["parent_request"],
-            )
-            if any(value not in (None, "") for value in extra_fields):
-                raise ValueError("idle requires no extra fields")
-            normalized["next_status"] = "idle"
-        return normalized
+        return _parse_and_validate_action_impl(raw)
 
     def _execute_action(
         self,
@@ -765,421 +601,11 @@ class MRnStepRunner:
         *,
         prompt_artifact_path: Optional[str] = None,
     ) -> MRnStepResult:
-        if action["action"] == "call_capability":
-            return self._execute_call_capability(
-                agent,
-                action,
-                step_call_count,
-                prompt_artifact_path=prompt_artifact_path,
-            )
-        if action["action"] == "create_workflow":
-            return self._execute_create_workflow(
-                agent,
-                action,
-                prompt_artifact_path=prompt_artifact_path,
-            )
-        if action["action"] == "inspect_workflow":
-            return self._execute_inspect_workflow(
-                agent,
-                action,
-                prompt_artifact_path=prompt_artifact_path,
-            )
-        if action["action"] == "write_report":
-            return self._execute_write_report(
-                agent,
-                action,
-                prompt_artifact_path=prompt_artifact_path,
-            )
-        if action["action"] == "send_message":
-            return self._execute_send_message(
-                agent,
-                action,
-                prompt_artifact_path=prompt_artifact_path,
-            )
-        if action["action"] == "ask_parent":
-            return self._execute_ask_parent(
-                agent,
-                action,
-                prompt_artifact_path=prompt_artifact_path,
-            )
-        return self._execute_idle(
+        return _dispatch_action(
+            self,
             agent,
             action,
-            prompt_artifact_path=prompt_artifact_path,
-        )
-
-    def _execute_call_capability(
-        self,
-        agent: PersistentAgent,
-        action: dict[str, Any],
-        step_call_count: list[int],
-        *,
-        prompt_artifact_path: Optional[str] = None,
-    ) -> MRnStepResult:
-        step_call_count[0] += 1
-
-        capability_name = action["capability"].strip()
-        config = dict(action.get("config") or {})
-        store_as = action.get("store_as")
-        step_id = f"{agent.agent_id}:{agent.current_iteration + 1}"
-
-        result = self._capability_runner.run_capability(
-            capability_name,
-            config,
-            agent.agent_id,
-            mode="direct",
-            step_id=step_id,
-        )
-
-        stored_as = None
-        if store_as and result.status in {"succeeded", "denied", "requires_approval"}:
-            agent_ctx = self._scoped_agents.require_agent(agent.agent_id)
-            agent_ctx.step_context[store_as] = result.output
-            self._scoped_agents.save_agent(agent_ctx)
-            stored_as = store_as
-
-        return self._persist_step(
-            agent,
-            action=action,
-            status_after=action["next_status"],
-            message=f"capability {capability_name}: {result.status}",
-            capability_result={
-                "status": result.status,
-                "output": result.output,
-                "error": result.error,
-                "duration_ms": result.duration_ms,
-                "capability": result.capability,
-                "decision": dict(result.decision),
-                "approval_request_id": result.approval_request_id,
-                "audit_record_path": result.audit_record_path,
-            },
-            stored_as=stored_as,
-            prompt_artifact_path=prompt_artifact_path,
-        )
-
-    def _execute_create_workflow(
-        self,
-        agent: PersistentAgent,
-        action: dict[str, Any],
-        *,
-        prompt_artifact_path: Optional[str] = None,
-    ) -> MRnStepResult:
-        compile_context = self._build_create_workflow_context(agent, action)
-        client = (
-            self._workflow_compiler_client or
-            getattr(self._workflow_authoring, "_workflow_compiler_client", None)
-        )
-        if client is not None:
-            compiled = client.compile(
-                action["workflow_request"],
-                compile_context,
-                agent.agent_id,
-                agent.agent_id,
-                "preview_only",
-            )
-            preview = compiled.envelope.preview
-            spec = compiled.envelope.spec
-            assumptions = compiled.envelope.assumptions
-            risks = compiled.envelope.risks
-            needs_confirmation = compiled.envelope.needs_confirmation
-        else:
-            authored = self._workflow_authoring.author_request(
-                action["workflow_request"],
-                caller_agent_id=agent.agent_id,
-                owner_agent_id=agent.agent_id,
-            )
-            preview = authored.preview_text
-            spec = authored.spec
-            assumptions = list(authored.assumptions)
-            risks = list(authored.risks)
-            needs_confirmation = bool(authored.needs_confirmation)
-
-        # When confirmation is explicitly required at the run-policy level,
-        # always stop for review. When that policy is disabled (for example
-        # after the parent already reviewed the plan), submit immediately
-        # even if the compiler envelope would normally ask for confirmation.
-        should_require_confirmation = bool(self._require_confirmation_for_workflows)
-
-        if not should_require_confirmation:
-            submission = self._workflow_authoring.submit(
-                spec,
-                created_by=Provenance(type="agent", id=agent.agent_id),
-                caller_agent_id=agent.agent_id,
-                owner_agent_id=agent.agent_id,
-                workflow_metadata=(
-                    {
-                        "compiled_with_memory": compiled.compiled_with_memory,
-                        "memory_refs_used": list(compiled.envelope.memory_refs_used),
-                        "memory_tools_used": list(compiled.memory_tools_used or []),
-                        "memory_context_summary": compiled.memory_context_summary,
-                    }
-                    if client is not None else None
-                ),
-            )
-            created_workflow = self._workflow_store.load_workflow(submission.workflow_id)
-            return self._persist_step(
-                agent,
-                action=action,
-                status_after=action["next_status"],
-                message=submission.message,
-                workflow_id=submission.workflow_id,
-                created_workflow_id=submission.workflow_id,
-                created_workflow_status=(
-                    created_workflow.status.value if created_workflow is not None else None
-                ),
-                workflow_submitted=True,
-                prompt_artifact_path=prompt_artifact_path,
-            )
-
-        report_path = self._scoped_agents.write_report(
-            agent.agent_id,
-            self._build_confirmation_report(
-                agent,
-                action["reason"],
-                preview,
-                assumptions,
-                risks,
-            ),
-        )
-        parent_message = None
-        if agent.parent_agent_id:
-            parent_message = self._send_agent_message(
-                agent,
-                kind="report",
-                subject=f"Workflow confirmation needed from {agent.title}",
-                body="\n".join([
-                    "Workflow creation requires confirmation.",
-                    f"Agent: {agent.agent_id}",
-                    f"Reason: {action['reason']}",
-                    f"Report path: {report_path}",
-                ]),
-                to_agent_id=agent.parent_agent_id,
-            )
-        result = self._persist_step(
-            agent,
-            action=action,
-            status_after="reporting",
-            message="workflow creation requires confirmation",
-            report_path=str(report_path),
-            message_id=parent_message.message_id if parent_message is not None else None,
-            created_parent_message_id=(
-                parent_message.message_id if parent_message is not None else None
-            ),
-            message_to_agent_id=parent_message.to_agent_id if parent_message is not None else None,
-            confirmation_required=True,
-            workflow_submitted=False,
-            prompt_artifact_path=prompt_artifact_path,
-        )
-        self._emit_mrn_reported(agent, result)
-        return result
-
-    def _build_create_workflow_context(self, agent: PersistentAgent, action: dict[str, Any]) -> str:
-        parts = [
-            f"Agent: {agent.agent_id} ({agent.title})",
-            f"Mission: {_compact(agent.mission, limit=400)}",
-            f"Scoped workflows visible: {len(self._workflow_summaries(agent))}",
-        ]
-        if isinstance(action.get("workflow_context"), str) and action["workflow_context"].strip():
-            parts.extend([
-                "Extra workflow context:",
-                action["workflow_context"].strip(),
-            ])
-        return "\n\n".join(parts)
-
-    def _build_confirmation_report(
-        self,
-        agent: PersistentAgent,
-        reason: str,
-        preview: str,
-        assumptions: list[str],
-        risks: list[str],
-    ) -> str:
-        lines = [
-            f"# MRn Workflow Preview for {agent.title}",
-            "",
-            f"- agent_id: {agent.agent_id}",
-            f"- mission: {_compact(agent.mission, limit=240)}",
-            f"- iteration: {agent.current_iteration + 1}",
-            f"- reason: {reason}",
-            "",
-            "## Preview",
-            preview.strip() or "-",
-            "",
-            "## Assumptions",
-        ]
-        if assumptions:
-            lines.extend(f"- {item}" for item in assumptions)
-        else:
-            lines.append("- none")
-        lines.extend(["", "## Risks"])
-        if risks:
-            lines.extend(f"- {item}" for item in risks)
-        else:
-            lines.append("- none")
-        return "\n".join(lines)
-
-    def _execute_inspect_workflow(
-        self,
-        agent: PersistentAgent,
-        action: dict[str, Any],
-        *,
-        prompt_artifact_path: Optional[str] = None,
-    ) -> MRnStepResult:
-        workflow = self._workflow_store.load_workflow(action["workflow_id"])
-        if workflow is None:
-            raise ValueError(f"workflow not found: {action['workflow_id']}")
-        workflow = self._scoped_agents.normalize_workflow_ownership(workflow)
-        if not self._scoped_agents.can_agent_access_workflow(agent.agent_id, workflow):
-            raise AgentScopeError("access denied: workflow not in agent scope")
-        summary = self._summarize_workflow(workflow)
-        return self._persist_step(
-            agent,
-            action=action,
-            status_after=action["next_status"],
-            message=f"inspected workflow {workflow.workflow_id}",
-            workflow_id=workflow.workflow_id,
-            workflow_summary=summary,
-            prompt_artifact_path=prompt_artifact_path,
-        )
-
-    def _summarize_workflow(self, workflow: Workflow) -> dict[str, Any]:
-        tasks = []
-        for task in workflow.tasks.values():
-            output = self._workflow_store.load_task_output(workflow.workflow_id, task.task_id)
-            tasks.append({
-                "task_id": task.task_id,
-                "label": task.label,
-                "status": task.status.value,
-                "summary": task.result_summary,
-                "output_summary": output.summary if output is not None else None,
-                "output_text": _compact(output.text, limit=180) if output is not None else None,
-            })
-        events = [
-            {
-                "timestamp": event.timestamp,
-                "event_type": event.event_type,
-                "task_id": event.task_id,
-                "message": _compact(event.message, limit=120),
-            }
-            for event in self._workflow_store.load_events(workflow.workflow_id, limit=5)
-        ]
-        return {
-            "workflow_id": workflow.workflow_id,
-            "title": workflow.title,
-            "status": workflow.status.value,
-            "owner_agent_id": workflow.owner_agent_id,
-            "tasks": tasks,
-            "recent_events": events,
-        }
-
-    def _execute_write_report(
-        self,
-        agent: PersistentAgent,
-        action: dict[str, Any],
-        *,
-        prompt_artifact_path: Optional[str] = None,
-    ) -> MRnStepResult:
-        content = "\n".join([
-            f"# MRn Report for {agent.title}",
-            "",
-            f"- mission: {_compact(agent.mission, limit=240)}",
-            f"- iteration: {agent.current_iteration + 1}",
-            f"- reason: {action['reason']}",
-            "",
-            action["report"].rstrip(),
-        ])
-        report_path = self._scoped_agents.write_report(agent.agent_id, content)
-        message = None
-        if agent.parent_agent_id:
-            message = self._send_agent_message(
-                agent,
-                kind="report",
-                subject=f"Report from {agent.title}",
-                body="\n".join([content, "", f"Report path: {report_path}"]),
-            )
-        result = self._persist_step(
-            agent,
-            action=action,
-            status_after=action["next_status"],
-            message="report written",
-            report_path=str(report_path),
-            message_id=message.message_id if message is not None else None,
-            created_parent_message_id=message.message_id if message is not None else None,
-            message_to_agent_id=message.to_agent_id if message is not None else None,
-            prompt_artifact_path=prompt_artifact_path,
-        )
-        self._emit_mrn_reported(agent, result)
-        return result
-
-    def _execute_send_message(
-        self,
-        agent: PersistentAgent,
-        action: dict[str, Any],
-        *,
-        prompt_artifact_path: Optional[str] = None,
-    ) -> MRnStepResult:
-        message = self._send_agent_message(
-            agent,
-            kind=action["message_kind"],
-            subject=action["message_subject"],
-            body=action["message_body"],
-            workflow_id=action.get("workflow_id"),
-            to_agent_id=action.get("to_agent_id"),
-        )
-        return self._persist_step(
-            agent,
-            action=action,
-            status_after=action["next_status"],
-            message=f"message sent to {message.to_agent_id}",
-            workflow_id=action.get("workflow_id"),
-            message_id=message.message_id,
-            created_parent_message_id=(
-                message.message_id
-                if message.to_agent_id == agent.parent_agent_id
-                else None
-            ),
-            message_to_agent_id=message.to_agent_id,
-            prompt_artifact_path=prompt_artifact_path,
-        )
-
-    def _execute_ask_parent(
-        self,
-        agent: PersistentAgent,
-        action: dict[str, Any],
-        *,
-        prompt_artifact_path: Optional[str] = None,
-    ) -> MRnStepResult:
-        message = self._send_agent_message(
-            agent,
-            kind="question",
-            subject=f"Parent request from {agent.title}",
-            body=action["parent_request"],
-            to_agent_id=agent.parent_agent_id,
-        )
-        return self._persist_step(
-            agent,
-            action=action,
-            status_after="waiting",
-            message="parent clarification requested",
-            message_id=message.message_id,
-            parent_request=action["parent_request"],
-            created_parent_message_id=message.message_id,
-            message_to_agent_id=message.to_agent_id,
-            prompt_artifact_path=prompt_artifact_path,
-        )
-
-    def _execute_idle(
-        self,
-        agent: PersistentAgent,
-        action: dict[str, Any],
-        *,
-        prompt_artifact_path: Optional[str] = None,
-    ) -> MRnStepResult:
-        return self._persist_step(
-            agent,
-            action=action,
-            status_after="idle",
-            message="agent remains idle",
+            step_call_count,
             prompt_artifact_path=prompt_artifact_path,
         )
 
@@ -1383,6 +809,4 @@ class MRnStepRunner:
 
     @staticmethod
     def _now_iso() -> str:
-        from datetime import datetime, timezone
-
-        return datetime.now(timezone.utc).isoformat()
+        return _orchestrator_now_iso()

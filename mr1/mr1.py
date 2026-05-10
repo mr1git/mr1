@@ -43,6 +43,26 @@ sys.path.insert(0, str(_PKG_ROOT.parent))
 
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 from mr1 import kazi, mrn
+from mr1.orchestrator.identity import (
+    _AGENTS_DIR as _AGENTS_DIR_IMPORTED,
+    _KAZI_CONFIG_PATH as _KAZI_CONFIG_PATH_IMPORTED,
+    _MR1_CONFIG_PATH as _MR1_CONFIG_PATH_IMPORTED,
+    _MRN_CONFIG_PATH as _MRN_CONFIG_PATH_IMPORTED,
+    _compact_text as _compact_text,
+    _generate_task_id as _generate_task_id,
+    _load_agent_config as _load_agent_config,
+    _now_iso as _now_iso,
+)
+from mr1.orchestrator.prompts import _ORCHESTRATOR_PROMPT as _ORCHESTRATOR_PROMPT
+from mr1.orchestrator import grounding as _grounding
+from mr1.orchestrator.process import MR1Process as MR1Process
+from mr1.orchestrator.state import (
+    _MAX_CONVERSATION as _MAX_CONVERSATION,
+    _MAX_DECISIONS as _MAX_DECISIONS,
+    _STATE_PATH as _STATE_PATH,
+    _TERMINAL_TASK_STATUSES as _TERMINAL_TASK_STATUSES,
+    StateManager as StateManager,
+)
 from mr1.capability_policy import (
     CapabilityApprovalDecision,
     CapabilityApprovalStore,
@@ -83,26 +103,14 @@ from mr1.inbox_triage import InboxTriagePolicy, InboxTriageRunner
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-_AGENTS_DIR = _PKG_ROOT / "agents"
-_STATE_PATH = _PKG_ROOT / "memory" / "active" / "mr1_state.json"
+_AGENTS_DIR = _AGENTS_DIR_IMPORTED
 _CONTEXT_PATH = _PKG_ROOT / "memory" / "active" / "mr1_context.md"
-_MR1_CONFIG_PATH = _AGENTS_DIR / "mr1.yml"
-_MRN_CONFIG_PATH = _AGENTS_DIR / "mrn.yml"
-_KAZI_CONFIG_PATH = _AGENTS_DIR / "kazi.yml"
+_MR1_CONFIG_PATH = _MR1_CONFIG_PATH_IMPORTED
+_MRN_CONFIG_PATH = _MRN_CONFIG_PATH_IMPORTED
+_KAZI_CONFIG_PATH = _KAZI_CONFIG_PATH_IMPORTED
 
-# Maximum number of decisions retained in state.
-_MAX_DECISIONS = 50
-_MAX_CONVERSATION = 80
 # Long-output threshold for the chat UI: lines above this are summarised.
 _OUTPUT_TRUNCATE_LINES = 40
-_TERMINAL_TASK_STATUSES = {
-    "completed",
-    "failed",
-    "timeout",
-    "context_exceeded",
-    "denied",
-    "killed",
-}
 
 # Maximum delegation rounds per user turn.
 _MAX_DELEGATION_ROUNDS = 5
@@ -288,292 +296,15 @@ _PERSISTENT_DELEGATION_IMPERATIVE_PATTERNS = (
 _DUMP_COMPLETE_SIGNAL = "[MR1:DUMP_COMPLETE]"
 
 
-# ---------------------------------------------------------------------------
-# System prompt — injected via --append-system-prompt into MR1's own
-# persistent claude process. This is the brain's behavioural contract.
-# ---------------------------------------------------------------------------
-_ORCHESTRATOR_PROMPT = """\
-You are MR1, the top-level orchestrator of a multi-agent workflow system.
-
-== ROLE ==
-You are the user's interface and decision engine. For every message, decide the best execution path:
-
-1. DIRECT ANSWER  
-   Respond yourself when the user is:
-   - asking questions
-   - brainstorming / discussing
-   - planning / reviewing
-   - asking for explanations or comparisons
-   - asking what to do next
-
-2. WORKFLOW COMPILATION  
-   Convert the request into a workflow when the user wants to:
-   - automate a task
-   - run multiple steps
-   - execute a pipeline
-   - monitor or wait for something
-   - connect tools / files / agents together
-
-3. PERSISTENT DELEGATION / OWNERSHIP
-   Create or reuse a persistent MR2-style child agent when the user wants:
-   - a child responsible for an area or domain
-   - delegation of ownership, not just execution
-   - an agent to propose, create, review, or test within that domain
-   - an agent that should decide when to create workflows
-
-4. ONE-SHOT DELEGATION (RARE)  
-   Delegate to a single worker only when:
-   - the task is clearly a one-shot execution
-   - AND workflow overhead is unnecessary
-   - AND persistent ownership is unnecessary
-
----
-
-== CRITICAL ROUTING RULES ==
-
-DO NOT create workflows for:
-- brainstorming ("let’s think", "what would be good", "ideas")
-- conceptual discussion
-- architecture/design questions
-- comparing approaches
-- asking for recommendations
-- reviewing system behavior
-
-These MUST be handled as DIRECT ANSWER.
-
-ONLY create workflows when the user clearly intends execution.
-
-If the user wants an agent to own an area, create a persistent MR2-style child instead of compiling a workflow directly.
-
-If unsure → DIRECT ANSWER.
-
----
-
-== WORKFLOW SYSTEM ==
-
-MR1 can construct and run workflows composed of:
-
-- TOOLS (deterministic execution)
-- WATCHERS (event/wait conditions)
-- AGENTS (reasoning/generation)
-- DATAFLOW (passing outputs between tasks)
-
-Workflows must:
-- be valid JSON
-- follow the workflow schema exactly
-- use capabilities and schema metadata
-- never guess field formats
-
----
-
-== WORKFLOW GENERATION RULES ==
-
-When generating workflows:
-
-- Use tools whenever possible (fast + deterministic)
-- Use agents only for reasoning or summarization
-- Use watchers for waiting or conditions
-- Use inputs to pass data between tasks (never inline outputs into prompts)
-
-Inputs MUST be objects:
-
-"inputs": [
-  {"name": "x", "from": "task_label.result.text"}
-]
-
-Never:
-
-"inputs": ["task.result.text"]
-
----
-
-== DELEGATION FORMAT (RARE) ==
-
-Only use if NOT using workflows:
-
-Persistent ownership / orchestration example:
-
-[DELEGATE]
-{"agent": "mr2", "task": "Own tool creation for this area and decide when to create workflows", "context": "Keep responsibility for proposal, safety review, creation, and testing"}
-[/DELEGATE]
-
-One-shot worker example:
-
-[DELEGATE]
-{"agent": "kazi", "task": "clear actionable instruction", "context": "relevant context"}
-[/DELEGATE]
-
-Rules:
-- At most ONE block
-- No text after the block
-- Prefer workflows over delegation
-
----
-
-== BUILT-IN COMMANDS ==
-
-The following are handled by the system:
-
-/status
-/tasks
-/kill
-/history
-/memdltr
-/workflows
-/workflow
-/jobs
-/events
-/watchers
-/capabilities
-/capability
-/tools
-/tool
-/agents
-/agent
-/schema
-/result
-/inputs
-/artifacts
-/vizualize
-/visualize-web
-/test spawn agents <h>
-/test kill agents
-
-If the user sends one of these:
-Respond EXACTLY with:
-Handled by MR1 system.
-
----
-
-== INTERNAL OBSERVATIONS ==
-
-You have backend-only read-only runtime observations. These are internal backend capabilities, not slash commands, and they are never user-visible.
-
-Use them when runtime grounding shows a truncated preview or a *_full_available=true field and the user is asking for the full detail.
-
-When you need an observation, respond with EXACTLY this shape and nothing else:
-
-[OBSERVE]
-{"calls":[{"name":"read_message","args":{"message_id":"msg-..."}}]}
-[/OBSERVE]
-
-Allowed observation calls:
-- list_agents
-- read_agent
-- list_messages
-- read_message
-- list_workflows
-- read_workflow
-- list_pending_approvals
-- list_recent_errors
-- search_memory
-
-Rules:
-- The OBSERVE block must be your entire response when used.
-- Use observations only for read-only runtime inspection.
-- Never use observations for mutations, messaging, workflow changes, or side effects.
-- Do not claim you lack access to full runtime detail when a matching read/list observation is available.
-- If runtime grounding is already sufficient, answer normally without using OBSERVE.
-
----
-
-== MEMORY SEARCH ==
-
-search_memory is a backend read-only observation, not a slash command.
-
-Use search_memory when:
-- The user references prior conversations, previous work, or says "last time", "before", "earlier".
-- The user asks MR1 to continue an old thread or recall a past outcome.
-- Debugging would benefit from remembered prior outcomes or known friction patterns.
-
-Do not use search_memory for purely current runtime state; use list/read observations instead.
-Do not claim memory is unavailable without trying search_memory when the user explicitly asks about prior system/project context.
-Keep results bounded; cite or summarize only relevant items.
-Do not auto-search memory every turn.
-
-Example observation call:
-[OBSERVE]
-{"calls":[{"name":"search_memory","args":{"query":"authentication bug from last week","limit":5}}]}
-[/OBSERVE]
-
----
-
-== MEMORY DUMP PROTOCOL ==
-
-If message starts with [SYSTEM:MEMDLTR]:
-
-1. Write memory/active/mr1_context.md containing:
-   - full conversation summary
-   - active tasks + status
-   - learned user preferences
-   - key decisions and reasoning
-
-2. End with EXACTLY:
-[MR1:DUMP_COMPLETE]
-
----
-
-== PERSONALITY ==
-
-- Concise and direct
-- No filler or fluff
-- No apologies
-- No hedging
-- Lead with the answer or action
-- If unsure → say so plainly
-
----
-
-== FINAL DECISION LOGIC ==
-
-Before responding, internally decide:
-
-Is this:
-- thinking → DIRECT ANSWER
-- execution → WORKFLOW
-- trivial one-shot → optional DELEGATE
-
-Never mix modes.
-
-Return only the chosen response.
-"""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_agent_config(path: Path) -> dict:
-    """Load an agent YAML definition."""
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
 def _normalize_routing_text(value: str) -> str:
     """Normalize free-form user text for deterministic routing checks."""
     return " ".join(value.strip().lower().split())
-
-
-def _generate_task_id() -> str:
-    """Generate a unique, timestamp-prefixed task ID."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    short = uuid.uuid4().hex[:6]
-    return f"task-{ts}-{short}"
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _compact_text(value: Any, *, limit: int = 240) -> str:
-    if not isinstance(value, str):
-        return "-"
-    normalized = " ".join(value.split())
-    if not normalized:
-        return "-"
-    if len(normalized) > limit:
-        return normalized[:limit] + "..."
-    return normalized
 
 
 def _truncate_grounding_message_body(
@@ -587,451 +318,6 @@ def _truncate_grounding_message_body(
     return text[:keep] + _GROUNDING_MESSAGE_TRUNCATION_SUFFIX
 
 
-# ---------------------------------------------------------------------------
-# MR1 Process — Claude session runner
-# ---------------------------------------------------------------------------
-
-class MR1Process:
-    """
-    Manages MR1's Claude Code session.
-
-    Claude Code does not expose a stable long-lived interactive JSON mode
-    for this workflow. Instead, each turn is executed with `claude --print`
-    using stream-json I/O and the prior Claude session ID is resumed when
-    available.
-    """
-
-    def __init__(
-        self,
-        system_prompt: str,
-        model: str,
-        tools: list[str],
-        session_id: Optional[str] = None,
-    ):
-        self._system_prompt = system_prompt
-        self._model = model
-        self._tools = tools
-        self._session_id = session_id
-        self._available = False
-
-    def start(self) -> None:
-        """Verify Claude Code is available for per-turn session use."""
-        result = subprocess.run(
-            ["claude", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-            raise RuntimeError(f"claude CLI is unavailable: {detail}")
-        self._available = True
-
-    def send(self, message: str) -> str:
-        """
-        Execute a single Claude turn and return the final result text.
-        """
-        if not self.alive:
-            return "[MR1 ERROR] Process is not running."
-
-        result_text, error_text = self._invoke(message, resume=bool(self._session_id))
-        if error_text and self._session_id:
-            self._session_id = None
-            result_text, error_text = self._invoke(message, resume=False)
-
-        if error_text:
-            return f"[MR1 ERROR] {error_text}"
-
-        self._available = True
-        return result_text
-
-    def _invoke(self, message: str, resume: bool) -> tuple[str, Optional[str]]:
-        try:
-            payload = json.dumps(
-                {"type": "user", "message": {"role": "user", "content": message}}
-            )
-        except TypeError as exc:
-            return "", f"failed to encode input: {exc}"
-
-        cmd = [
-            "claude",
-            "--print",
-            "--verbose",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--replay-user-messages",
-        ]
-        if self._model:
-            cmd.extend(["--model", self._model])
-        if self._tools:
-            cmd.extend(["--allowedTools", ",".join(self._tools)])
-        if resume and self._session_id:
-            cmd.extend(["--resume", self._session_id])
-        else:
-            cmd.extend(["--append-system-prompt", self._system_prompt])
-
-        try:
-            result = subprocess.run(
-                cmd,
-                input=payload + "\n",
-                capture_output=True,
-                text=True,
-                timeout=1800,
-            )
-        except subprocess.TimeoutExpired:
-            return "", "claude turn timed out"
-        except OSError as exc:
-            return "", f"could not run claude: {exc}"
-
-        stdout = result.stdout or ""
-        stderr = (result.stderr or "").strip()
-        parsed_text = ""
-        parsed_session_id = None
-        parse_errors = 0
-
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                parse_errors += 1
-                continue
-            if event.get("session_id"):
-                parsed_session_id = event["session_id"]
-            if event.get("type") == "result":
-                parsed_text = event.get("result", "")
-                parsed_session_id = event.get("session_id", parsed_session_id)
-
-        if parsed_session_id:
-            self._session_id = parsed_session_id
-
-        if result.returncode != 0:
-            detail = stderr or parsed_text.strip()
-            if not detail and parse_errors:
-                detail = "received malformed stream-json output"
-            return "", detail or f"claude exited with code {result.returncode}"
-
-        if not parsed_text:
-            detail = stderr or "claude returned no result text"
-            return "", detail
-
-        return parsed_text, None
-
-    def kill(self) -> None:
-        """Forget the current Claude session handle."""
-        self._session_id = None
-        self._available = False
-
-    @property
-    def pid(self) -> Optional[int]:
-        return None
-
-    @property
-    def alive(self) -> bool:
-        return self._available
-
-    @property
-    def session_id(self) -> Optional[str]:
-        return self._session_id
-
-
-# ---------------------------------------------------------------------------
-# State Manager
-# ---------------------------------------------------------------------------
-
-class StateManager:
-    """
-    Manages MR1's persistent state at memory/active/mr1_state.json.
-
-    Tracks the current session, active/completed tasks, running agent
-    PIDs, and a rolling window of recent orchestration decisions.
-    """
-
-    def __init__(self, state_path: Path = _STATE_PATH):
-        self._path = state_path
-        self._state = self._load_or_init()
-
-    def _load_or_init(self) -> dict:
-        if self._path.exists():
-            try:
-                with open(self._path) as f:
-                    data = json.load(f)
-                self._ensure_reference_defaults(data)
-                return data
-            except (json.JSONDecodeError, KeyError):
-                pass  # Corrupted — reinitialise.
-        data = {
-            "session_id": uuid.uuid4().hex[:12],
-            "started_at": _now_iso(),
-            "claude_session_id": None,
-            "tasks": {},
-            "decisions": [],
-            "agent_pids": [],
-            "conversation": [],
-            "pending_workflow": None,
-        }
-        self._ensure_reference_defaults(data)
-        return data
-
-    @staticmethod
-    def _ensure_reference_defaults(state: dict[str, Any]) -> None:
-        state.setdefault("last_created_agent_id", None)
-        state.setdefault("last_referenced_agent_id", None)
-        state.setdefault("last_created_workflow_id", None)
-        state.setdefault("last_referenced_workflow_id", None)
-        aliases = state.setdefault("reference_aliases", {})
-        if not isinstance(aliases, dict):
-            aliases = {}
-            state["reference_aliases"] = aliases
-        agents = aliases.get("agents")
-        workflows = aliases.get("workflows")
-        aliases["agents"] = dict(agents) if isinstance(agents, dict) else {}
-        aliases["workflows"] = dict(workflows) if isinstance(workflows, dict) else {}
-
-    def save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(self._state, f, indent=2)
-        tmp.rename(self._path)  # Atomic on POSIX.
-
-    def set_claude_session_id(self, session_id: Optional[str]) -> None:
-        self._state["claude_session_id"] = session_id
-        self.save()
-
-    # -- Tasks -------------------------------------------------------------
-
-    def begin_task(
-        self,
-        task_id: str,
-        agent_type: str,
-        description: str,
-        pid: Optional[int] = None,
-        parent_task_id: str = "mr1",
-        lane: str = "conversation",
-    ) -> None:
-        existing = self._state["tasks"].get(task_id, {})
-        task = {
-            "agent_type": agent_type,
-            "status": existing.get("status", "running"),
-            "pid": existing.get("pid"),
-            "description": description[:300],
-            "started_at": existing.get("started_at", _now_iso()),
-            "parent_task_id": existing.get("parent_task_id", parent_task_id),
-            "lane": existing.get("lane", lane),
-        }
-        if pid is not None:
-            task["pid"] = pid
-        if task["status"] not in _TERMINAL_TASK_STATUSES:
-            task["status"] = "running"
-        self._state["tasks"][task_id] = task
-        self.save()
-
-    def add_task(
-        self,
-        task_id: str,
-        agent_type: str,
-        description: str,
-        pid: Optional[int],
-    ) -> None:
-        self.begin_task(task_id, agent_type, description, pid=pid)
-
-    def update_task_pid(self, task_id: str, pid: int) -> None:
-        if task_id not in self._state["tasks"]:
-            return
-        self._state["tasks"][task_id]["pid"] = pid
-        self.save()
-
-    def complete_task(self, task_id: str, status: str = "completed") -> None:
-        if task_id in self._state["tasks"]:
-            self._state["tasks"][task_id]["status"] = status
-            self._state["tasks"][task_id]["finished_at"] = _now_iso()
-            self.save()
-
-    def get_task(self, task_id: str) -> Optional[dict[str, Any]]:
-        task = self._state["tasks"].get(task_id)
-        if task is None:
-            return None
-        return dict(task)
-
-    @property
-    def active_tasks(self) -> dict:
-        return {
-            tid: t
-            for tid, t in self._state["tasks"].items()
-            if t["status"] == "running"
-        }
-
-    # -- Decisions ---------------------------------------------------------
-
-    def add_decision(
-        self,
-        user_input: str,
-        action: str,
-        task_id: Optional[str] = None,
-    ) -> None:
-        self._state["decisions"].append({
-            "timestamp": _now_iso(),
-            "input_summary": user_input[:200],
-            "action": action,
-            "task_id": task_id,
-        })
-        # Rolling window.
-        if len(self._state["decisions"]) > _MAX_DECISIONS:
-            self._state["decisions"] = self._state["decisions"][-_MAX_DECISIONS:]
-        self.save()
-
-    def add_conversation(
-        self,
-        role: str,
-        text: str,
-        kind: str = "message",
-        task_id: Optional[str] = None,
-        lane: str = "conversation",
-    ) -> dict[str, Any]:
-        entry = {
-            "timestamp": _now_iso(),
-            "role": role,
-            "text": text[:3000],
-            "kind": kind,
-            "task_id": task_id,
-            "lane": lane,
-        }
-        self._state.setdefault("conversation", []).append(entry)
-        if len(self._state["conversation"]) > _MAX_CONVERSATION:
-            self._state["conversation"] = self._state["conversation"][-_MAX_CONVERSATION:]
-        self.save()
-        return entry
-
-    def set_pending_workflow(self, draft: Optional[dict[str, Any]]) -> None:
-        self._state["pending_workflow"] = draft
-        self.save()
-
-    def clear_pending_workflow(self) -> None:
-        self.set_pending_workflow(None)
-
-    def set_reference_state(self, key: str, value: Optional[str]) -> None:
-        self._state[key] = value
-        self.save()
-
-    def set_reference_alias(self, kind: str, alias: str, target_id: str) -> None:
-        normalized_alias = alias.strip().lower()
-        if not normalized_alias:
-            return
-        aliases = self._state.setdefault("reference_aliases", {})
-        bucket = aliases.setdefault(kind, {})
-        bucket[normalized_alias] = target_id
-        self.save()
-
-    @property
-    def reference_aliases(self) -> dict[str, dict[str, str]]:
-        aliases = self._state.get("reference_aliases", {})
-        return {
-            "agents": dict(aliases.get("agents", {})),
-            "workflows": dict(aliases.get("workflows", {})),
-        }
-
-    @property
-    def last_created_agent_id(self) -> Optional[str]:
-        return self._state.get("last_created_agent_id")
-
-    @property
-    def last_referenced_agent_id(self) -> Optional[str]:
-        return self._state.get("last_referenced_agent_id")
-
-    @property
-    def last_created_workflow_id(self) -> Optional[str]:
-        return self._state.get("last_created_workflow_id")
-
-    @property
-    def last_referenced_workflow_id(self) -> Optional[str]:
-        return self._state.get("last_referenced_workflow_id")
-
-    # -- Agent PIDs --------------------------------------------------------
-
-    def add_agent_pid(self, pid: int) -> None:
-        if pid not in self._state.get("agent_pids", []):
-            self._state.setdefault("agent_pids", []).append(pid)
-            self.save()
-
-    def remove_agent_pid(self, pid: int) -> None:
-        pids = self._state.get("agent_pids", [])
-        if pid in pids:
-            pids.remove(pid)
-            self.save()
-
-    # -- Accessors ---------------------------------------------------------
-
-    @property
-    def session_id(self) -> str:
-        return self._state["session_id"]
-
-    @property
-    def conversation(self) -> list[dict[str, Any]]:
-        return list(self._state.get("conversation", []))
-
-    @property
-    def claude_session_id(self) -> Optional[str]:
-        return self._state.get("claude_session_id")
-
-    @property
-    def pending_workflow(self) -> Optional[dict[str, Any]]:
-        value = self._state.get("pending_workflow")
-        return dict(value) if isinstance(value, dict) else None
-
-    def format_status(self) -> str:
-        """Human-readable status block."""
-        active = self.active_tasks
-        recent = self._state["decisions"][-5:]
-        lines = [
-            f"Session:  {self._state['session_id']}",
-            f"Started:  {self._state['started_at']}",
-            f"Active tasks: {len(active)}",
-        ]
-        for tid, t in active.items():
-            lines.append(
-                f"  {tid}  [{t['agent_type']}]  pid={t['pid']}  {t['description'][:60]}"
-            )
-        if recent:
-            lines.append("Recent decisions:")
-            for d in recent:
-                lines.append(
-                    f"  {d['timestamp'][:19]}  {d['action']}"
-                    + (f"  ({d['task_id']})" if d.get("task_id") else "")
-                )
-        return "\n".join(lines)
-
-    def format_tasks(self) -> str:
-        """Human-readable task list."""
-        if not self._state["tasks"]:
-            return "No tasks."
-        lines = []
-        for tid, t in self._state["tasks"].items():
-            status_icon = {
-                "running": "~",
-                "completed": "+",
-                "failed": "!",
-                "killed": "x",
-            }.get(t["status"], "?")
-            lines.append(
-                f"  [{status_icon}] {tid}  {t['agent_type']}  "
-                f"{t['status']}  {t['description'][:50]}"
-            )
-        return "\n".join(lines)
-
-    def format_for_prompt(self) -> str:
-        """Compact state summary."""
-        active = self.active_tasks
-        if not active:
-            return "No active tasks."
-        parts = []
-        for tid, t in active.items():
-            parts.append(f"{tid} [{t['agent_type']}]: {t['description'][:80]}")
-        return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1458,152 +744,34 @@ class MR1:
         pinned_ids: list[str],
         limit: int,
     ) -> list[dict[str, Any]]:
-        pinned_set = {item for item in pinned_ids if item}
-        prioritized = [item for item in items if item.get(id_field) in pinned_set]
-        remaining = [item for item in items if item.get(id_field) not in pinned_set]
-        return (prioritized + remaining)[:limit]
-
-    def _grounding_agents(
-        self,
-        *,
-        limit: int = _GROUNDING_AGENT_LIMIT,
-        pinned_agent_ids: Optional[list[str]] = None,
-    ) -> list[dict[str, Any]]:
-        pinned = pinned_agent_ids or [
-            self._state.last_referenced_agent_id,
-            self._state.last_created_agent_id,
-        ]
-        return self._runtime_access.list_agents(
-            caller_agent_id=self._root_agent_id,
-            limit=limit,
-            pinned_agent_ids=pinned,
+        return _grounding.prioritize_items(
+            items, id_field=id_field, pinned_ids=pinned_ids, limit=limit,
         )
 
-    def _grounding_workflows(
-        self,
-        *,
-        limit: int = _GROUNDING_WORKFLOW_LIMIT,
-        pinned_workflow_ids: Optional[list[str]] = None,
-    ) -> list[dict[str, Any]]:
-        pinned = pinned_workflow_ids or [
-            self._state.last_referenced_workflow_id,
-            self._state.last_created_workflow_id,
-        ]
-        return self._runtime_access.list_workflows(
-            caller_agent_id=self._root_agent_id,
-            limit=limit,
-            pinned_workflow_ids=pinned,
-        )
+    def _grounding_agents(self, **kwargs) -> list[dict[str, Any]]:
+        return _grounding.grounding_agents(self, **kwargs)
+
+    def _grounding_workflows(self, **kwargs) -> list[dict[str, Any]]:
+        return _grounding.grounding_workflows(self, **kwargs)
 
     @staticmethod
     def _grounding_message_ids_from_agents(agents: list[dict[str, Any]]) -> list[str]:
-        message_ids: list[str] = []
-        for agent in agents:
-            for field in (
-                "latest_inbox_messages",
-                "latest_outbox_messages",
-                "pending_parent_messages",
-            ):
-                for item in agent.get(field, []):
-                    message_id = item.get("message_id")
-                    if isinstance(message_id, str) and message_id:
-                        message_ids.append(message_id)
-        return message_ids
+        return _grounding.grounding_message_ids_from_agents(agents)
 
-    def _grounding_messages(
-        self,
-        *,
-        limit: int = _GROUNDING_MESSAGE_LIMIT,
-        pinned_message_ids: Optional[list[str]] = None,
-        referenced_message_ids: Optional[list[str]] = None,
-    ) -> list[dict[str, Any]]:
-        pinned_ids = [item for item in (pinned_message_ids or []) if item]
-        referenced_ids = [item for item in (referenced_message_ids or []) if item]
-        base = self._runtime_access.list_messages(
-            caller_agent_id=self._root_agent_id,
-            to_agent_id=self._root_agent_id,
-            status="unread",
-            include_archived=False,
-        )
-        extra = self._runtime_access.list_messages(
-            caller_agent_id=self._root_agent_id,
-            message_ids=sorted(set(pinned_ids + referenced_ids)),
-            include_archived=True,
-        )
-        deduped: dict[str, dict[str, Any]] = {}
-        for item in base + extra:
-            deduped[item["message_id"]] = item
-        payload = list(deduped.values())
-        payload.sort(key=lambda item: (item["created_at"], item["message_id"]), reverse=True)
-        return self._prioritize_items(
-            payload,
-            id_field="message_id",
-            pinned_ids=pinned_ids + referenced_ids,
-            limit=limit,
-        )
+    def _grounding_messages(self, **kwargs) -> list[dict[str, Any]]:
+        return _grounding.grounding_messages(self, **kwargs)
 
-    def _grounding_approvals(self, *, limit: int = _GROUNDING_APPROVAL_LIMIT) -> list[dict[str, Any]]:
-        return self._runtime_access.list_pending_approvals(
-            caller_agent_id=self._root_agent_id,
-            limit=limit,
-        )
+    def _grounding_approvals(self, **kwargs) -> list[dict[str, Any]]:
+        return _grounding.grounding_approvals(self, **kwargs)
 
-    def _grounding_events(self, *, limit: int = _GROUNDING_EVENT_LIMIT) -> list[dict[str, Any]]:
-        return self._runtime_access.list_recent_events(
-            caller_agent_id=self._root_agent_id,
-            limit=limit,
-        )
+    def _grounding_events(self, **kwargs) -> list[dict[str, Any]]:
+        return _grounding.grounding_events(self, **kwargs)
 
-    def build_runtime_grounding(
-        self,
-        *,
-        resolved_references: Optional[dict[str, Any]] = None,
-        ambiguities: Optional[list[dict[str, Any]]] = None,
-    ) -> dict[str, Any]:
-        resolved = dict(resolved_references or {})
-        pinned_agent_ids = [
-            item.get("id")
-            for item in resolved.values()
-            if item.get("kind") == "agent"
-        ]
-        pinned_workflow_ids = [
-            item.get("id")
-            for item in resolved.values()
-            if item.get("kind") == "workflow"
-        ]
-        pinned_message_ids = [
-            item.get("id")
-            for item in resolved.values()
-            if item.get("kind") == "message"
-        ]
-        agents = self._grounding_agents(pinned_agent_ids=pinned_agent_ids)
-        workflows = self._grounding_workflows(pinned_workflow_ids=pinned_workflow_ids)
-        referenced_message_ids = self._grounding_message_ids_from_agents(agents)
-        messages = self._grounding_messages(
-            pinned_message_ids=pinned_message_ids,
-            referenced_message_ids=referenced_message_ids,
-        )
-        return {
-            "agents": agents,
-            "workflows": workflows,
-            "messages": messages,
-            "approvals": self._grounding_approvals(),
-            "events": self._grounding_events(),
-            "resolved_references": resolved,
-            "ambiguities": list(ambiguities or []),
-        }
+    def build_runtime_grounding(self, **kwargs) -> dict[str, Any]:
+        return _grounding.build_runtime_grounding(self, **kwargs)
 
     def _format_runtime_grounding_block(self, runtime_grounding: dict[str, Any]) -> str:
-        return "\n".join([
-            "RUNTIME STATE IS SOURCE OF TRUTH.",
-            "If this conflicts with remembered conversation context, trust runtime state.",
-            'Resolve references such as "that MR2" using the runtime state first.',
-            "Preview fields may be truncated. If a preview says full_available=true, full detail exists in backend observations even if not shown here.",
-            "",
-            "=== RUNTIME GROUNDING ===",
-            json.dumps(runtime_grounding, indent=2, sort_keys=True),
-            "=== END RUNTIME GROUNDING ===",
-        ])
+        return _grounding.format_runtime_grounding_block(runtime_grounding)
 
     def _format_routing_advice_block(self, route_advice: RouteAdvice) -> str:
         return "\n".join([
