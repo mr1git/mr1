@@ -119,6 +119,8 @@ from mr1.scheduler_core.semantic_validation import (
     extract_semantic_expectation,
 )
 from mr1.scheduler_core.state_machine import reopen_workflow
+from mr1.scheduler_core.tool_runtime import ToolTaskRunner
+from mr1.scheduler_core.watcher_runtime import WatcherPollService
 from mr1.watchers import (
     WatcherConfigError,
     WatchEvaluation,
@@ -889,6 +891,27 @@ class Scheduler:
             scoped_agents=self._scoped_agents,
             message_store=self._message_store,
         )
+        self._tool_task_runner = ToolTaskRunner(
+            tools=self._tools,
+            store=self._store,
+            approval_store=self._approval_store,
+            timeline=self._timeline,
+            apply_semantic_validation=self._apply_semantic_validation,
+            write_policy_audit=self._write_policy_audit,
+            append_policy_audit_index=self._append_policy_audit_index,
+            policy_audit_id=self._policy_audit_id,
+            finish_attempt=self._finish_attempt,
+        )
+        self._watcher_poll_service = WatcherPollService(
+            store=self._store,
+            watchers=self._watchers,
+            approval_store=self._approval_store,
+            event_adapter=self._event_adapter,
+            current_attempt_policy_audit_path=self._current_attempt_policy_audit_path,
+            finalize_policy_audit=self._finalize_policy_audit,
+            append_policy_audit_index_from_path=self._append_policy_audit_index_from_path,
+            finish_attempt=self._finish_attempt,
+        )
         self._tick_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1310,232 +1333,7 @@ class Scheduler:
             return True
 
     def _poll_running_watcher(self, wf: Workflow, task: Task) -> bool:
-        audit_path = self._current_attempt_policy_audit_path(task)
-        timeout_message = self._watcher_timeout_message(task)
-        if timeout_message is not None:
-            checked_at = _now_iso()
-            payload = {
-                "state": "timed_out",
-                "message": timeout_message,
-                "watcher_type": task.watcher_type,
-            }
-            result_path = str(self._store.write_attempt_result(
-                wf.workflow_id,
-                task.task_id,
-                task.current_attempt,
-                payload,
-            ))
-            if audit_path is not None:
-                self._finalize_policy_audit(
-                    audit_path,
-                    execution_result=dict(payload),
-                    error=timeout_message,
-                )
-                self._append_policy_audit_index_from_path(
-                    audit_path,
-                    execution_status=TaskStatus.TIMED_OUT.value,
-                    error=timeout_message,
-                )
-            self._finish_attempt(
-                wf,
-                task,
-                TaskStatus.TIMED_OUT,
-                event=ev.TASK_TIMED_OUT,
-                message=timeout_message,
-                error=timeout_message,
-                error_type="timeout",
-                result_path=result_path,
-                watch_satisfied_at=_UNSET,
-                last_checked_at=checked_at,
-                last_check_result=payload,
-                extra_events=[(
-                    ev.WATCHER_TIMED_OUT,
-                    timeout_message,
-                    payload,
-                )],
-            )
-            return True
-
-        if not self._should_evaluate_watcher(task):
-            return False
-
-        now = datetime.now(timezone.utc)
-        try:
-            evaluation = self._watchers.evaluate(task, now)
-        except Exception as exc:
-            evaluation = WatchEvaluation(
-                state="failed",
-                message=f"watcher evaluation error: {exc}",
-                metadata={"error": str(exc), "watcher_type": task.watcher_type},
-            )
-
-        checked_at = now.isoformat()
-        check_payload = self._watcher_result_payload(task, evaluation)
-        if evaluation.state == "not_satisfied":
-            self._record_watcher_check(
-                wf,
-                task,
-                checked_at=checked_at,
-                check_payload=check_payload,
-            )
-            return True
-
-        if evaluation.state == "satisfied":
-            task.status = TaskStatus.SUCCEEDED
-            task.last_checked_at = checked_at
-            task.last_check_result = check_payload
-            task.watch_satisfied_at = _now_iso()
-            output = build_watcher_task_output(task)
-            output_path = str(self._store.write_task_output(
-                wf.workflow_id,
-                task.task_id,
-                output,
-            ))
-            result_path = str(self._store.write_attempt_result(
-                wf.workflow_id,
-                task.task_id,
-                task.current_attempt,
-                check_payload,
-            ))
-            if audit_path is not None:
-                self._finalize_policy_audit(
-                    audit_path,
-                    execution_result=dict(check_payload),
-                )
-                approval_request_id = None
-                try:
-                    with open(audit_path, "r", encoding="utf-8") as handle:
-                        audit_record = CapabilityAuditRecord.from_dict(json.load(handle))
-                    approval_request_id = audit_record.decision.get("metadata", {}).get("approval_request_id")
-                except (OSError, json.JSONDecodeError, KeyError, ValueError):
-                    approval_request_id = None
-                if isinstance(approval_request_id, str) and approval_request_id:
-                    self._approval_store.mark_used(
-                        approval_request_id,
-                        audit_id=audit_path.stem,
-                    )
-                self._append_policy_audit_index_from_path(
-                    audit_path,
-                    execution_status=TaskStatus.SUCCEEDED.value,
-                    approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
-                )
-            self._finish_attempt(
-                wf,
-                task,
-                TaskStatus.SUCCEEDED,
-                event=ev.TASK_SUCCEEDED,
-                message=evaluation.message,
-                watch_satisfied_at=_now_iso(),
-                last_checked_at=checked_at,
-                last_check_result=check_payload,
-                extra_events=[(
-                    ev.WATCHER_SATISFIED,
-                    evaluation.message,
-                    check_payload,
-                ), (
-                    ev.OUTPUT_WRITTEN,
-                    "normalized output written",
-                    {"path": output_path},
-                )],
-                output_path=output_path,
-                result_path=result_path,
-            )
-            return True
-
-        if evaluation.state == "timed_out":
-            result_path = str(self._store.write_attempt_result(
-                wf.workflow_id,
-                task.task_id,
-                task.current_attempt,
-                check_payload,
-            ))
-            if audit_path is not None:
-                self._finalize_policy_audit(
-                    audit_path,
-                    execution_result=dict(check_payload),
-                    error=evaluation.message,
-                )
-                self._append_policy_audit_index_from_path(
-                    audit_path,
-                    execution_status=TaskStatus.TIMED_OUT.value,
-                    error=evaluation.message,
-                )
-            self._finish_attempt(
-                wf,
-                task,
-                TaskStatus.TIMED_OUT,
-                event=ev.TASK_TIMED_OUT,
-                message=evaluation.message,
-                error=evaluation.message,
-                error_type="timeout",
-                result_path=result_path,
-                last_checked_at=checked_at,
-                last_check_result=check_payload,
-                extra_events=[(
-                    ev.WATCHER_TIMED_OUT,
-                    evaluation.message,
-                    check_payload,
-                )],
-            )
-            return True
-
-        result_path = str(self._store.write_attempt_result(
-            wf.workflow_id,
-            task.task_id,
-            task.current_attempt,
-            check_payload,
-        ))
-        if audit_path is not None:
-            self._finalize_policy_audit(
-                audit_path,
-                execution_result=dict(check_payload),
-                error=evaluation.message,
-            )
-            self._append_policy_audit_index_from_path(
-                audit_path,
-                execution_status=TaskStatus.FAILED.value,
-                error=evaluation.message,
-            )
-        self._finish_attempt(
-            wf,
-            task,
-            TaskStatus.FAILED,
-            event=ev.TASK_FAILED,
-            message=evaluation.message,
-            error=evaluation.message,
-            error_type="unknown",
-            result_path=result_path,
-            last_checked_at=checked_at,
-            last_check_result=check_payload,
-            extra_events=[(
-                ev.WATCHER_FAILED,
-                evaluation.message,
-                check_payload,
-            )],
-        )
-        return True
-
-    def _should_evaluate_watcher(self, task: Task) -> bool:
-        if not task.last_checked_at:
-            return True
-        interval_s = task.watch_config.get("poll_interval_s", 1)
-        if not isinstance(interval_s, (int, float)) or interval_s < 0:
-            interval_s = 1
-        last_checked = datetime.fromisoformat(task.last_checked_at)
-        return (datetime.now(timezone.utc) - last_checked).total_seconds() >= interval_s
-
-    def _watcher_timeout_message(self, task: Task) -> Optional[str]:
-        max_wait_s = task.watch_config.get("max_wait_s")
-        if not isinstance(max_wait_s, (int, float)) or max_wait_s <= 0:
-            return None
-        started_at = task.watch_started_at or task.started_at
-        if not started_at:
-            return None
-        started_dt = datetime.fromisoformat(started_at)
-        elapsed_s = (datetime.now(timezone.utc) - started_dt).total_seconds()
-        if elapsed_s < max_wait_s:
-            return None
-        return f"watcher exceeded max_wait_s={int(max_wait_s)}"
+        return self._watcher_poll_service.poll(wf, task)
 
     def _workflow_actor_type(self, wf: Workflow) -> str:
         return self._capability_gate.workflow_actor_type(wf)
@@ -1705,19 +1503,6 @@ class Scheduler:
             )],
         )
 
-    def _watcher_result_payload(
-        self,
-        task: Task,
-        evaluation: WatchEvaluation,
-    ) -> dict[str, Any]:
-        payload = {
-            "state": evaluation.state,
-            "message": evaluation.message,
-            "watcher_type": task.watcher_type,
-        }
-        payload.update(dict(evaluation.metadata))
-        return payload
-
     def _normalize_error_type(
         self,
         result: RunResult,
@@ -1802,26 +1587,6 @@ class Scheduler:
             data=data,
             result_payload=result_payload,
         )
-
-    def _record_watcher_check(
-        self,
-        wf: Workflow,
-        task: Task,
-        *,
-        checked_at: str,
-        check_payload: dict[str, Any],
-    ) -> None:
-        with self._store.locked():
-            task.last_checked_at = checked_at
-            task.last_check_result = dict(check_payload)
-            self._store.save_workflow(wf)
-            self._event_adapter.emit_watcher_check(
-                wf.workflow_id,
-                task.task_id,
-                attempt_id=task.current_attempt or None,
-                message=check_payload.get("message", ""),
-                metadata=dict(check_payload),
-            )
 
     def _finalize_task(
         self,
@@ -2483,198 +2248,7 @@ class Scheduler:
         decision: dict[str, Any],
         audit_path: Path,
     ) -> None:
-        try:
-            tool_result = self._tools.run(task, self._store, wf)
-        except Exception as exc:
-            tool_result = ToolResult(
-                state="failed",
-                summary=f"tool failed: {task.tool_type}",
-                text="",
-                error=str(exc),
-                metadata={"tool_type": task.tool_type},
-            )
-
-        state_map = {
-            "succeeded": (TaskStatus.SUCCEEDED, ev.TASK_SUCCEEDED, ev.TOOL_SUCCEEDED),
-            "failed": (TaskStatus.FAILED, ev.TASK_FAILED, ev.TOOL_FAILED),
-            "timed_out": (TaskStatus.TIMED_OUT, ev.TASK_TIMED_OUT, ev.TOOL_TIMED_OUT),
-        }
-        target_status, task_event, tool_event = state_map.get(
-            tool_result.state,
-            (TaskStatus.FAILED, ev.TASK_FAILED, ev.TOOL_FAILED),
-        )
-        error_type: Optional[str] = "timeout" if target_status is TaskStatus.TIMED_OUT else None
-
-        extra_events: list[tuple[str, str, dict[str, Any]]] = []
-        output_path: Optional[str] = None
-        dataflow_error: Optional[str] = None
-        artifacts: list[Any] = []
-        output = None
-        try:
-            artifacts = register_artifacts(task, self._store, tool_result.artifacts)
-            for artifact in artifacts:
-                extra_events.append((
-                    ev.ARTIFACT_REGISTERED,
-                    f"artifact registered: {artifact.name}",
-                    {"name": artifact.name, "kind": artifact.kind, "path": artifact.path},
-                ))
-            if target_status is TaskStatus.SUCCEEDED:
-                output = build_tool_task_output(
-                    replace(
-                        task,
-                        status=target_status,
-                        tool_error=tool_result.error,
-                    ),
-                    tool_result,
-                )
-        except DataflowError as exc:
-            target_status = TaskStatus.FAILED
-            task_event = ev.TASK_FAILED
-            tool_event = ev.TOOL_FAILED
-            dataflow_error = str(exc)
-            error_type = "unknown"
-            tool_result = ToolResult(
-                state="failed",
-                summary=tool_result.summary,
-                text=tool_result.text,
-                data=tool_result.data,
-                metrics=tool_result.metrics,
-                artifacts=[],
-                metadata=tool_result.metadata,
-                error=str(exc),
-            )
-
-        result_payload = {
-            "task_id": task.task_id,
-            "workflow_id": wf.workflow_id,
-            "attempt_id": task.current_attempt,
-            "status": target_status.value,
-            "summary": tool_result.summary,
-            "text": tool_result.text,
-            "data": tool_result.data,
-            "metrics": tool_result.metrics,
-            "error": dataflow_error or tool_result.error,
-            "error_type": error_type,
-            "failure_type": None,
-            "retryable": None,
-            "audit_record_path": str(audit_path),
-        }
-        target_status, task_event, tool_result_summary, semantic_error, semantic_error_type, result_payload = self._apply_semantic_validation(
-            wf,
-            task,
-            target_status=target_status,
-            event_type=task_event,
-            summary=output.summary if output is not None else tool_result.summary,
-            text=output.text if output is not None else tool_result.text,
-            data=output.data if output is not None else tool_result.data,
-            result_payload=result_payload,
-        )
-        if semantic_error_type is not None:
-            error_type = semantic_error_type
-            tool_event = ev.TOOL_FAILED
-        tool_result_summary = tool_result_summary or tool_result.summary
-        if target_status is TaskStatus.SUCCEEDED and output is not None:
-            output_path = str(self._store.write_task_output(
-                wf.workflow_id,
-                task.task_id,
-                output,
-            ))
-            extra_events.append((
-                ev.OUTPUT_WRITTEN,
-                "normalized output written",
-                {"path": output_path},
-            ))
-        if target_status is TaskStatus.FAILED and error_type is None:
-            error_type = "unknown"
-        result_payload["error_type"] = error_type
-        result_path = str(self._store.write_attempt_result(
-            wf.workflow_id,
-            task.task_id,
-            task.current_attempt,
-            result_payload,
-        ))
-        self._write_policy_audit(
-            audit_path,
-            capability_name=request.capability_name,
-            request=request,
-            metadata=metadata,
-            decision=decision,
-            execution_result={
-                "status": target_status.value,
-                "summary": result_payload.get("summary"),
-                "text": result_payload.get("text"),
-                "data": dict(result_payload.get("data") or {}),
-                "metrics": dict(result_payload.get("metrics") or {}),
-            },
-            error=result_payload.get("error"),
-        )
-        approval_request_id = decision.get("metadata", {}).get("approval_request_id")
-        if (
-            target_status is TaskStatus.SUCCEEDED
-            and isinstance(approval_request_id, str)
-            and approval_request_id
-        ):
-            self._approval_store.mark_used(
-                approval_request_id,
-                audit_id=audit_path.stem,
-            )
-        self._append_policy_audit_index(
-            actor_id=request.actor_id,
-            audit_id=self._policy_audit_id(audit_path),
-            audit_path=audit_path,
-            request=request,
-            metadata=metadata,
-            decision=decision,
-            execution_status=target_status.value,
-            error=result_payload.get("error"),
-            approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
-        )
-        self._timeline.emit(
-            event_type="capability_executed" if target_status is TaskStatus.SUCCEEDED else "capability_failed",
-            actor_id=request.actor_id,
-            actor_type=request.actor_type,
-            target_id=request.capability_name,
-            target_type="capability",
-            status=target_status.value,
-            summary=(
-                f"capability executed: {request.capability_name}"
-                if target_status is TaskStatus.SUCCEEDED else
-                f"capability failed: {request.capability_name}"
-            ),
-            workflow_id=wf.workflow_id,
-            task_id=task.task_id,
-            approval_request_id=approval_request_id if isinstance(approval_request_id, str) else None,
-            audit_id=self._policy_audit_id(audit_path),
-            record_path=str(audit_path),
-            metadata={"error": result_payload.get("error")},
-        )
-        message = semantic_error or dataflow_error or tool_result.error or tool_result.summary or ""
-        event_metadata = {
-            "tool_type": task.tool_type,
-            "state": target_status.value,
-        }
-        if result_payload.get("error"):
-            event_metadata["error"] = result_payload.get("error")
-        if result_payload.get("data"):
-            event_metadata["data"] = dict(result_payload["data"])
-        extra_events.insert(0, (tool_event, message, event_metadata))
-        self._finish_attempt(
-            wf,
-            task,
-            target_status,
-            event=task_event,
-            message=message,
-            result_summary=tool_result_summary,
-            error=semantic_error or dataflow_error or tool_result.error,
-            error_type=error_type,
-            result_path=result_path,
-            output_path=output_path,
-            artifacts=artifacts,
-            dataflow_error=dataflow_error,
-            tool_finished_at=_now_iso(),
-            tool_error=dataflow_error or tool_result.error,
-            extra_events=extra_events,
-        )
+        return self._tool_task_runner.run(wf, task, request, metadata, decision, audit_path)
 
     # ------------------------------------------------------------------
     # Atomic commit helper
