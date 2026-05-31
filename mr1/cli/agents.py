@@ -23,6 +23,7 @@ from mr1.scoped_agents import (
     AgentScopeError,
     PersistentAgent,
     PersistentAgentStore,
+    derive_agent_lifecycle,
 )
 from mr1.workflow_models import Provenance, TaskStatus, Workflow
 from mr1.workflow_store import WorkflowStore
@@ -128,28 +129,28 @@ def _format_agents(
     if not agents:
         return "No agents."
     payload = [_persistent_agent_payload(agent) for agent in agents]
-    if brief:
+    if json_output and brief:
         payload = [
             {
                 "agent_id": item["agent_id"],
                 "agent_type": item["agent_type"],
                 "title": item["title"],
-                "status": item["status"],
+                "status": item["lifecycle_status"],
             }
             for item in payload
         ]
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
     rows = [("AGENT_ID", "TYPE", "TITLE", "STATUS", "LEVEL", "PARENT", "WORKFLOWS")]
-    for agent in agents:
+    for item in payload:
         rows.append((
-            agent.agent_id,
-            agent.agent_type,
-            agent.title,
-            agent.status,
-            str(agent.tree_level),
-            agent.parent_agent_id or "-",
-            str(len(agent.owned_workflow_ids)),
+            item["agent_id"],
+            item["agent_type"],
+            item["title"],
+            item["lifecycle_status"],
+            str(item["tree_level"]),
+            item["parent_agent_id"] or "-",
+            str(len(item["owned_workflow_ids"])),
         ))
     return _render_table(rows)
 
@@ -161,6 +162,7 @@ def _persistent_agent_payload(
     workflow_store: Optional[WorkflowStore] = None,
 ) -> dict[str, Any]:
     payload = agent.to_dict()
+    payload.update(derive_agent_lifecycle(agent))
     last_run = agent.last_run or {}
     payload["latest_run_id"] = last_run.get("run_id")
     payload["latest_run_stopped_reason"] = last_run.get("stopped_reason")
@@ -256,20 +258,23 @@ def _format_agent(
         owned_workflow_ids = list(agent.owned_workflow_ids)
         scope_roots = list(agent.scope_roots)
         report_names = [path.name for path in reports or []]
-    if brief:
+    if json_output and brief:
         payload = {
             "agent_id": payload["agent_id"],
             "agent_type": payload["agent_type"],
             "title": payload["title"],
-            "status": payload["status"],
+            "status": payload.get("lifecycle_status", payload["status"]),
         }
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
+    lifecycle_status = str(payload.get("lifecycle_status", status))
     lines = [
         f"agent_id:     {agent_id}",
         f"type:         {agent_type}",
         f"title:        {title}",
         f"status:       {status}",
+        f"lifecycle:    {lifecycle_status}",
+        f"status_conflict: {'yes' if payload.get('status_conflict') else 'no'}",
         f"clearance:    {clearance:.2f}",
         f"mission:      {_compact_text(mission)}",
         f"mode:         {mode}",

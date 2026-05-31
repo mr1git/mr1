@@ -11,7 +11,12 @@ from typing import Any, Optional
 
 from mr1.messages import MessageStore
 from mr1.mrn_loop import ALLOWED_MRN_ACTIONS, MRnStepResult, MRnStepRunner
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore, new_run_id
+from mr1.scoped_agents import (
+    AgentScopeError,
+    PersistentAgentStore,
+    is_agent_terminal,
+    new_run_id,
+)
 from mr1.workflow_store import WorkflowStore
 
 
@@ -146,7 +151,7 @@ class MRnRunRunner:
         if not self._scoped_agents.can_manage_agent(resolved_caller, agent_id):
             raise AgentScopeError("access denied: agent not in scope")
         agent = self._scoped_agents.require_agent(agent_id)
-        if agent.status == "terminated":
+        if is_agent_terminal(agent):
             raise ValueError(f"agent terminated: {agent_id}")
         if not (agent.mission and agent.mission.strip()):
             raise ValueError(f"no mission assigned: {agent_id}")

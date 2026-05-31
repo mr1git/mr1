@@ -1,0 +1,9 @@
+{
+  "category": "state",
+  "description": "After creating an agent, /status and /agents should reflect it consistently",
+  "elapsed_s": 0.03,
+  "findings": [],
+  "scenario": "state_status_after_creation",
+  "session_error": null,
+  "turn_count": 4
+}

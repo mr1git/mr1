@@ -13,13 +13,20 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from mr1.scoped_agents import AgentScopeError
+from mr1.scoped_agents import AgentScopeError, is_agent_live
 from mr1.inbox_triage import InboxTriagePolicy
 from mr1.mrn_run import MRnRunPolicy, MRnRunRunner
 from mr1.mrn_loop import MRnStepRunner
 from mr1.workflow_models import Provenance
 from mr1.scheduler import WatcherTriggerError, WorkflowSpecError
 from mr1 import workflow_cli
+
+_KNOWN_COMMAND_HINT = (
+    "Known commands: /status, /tasks, /kill, /stop, /history, /memdltr, "
+    "/workflows, /watchers, /workflow, /task, /result, /inputs, /artifacts, "
+    "/jobs, /events, /scheduler tick, /agents, /agent, /inbox, /outbox, "
+    "/message, /approvals, /tools, /capabilities, /schema, /help."
+)
 
 
 def handle_builtin(root, cmd: str) -> Optional[str]:
@@ -265,6 +272,7 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
             "Commands: /status  /tasks  /kill  /stop  /history  /memdltr  "
             "/workflows  /watchers  /capabilities  /capability <name>  "
             "/tools  /tool <type>  /agents  /agent <ag-id>  /agent create <title>  "
+            "/agent kill-all [all|<title>] [--exclude <agent-id-or-title>]...  "
             "/agent step <ag-id>  /agent run <ag-id> --steps N  "
             "/inbox  /outbox  /message <id>  /approvals  /schema  "
             "/vizualize  /visualize-web  /clear  /help  /exit  "
@@ -291,6 +299,9 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
             f"Stopped {total} spawned process/test agent(s). "
             "Persistent MRn agents are not affected."
         )
+    if cmd.startswith("/"):
+        command = cmd.split(maxsplit=1)[0]
+        return f"Unknown slash command: {command}. {_KNOWN_COMMAND_HINT}"
     return None
 
 def handle_capability_builtin(root, cmd: str) -> str:
@@ -393,7 +404,7 @@ def handle_capability_builtin(root, cmd: str) -> str:
 
 def handle_agent_builtin(root, cmd: str) -> str:
     usage = (
-        "usage: /agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|"
+        "usage: /agent <create <title>|kill <ag-id>|kill-all [all|<title>] [--exclude <agent-id-or-title>]...|assign <ag-id> <mission-file>|"
         "step <ag-id>|run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]|"
         "<ag-id>|kazi [health]> [--json] [--brief]"
     )
@@ -407,6 +418,8 @@ def handle_agent_builtin(root, cmd: str) -> str:
     command = parts[0]
     if command == "/agent" and len(parts) > 1 and parts[1] == "run":
         return root._handle_agent_run_builtin(parts[2:], usage)
+    if command == "/agent" and len(parts) > 1 and parts[1] == "kill-all":
+        return root._handle_agent_kill_all_builtin(parts[2:], usage)
     flags = {part for part in parts[1:] if part.startswith("--")}
     positionals = [part for part in parts[1:] if not part.startswith("--")]
     allowed_flags = {"--json", "--brief"}
@@ -510,6 +523,79 @@ def handle_agent_builtin(root, cmd: str) -> str:
         )
     except ValueError:
         return f"agent not found: {agent_name}"
+
+
+def handle_agent_kill_all_builtin(root, parts: list[str], usage: str) -> str:
+    del usage
+    selector = "all"
+    exclusions: list[str] = []
+    index = 0
+    while index < len(parts):
+        token = parts[index]
+        if token == "--exclude":
+            if index + 1 >= len(parts):
+                return "usage: /agent kill-all [all|<title>] [--exclude <agent-id-or-title>]..."
+            exclusions.append(parts[index + 1])
+            index += 2
+            continue
+        if selector != "all":
+            return "usage: /agent kill-all [all|<title>] [--exclude <agent-id-or-title>]..."
+        selector = token
+        index += 1
+
+    live_agents = [
+        agent
+        for agent in root._scoped_agents.list_visible_agents(root._root_agent_id)
+        if agent.agent_id != root._root_agent_id and is_agent_live(agent)
+    ]
+    if selector != "all":
+        normalized_selector = selector.strip().lower()
+        live_agents = [
+            agent
+            for agent in live_agents
+            if agent.agent_id == selector or agent.title.strip().lower() == normalized_selector
+        ]
+    if not live_agents:
+        return "No live agents matched the requested kill-all scope."
+
+    normalized_exclusions = {item.strip().lower() for item in exclusions if item.strip()}
+    excluded = [
+        agent
+        for agent in live_agents
+        if agent.agent_id.lower() in normalized_exclusions
+        or agent.title.strip().lower() in normalized_exclusions
+    ]
+    targets = [agent for agent in live_agents if agent not in excluded]
+
+    terminated: list[str] = []
+    errors: list[str] = []
+    for agent in targets:
+        try:
+            root._scoped_agents.terminate_agent(root._root_agent_id, agent.agent_id)
+            terminated.append(agent.agent_id)
+        except (ValueError, AgentScopeError) as exc:
+            errors.append(f"{agent.agent_id}: {exc}")
+
+    parts_out: list[str] = []
+    if terminated:
+        parts_out.append(f"Terminated {len(terminated)} agent(s): {', '.join(terminated)}.")
+    if excluded:
+        excluded_text = ", ".join(f"{agent.title} ({agent.agent_id})" for agent in excluded)
+        parts_out.append(f"Excluded {len(excluded)} agent(s): {excluded_text}.")
+    unmatched_exclusions = [
+        item
+        for item in exclusions
+        if item.strip()
+        and item.strip().lower() not in {
+            *[agent.agent_id.lower() for agent in live_agents],
+            *[agent.title.strip().lower() for agent in live_agents],
+        }
+    ]
+    if unmatched_exclusions:
+        parts_out.append(f"Unmatched exclusions: {', '.join(unmatched_exclusions)}.")
+    if errors:
+        parts_out.append(f"Errors: {'; '.join(errors)}")
+    return " ".join(parts_out) if parts_out else "No agents terminated."
 
 def handle_agent_run_builtin(root, parts: list[str], usage: str) -> str:
     if not parts:
@@ -851,4 +937,3 @@ def submit_workflow_from_path(root, path_str: str) -> str:
     except WorkflowSpecError as exc:
         return f"invalid workflow: {exc}"
     return f"submitted: {wf_id}"
-

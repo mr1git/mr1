@@ -1,0 +1,9 @@
+{
+  "category": "routing",
+  "description": "'run the workflow again' with no workflows should clarify, not create",
+  "elapsed_s": 8.46,
+  "findings": [],
+  "scenario": "nl_run_workflow_again",
+  "session_error": null,
+  "turn_count": 1
+}

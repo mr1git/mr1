@@ -1,0 +1,9 @@
+{
+  "category": "observability",
+  "description": "A direct_answer turn likely produces no timeline events \u2014 confirm gap",
+  "elapsed_s": 4.44,
+  "findings": [],
+  "scenario": "obs_timeline_on_direct_answer",
+  "session_error": null,
+  "turn_count": 1
+}

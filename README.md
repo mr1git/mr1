@@ -8,105 +8,46 @@ MR1 is a persistent, terminal-based multi-agent system built on the Claude CLI. 
 python main.py
 ```
 
-`python main.py` now launches the Ink timeline/tree UI by default. That UI is the primary MR1 interface: you talk to MR1 in the same screen while the background task tree animates above the conversation.
+`python main.py` runs the plain chat loop.
 
-There is also an experimental `TermUI` renderer with a simpler block-style MR1 anchor:
-
-```bash
-python main.py --termui
-```
-
-There is now also a browser-based path that avoids terminal rendering entirely:
+To launch the read-only runtime TUI instead:
 
 ```bash
-python main.py --web
+python main.py --tui
 ```
 
-To use the legacy plain-text loop instead:
+or:
+
+```bash
+python -m mr1.tui
+```
+
+The plain chat path also remains available explicitly:
 
 ```bash
 python main.py --plain
 ```
 
-## Timeline UI
+## Runtime TUI
 
-The Ink UI is no longer a detached observer. It is the main MR1 frontend.
+The new TUI is a separate read-only runtime viewer over the persisted MR1 state.
 
 It provides:
 
-- `R` root MR1
-- `O/Y/G/B/I/V` deeper or later tree positions
-- a moving MR1 anchor with timeline-follow behavior
-- a lower conversation lane and an upper system lane
-- child agents that stay attached while alive, then freeze and dim when dead
-- a built-in prompt composer so you can talk to MR1 directly inside the UI
+- a live MR1/MRn tree with MR1 pinned at the top
+- keyboard-first navigation by parent, child, and sibling
+- timeline mode for recent runtime events
+- a right-side detail panel for the selected agent or event
+- dimmed terminated agents and a dead-agent visibility toggle
+- live-follow mode that can be frozen while inspecting history
 
-Install the Node dependencies once from the project root:
+Inside the plain loop, `/vizualize`, `/visualize`, and `/visualize-web` now print guidance for the TUI rather than launching legacy UI paths.
 
-```bash
-npm install
-```
-
-Then either launch it directly:
-
-```bash
-npm run viz
-```
-
-To try the experimental `TermUI` prototype directly:
-
-```bash
-npm run viz:termui
-```
-
-For a non-interactive smoke render of the current timeline snapshot:
-
-```bash
-npm run viz:once
-```
-
-For a static `TermUI` smoke render against the current snapshot:
-
-```bash
-npm run viz:termui:once
-```
-
-For deterministic frontend checks:
-
-```bash
-npm run viz:test
-```
-
-And for the deterministic `TermUI` render checks:
-
-```bash
-npm run viz:termui:test
-```
-
-Inside the legacy plain loop, `/vizualize` and `/visualize` now act as handoff hints toward the primary Ink UI rather than launching a detached observer window.
-
-For the browser-based visualizer inside the plain loop, use `/visualize-web`.
-
-For synthetic workload generation in either the plain loop or the web prompt, use:
+For synthetic workload generation in the plain loop, use:
 
 ```text
 /test spawn agents 3
 /test kill agents
-```
-
-## Bridge
-
-The Ink app talks to a Python bridge process instead of scraping terminal output. The bridge owns a persistent MR1 instance and emits structured JSON lines for:
-
-- conversation turns
-- task lifecycle events
-- periodic timeline snapshots
-- command results and errors
-
-You can run it directly for debugging:
-
-```bash
-python -m mr1.ui_bridge
 ```
 
 ## Agent hierarchy
@@ -134,8 +75,8 @@ MR1 decides per-turn whether to answer directly, delegate to Kami (complex), or 
 | `/tasks`   | List all tasks with status icons            |
 | `/kill`    | Terminate all running agents                |
 | `/history` | Show recent conversation turns              |
-| `/vizualize` | Explain how to switch to the primary Ink UI |
-| `/visualize-web` | Launch the browser-based web visualizer |
+| `/vizualize` | Show how to launch the runtime TUI |
+| `/visualize-web` | Alias that now points to the runtime TUI |
 | `/test spawn agents <h>` | Spawn a synthetic full binary tree of worker processes |
 | `/test kill agents` | Kill all synthetic worker processes |
 | `exit`     | Save session state and quit                 |
@@ -144,7 +85,7 @@ MR1 decides per-turn whether to answer directly, delegate to Kami (complex), or 
 
 Phase 1 adds a deterministic workflow scheduler that runs inside the MR1 process. Workflow control does not invoke MR1 reasoning: submission, discovery, scheduling, event logging, and inspection all go through the store, scheduler, and workflow CLI only.
 
-Supported commands in the plain loop, UI bridge, and web UI:
+Supported commands in the plain loop:
 
 | Command | Effect |
 |---------|--------|

@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from mr1 import workflow_events as ev
 from mr1.capability_policy import CapabilityApprovalStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import PersistentAgentStore, is_agent_terminal
 from mr1.workflow_models import Task, TaskStatus, Workflow
 
 
@@ -207,7 +207,7 @@ class SemanticValidator:
                 remaining = [
                     agent_id
                     for agent_id in target_agent_ids
-                    if (agent := self._scoped_agents.load_agent(agent_id)) is None or agent.status != "terminated"
+                    if (agent := self._scoped_agents.load_agent(agent_id)) is None or not is_agent_terminal(agent)
                 ]
                 if remaining:
                     return "target agents not terminated: " + ", ".join(remaining)

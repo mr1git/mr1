@@ -347,6 +347,20 @@ def test_terminated_agent_rejection(workflow_store, agent_store, message_store):
         runner.run(child.agent_id, MRnRunPolicy(), caller_agent_id=root.agent_id)
 
 
+def test_legacy_active_terminated_agent_rejection(workflow_store, agent_store, message_store):
+    root, child = _child_agent(agent_store)
+    child.run_status = "terminated"
+    agent_store.save_agent(child)
+    runner = MRnRunRunner(
+        workflow_store=workflow_store,
+        scoped_agent_store=agent_store,
+        message_store=message_store,
+    )
+
+    with pytest.raises(ValueError, match=f"agent terminated: {child.agent_id}"):
+        runner.run(child.agent_id, MRnRunPolicy(), caller_agent_id=root.agent_id)
+
+
 def test_scope_denial(workflow_store, agent_store, message_store):
     root = agent_store.ensure_root_agent()
     left = agent_store.create_child_agent(root.agent_id, "left")

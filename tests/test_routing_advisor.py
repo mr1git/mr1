@@ -1,3 +1,5 @@
+import pytest
+
 from mr1.routing_advisor import build_route_advice
 
 
@@ -80,6 +82,60 @@ def test_create_workflow_routes_correctly():
     advice = build_route_advice(
         "create a workflow to read README and summarize",
         runtime_grounding=_runtime_grounding(),
+    )
+
+    assert advice.route == "create_workflow"
+
+
+def test_create_workflow_with_lists_verb_routes_correctly():
+    advice = build_route_advice(
+        "create a workflow that lists files in /tmp and writes the count to a report",
+        runtime_grounding=_runtime_grounding(),
+    )
+
+    assert advice.route == "create_workflow"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "yes",
+        "yes, submit it",
+        "ok",
+        "okay",
+        "submit",
+        "do it",
+        "go ahead",
+        "proceed",
+    ],
+)
+def test_pending_workflow_confirmation_phrases_route_to_workflow_handling(phrase):
+    advice = build_route_advice(
+        phrase,
+        runtime_grounding=_runtime_grounding(),
+        pending_state={"mode": "create"},
+    )
+
+    assert advice.route == "create_workflow"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "no",
+        "cancel",
+        "stop",
+        "nevermind",
+        "never mind",
+        "abort",
+        "actually nevermind, cancel that",
+    ],
+)
+def test_pending_workflow_cancellation_phrases_route_to_workflow_handling(phrase):
+    advice = build_route_advice(
+        phrase,
+        runtime_grounding=_runtime_grounding(),
+        pending_state={"mode": "create"},
     )
 
     assert advice.route == "create_workflow"
@@ -173,3 +229,66 @@ def test_why_did_you_create_question_routes_direct_response():
     )
 
     assert advice.route == "direct_response"
+
+
+def test_confirmation_without_pending_workflow_clarifies():
+    advice = build_route_advice(
+        "yes, submit it",
+        runtime_grounding=_runtime_grounding(),
+    )
+
+    assert advice.route == "ask_clarification"
+
+
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "create three agents and then kill them all",
+        "create an agent then delete it",
+        "spawn five workers and immediately stop them",
+    ],
+)
+def test_conflicting_create_then_destroy_routes_to_clarification(user_text):
+    advice = build_route_advice(
+        user_text,
+        runtime_grounding=_runtime_grounding(),
+    )
+
+    assert advice.route == "ask_clarification"
+
+
+@pytest.mark.parametrize(
+    ("user_text", "expected_route"),
+    [
+        ("delete every workflow and every agent right now", "ask_clarification"),
+        ("delete the old one", "ask_clarification"),
+        ("delete everything", "ask_clarification"),
+        ("show me pending approvals", "inspect_existing_state"),
+        ("list all workflows", "inspect_existing_state"),
+        ("list approvals", "inspect_existing_state"),
+        ("spawn twenty agents that each watch a different file", "persistent_agent"),
+        ("spawn an agent for me", "persistent_agent"),
+        ("kill the archivist permanently", "run_commands"),
+        ("kill the archivist agent permanently", "run_commands"),
+        ("tell librarian to summarize last week's notes", "run_commands"),
+        ("tell the librarian agent to summarize last week's notes", "run_commands"),
+        ("rerun it", "ask_clarification"),
+        ("stop that", "ask_clarification"),
+        ("rename Librarian to PaperLibrarian", "run_commands"),
+        ("pause that agent", "run_commands"),
+        ("create three agents and then kill them all", "ask_clarification"),
+        ("can you show me what's running?", "inspect_existing_state"),
+        ("what workflows are running?", "inspect_existing_state"),
+    ],
+)
+def test_runtime_qa_routing_phrases_route_as_expected(user_text, expected_route):
+    advice = build_route_advice(
+        user_text,
+        runtime_grounding=_runtime_grounding(
+            agents=[{"agent_id": "ag-1", "title": "Archivist"}, {"agent_id": "ag-2", "title": "Librarian"}],
+            workflows=[{"workflow_id": "wf-1", "title": "Example", "status": "running"}],
+            approvals=[{"approval_request_id": "cap_approval_test"}],
+        ),
+    )
+
+    assert advice.route == expected_route

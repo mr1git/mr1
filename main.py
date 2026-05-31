@@ -6,9 +6,7 @@ Run this to start the MR1 multi-agent system.
   python main.py
 """
 
-import json
 import argparse
-import os
 import shutil
 import subprocess
 import sys
@@ -39,13 +37,6 @@ _REQUIRED_AGENT_CONFIGS = [
 ]
 
 _CONFIG_PATH = _PROJECT_ROOT / "config.yml"
-
-
-def _launch_visual_ui(script: str = "viz") -> int:
-    env = dict(os.environ)
-    env["MR1_PROJECT_ROOT"] = str(_PROJECT_ROOT)
-    env["MR1_PYTHON_BIN"] = sys.executable
-    return subprocess.run(["npm", "run", script], cwd=_PROJECT_ROOT, env=env).returncode
 
 
 # ---------------------------------------------------------------------------
@@ -145,36 +136,25 @@ def _load_and_validate_configs() -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MR1 entry point")
-    parser.add_argument("--plain", action="store_true", help="run the legacy plain-text interface")
     parser.add_argument(
-        "--termui",
+        "--plain",
         action="store_true",
-        help="run the experimental TermUI visual interface",
+        help="run the plain-text chat interface",
     )
     parser.add_argument(
-        "--web",
+        "--tui",
         action="store_true",
-        help="run the browser-based MR1 visual interface",
+        help="run the read-only runtime TUI",
     )
     args = parser.parse_args()
 
     # Ensure mr1 package is importable from this file's directory.
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-    if not args.plain:
-        if args.web:
-            from mr1.web_viz import serve_standalone
-            _check_claude_installed()
-            _check_claude_authenticated()
-            _init_directories()
-            _check_agent_configs()
-            _check_config()
-            _load_and_validate_configs()
-            sys.exit(serve_standalone())
-        if shutil.which("npm") is not None:
-            script = "viz:termui" if args.termui else "viz"
-            sys.exit(_launch_visual_ui(script))
-        print("npm not found on PATH. Falling back to the plain MR1 loop.\n")
+    if args.tui:
+        from mr1.tui import main as tui_main
+
+        sys.exit(tui_main())
 
     print("MR1 — starting up...")
 

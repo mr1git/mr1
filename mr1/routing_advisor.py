@@ -17,12 +17,18 @@ _REPLY_INTENT_PATTERN = re.compile(
 _INSPECTION_PHRASES = (
     "check",
     "inspect",
+    "show",
+    "list",
+    "display",
+    "view",
     "status",
     "result",
     "results",
     "findings",
     "summarize findings",
     "what happened",
+    "what's running",
+    "whats running",
     "did it finish",
     "did the workflow finish",
     "finish running",
@@ -52,9 +58,17 @@ _RUN_COMMAND_VERBS = (
     "kill",
     "terminate",
     "resume",
+    "pause",
+    "rename",
+    "delete",
+    "remove",
+    "wipe",
+    "purge",
     "message",
     "send",
     "ask",
+    "tell",
+    "stop",
 )
 _PERSISTENT_MARKERS = (
     "persistent agent",
@@ -73,6 +87,10 @@ _PERSISTENT_MARKERS = (
 )
 _PERSISTENT_IMPERATIVE_PATTERNS = (
     re.compile(r"\bcreate\s+(?:a|an)\s+(?!workflow\b)(?:\w+\s+){0,3}(?:agent|child)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:spawn|make|add|start|set\s+up)\s+(?!workflow\b)(?:(?:a|an)\s+)?(?:\w+\s+){0,4}(?:agent|agents|child|children)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bcreate an owner agent\b", re.IGNORECASE),
     re.compile(r"\bcreate a persistent agent\b", re.IGNORECASE),
     re.compile(r"\bcreate (?:a|an) agent to own\b", re.IGNORECASE),
@@ -105,6 +123,39 @@ _WORKFLOW_ACTION_WORDS = re.compile(
     r"\b(read|write|run|check|summarize|create|generate|inspect|list|save|wait|trigger|search)\b",
     re.IGNORECASE,
 )
+_RERUN_VERB_PATTERN = re.compile(r"\b(rerun|re-run|retry|restart)\b", re.IGNORECASE)
+_AGENT_COMMAND_SHAPE_PATTERNS = (
+    re.compile(
+        r"\b(?:kill|terminate|resume|pause|stop)\s+(?:(?:that|this|the)\s+)?(?!that\b|this\b|it\b|everything\b|one\b)[a-z0-9][\w-]*\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:message|send|ask|tell)\s+(?:(?:that|this|the)\s+)?(?!that\b|this\b|it\b|everything\b|one\b)[a-z0-9][\w-]*\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\brename\s+(?:(?:that|this|the)\s+)?(?!that\b|this\b|it\b|everything\b|one\b)[a-z0-9][\w-]*(?:\s+[a-z0-9][\w-]*){0,2}\s+to\s+[a-z0-9][\w-]*\b",
+        re.IGNORECASE,
+    ),
+)
+
+_WORKFLOW_CONFIRMATION_PATTERNS = (
+    re.compile(r"^yes(?:,\s*submit(?:\s+it)?)?[.!]?$", re.IGNORECASE),
+    re.compile(r"^(?:ok|okay|submit|do it|go ahead|proceed|confirm|run it|execute)[.!]?$", re.IGNORECASE),
+)
+
+_WORKFLOW_CANCELLATION_PATTERNS = (
+    re.compile(r"^(?:no|cancel|stop|abort)[.!]?$", re.IGNORECASE),
+    re.compile(r"^(?:nevermind|never mind)[.!]?$", re.IGNORECASE),
+    re.compile(r"^actually\s+(?:nevermind|never mind),?\s+cancel(?:\s+that)?[.!]?$", re.IGNORECASE),
+)
+
+_CONFLICTING_AGENT_LIFECYCLE_PATTERNS = (
+    re.compile(
+        r"\b(?:create|spawn|make|add|start|set\s+up)\b.*\b(?:agent|agents|worker|workers|child|children)\b.*\b(?:and|then|immediately)\b.*\b(?:kill|terminate|delete|remove|stop)\b.*\b(?:all|them|it)\b",
+        re.IGNORECASE,
+    ),
+)
 
 _LOW_CONFIDENCE_THRESHOLD = 0.70
 
@@ -115,6 +166,11 @@ def _normalize_text(value: str) -> str:
 
 def _explicit_ids(pattern: re.Pattern[str], user_input: str) -> list[str]:
     return sorted(set(pattern.findall(user_input)))
+
+
+def _contains_phrase(normalized: str, phrase: str) -> bool:
+    pattern = r"\b" + re.escape(phrase).replace(r"\ ", r"\s+") + r"\b"
+    return re.search(pattern, normalized) is not None
 
 
 def _starts_with_meta_prefix(normalized: str) -> bool:
@@ -150,6 +206,10 @@ def _has_explicit_operational_intent(normalized: str) -> bool:
     return any(re.search(rf"\b{verb}\b", normalized) for verb in _RUN_COMMAND_VERBS)
 
 
+def _has_agent_command_shape(normalized: str) -> bool:
+    return any(pattern.search(normalized) for pattern in _AGENT_COMMAND_SHAPE_PATTERNS)
+
+
 def _has_runtime_workflow_cue(runtime_grounding: Optional[dict[str, Any]]) -> bool:
     if not isinstance(runtime_grounding, dict):
         return False
@@ -169,6 +229,18 @@ def _has_runtime_approval_cue(runtime_grounding: Optional[dict[str, Any]]) -> bo
         return False
     approvals = runtime_grounding.get("approvals")
     return isinstance(approvals, list) and bool(approvals)
+
+
+def _looks_like_workflow_preview_confirmation(normalized: str) -> bool:
+    return any(pattern.fullmatch(normalized) for pattern in _WORKFLOW_CONFIRMATION_PATTERNS)
+
+
+def _looks_like_workflow_preview_cancellation(normalized: str) -> bool:
+    return any(pattern.fullmatch(normalized) for pattern in _WORKFLOW_CANCELLATION_PATTERNS)
+
+
+def _has_conflicting_agent_lifecycle_intent(normalized: str) -> bool:
+    return any(pattern.search(normalized) for pattern in _CONFLICTING_AGENT_LIFECYCLE_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -279,6 +351,26 @@ def build_route_advice(
                 reason="A pending workflow draft exists, so this turn stays in workflow-authoring handling.",
             )
 
+    if _has_conflicting_agent_lifecycle_intent(normalized):
+        return _advice(
+            "ask_clarification",
+            required_refs=required_refs,
+            side_effects_allowed=False,
+            recommended_commands=["ask_clarification"],
+            confidence=0.91,
+            reason="The turn combines conflicting agent lifecycle actions by creating agents and immediately destroying them.",
+        )
+
+    if _looks_like_workflow_preview_confirmation(normalized) or _looks_like_workflow_preview_cancellation(normalized):
+        return _advice(
+            "ask_clarification",
+            required_refs=required_refs,
+            side_effects_allowed=False,
+            recommended_commands=["ask_clarification"],
+            confidence=0.74,
+            reason="The turn looks like workflow confirmation or cancellation language, but no pending workflow draft exists.",
+        )
+
     if _has_explicit_operational_intent(normalized):
         if message_ids and _REPLY_INTENT_PATTERN.search(user_input):
             return _advice(
@@ -301,8 +393,12 @@ def build_route_advice(
                 confidence=0.97 if approval_ids else 0.82,
                 reason="The turn requests an immediate approval decision rather than an explanation.",
             )
-        if any(re.search(rf"\b{verb}\b", normalized) for verb in ("kill", "terminate", "resume", "message", "send", "ask")) and any(
-            token in normalized for token in ("agent", "agents", "child", "children", "ag-")
+        if any(
+            re.search(rf"\b{verb}\b", normalized)
+            for verb in ("kill", "terminate", "resume", "pause", "rename", "message", "send", "ask", "tell", "stop")
+        ) and (
+            any(token in normalized for token in ("agent", "agents", "child", "children", "ag-"))
+            or _has_agent_command_shape(normalized)
         ):
             return _advice(
                 "run_commands",
@@ -312,18 +408,36 @@ def build_route_advice(
                 confidence=0.84,
                 reason="The turn requests an immediate operational agent command rather than a meta discussion.",
             )
+        if any(re.search(rf"\b{verb}\b", normalized) for verb in ("delete", "remove", "wipe", "purge", "stop")):
+            return _advice(
+                "ask_clarification",
+                required_refs=required_refs,
+                side_effects_allowed=False,
+                recommended_commands=["ask_clarification"],
+                confidence=0.68,
+                reason="The turn is operational and potentially destructive, but the exact runtime target or command form is underspecified.",
+            )
 
-    has_inspection_intent = any(phrase in normalized for phrase in _INSPECTION_PHRASES)
+    has_inspection_intent = any(_contains_phrase(normalized, phrase) for phrase in _INSPECTION_PHRASES)
     has_inspection_intent = has_inspection_intent or bool(
         re.search(r"\bdid\b.*\bfinish(?:\s+running)?\b", normalized)
     )
     has_inspection_intent = has_inspection_intent or bool(
         re.search(r"\bwhy\b.*\bfail(?:ed)?\b", normalized)
     )
+    has_inspection_intent = has_inspection_intent or bool(
+        re.search(r"\b(?:show|list|display|view)\b", normalized)
+    )
+    has_inspection_intent = has_inspection_intent or bool(
+        re.search(r"\bwhat(?:'s| is)\s+running\b", normalized)
+    )
+    has_inspection_intent = has_inspection_intent or bool(
+        re.search(r"\bwhat\s+workflows?\s+are\s+running\b", normalized)
+    )
     if has_inspection_intent and not persistent_request and not _is_meta_request(normalized):
         explicit_state_refs = bool(workflow_ids or task_ids or agent_ids)
         workflow_language = any(
-            token in normalized for token in ("workflow", "task", "findings", "results", "status")
+            token in normalized for token in ("workflow", "task", "findings", "results", "status", "running")
         )
         agent_language = any(
             token in normalized
@@ -337,6 +451,7 @@ def build_route_advice(
                 "message",
             )
         )
+        approval_language = "approval" in normalized or "approvals" in normalized
         pronoun_followup = (
             "that workflow" in normalized
             or "this workflow" in normalized
@@ -357,6 +472,9 @@ def build_route_advice(
             or (pronoun_followup and _has_runtime_workflow_cue(runtime_grounding))
             or agent_language
             or (agent_followup and _has_runtime_agent_cue(runtime_grounding))
+            or approval_language
+            or "pending" in normalized
+            or "running" in normalized
         ):
             return _advice(
                 "inspect_existing_state",
@@ -395,6 +513,16 @@ def build_route_advice(
             recommended_commands=["load_workflow", "author_workflow_modification", "submit_workflow"],
             confidence=0.93,
             reason="The turn references an existing workflow and asks for modification or rerun behavior.",
+        )
+
+    if _RERUN_VERB_PATTERN.search(normalized):
+        return _advice(
+            "ask_clarification",
+            required_refs=required_refs,
+            side_effects_allowed=False,
+            recommended_commands=["ask_clarification"],
+            confidence=0.68,
+            reason="The turn requests a rerun/retry action but does not identify the workflow or task precisely enough to execute safely.",
         )
 
     if not _is_meta_request(normalized):

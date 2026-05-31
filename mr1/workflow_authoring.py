@@ -69,6 +69,18 @@ JSON_PREVIEW_PATTERNS = (
     "json preview",
 )
 
+_CONFIRM_PREVIEW_PATTERNS = (
+    re.compile(r"^yes(?:,\s*submit(?:\s+it)?)?[.!]?$", re.IGNORECASE),
+    re.compile(r"^(?:ok|okay)[.!]?$", re.IGNORECASE),
+    re.compile(r"^(?:submit|confirm|run it|execute|do it|go ahead|proceed)[.!]?$", re.IGNORECASE),
+)
+
+_CANCEL_PREVIEW_PATTERNS = (
+    re.compile(r"^(?:no|cancel|stop|abort)[.!]?$", re.IGNORECASE),
+    re.compile(r"^(?:nevermind|never mind)[.!]?$", re.IGNORECASE),
+    re.compile(r"^actually\s+(?:nevermind|never mind),?\s+cancel(?:\s+that)?[.!]?$", re.IGNORECASE),
+)
+
 WORKFLOW_ID_PATTERN = re.compile(r"\bwf-\d{8}T\d{6}-[0-9a-f]{6}\b")
 
 _BRANCH_REASONING_PROMPT = """\
@@ -115,6 +127,20 @@ def _now_iso() -> str:
 
 def _normalize_text(value: str) -> str:
     return " ".join(value.strip().lower().split())
+
+
+def is_confirm_preview_input(user_input: str) -> bool:
+    normalized = _normalize_text(user_input)
+    if normalized in CONFIRM_PREVIEW_INPUTS:
+        return True
+    return any(pattern.fullmatch(normalized) for pattern in _CONFIRM_PREVIEW_PATTERNS)
+
+
+def is_cancel_preview_input(user_input: str) -> bool:
+    normalized = _normalize_text(user_input)
+    if normalized in CANCEL_PREVIEW_INPUTS:
+        return True
+    return any(pattern.fullmatch(normalized) for pattern in _CANCEL_PREVIEW_PATTERNS)
 
 
 def _json_dumps(value: Any) -> str:
@@ -545,9 +571,9 @@ class WorkflowAuthoringService:
     ) -> str:
         normalized = _normalize_text(user_input)
         if pending_draft is not None:
-            if normalized in CONFIRM_PREVIEW_INPUTS:
+            if is_confirm_preview_input(normalized):
                 return "confirm_preview"
-            if normalized in CANCEL_PREVIEW_INPUTS:
+            if is_cancel_preview_input(normalized):
                 return "cancel_preview"
             if any(pattern in normalized for pattern in JSON_PREVIEW_PATTERNS):
                 return "show_json_preview"
@@ -738,10 +764,10 @@ class WorkflowAuthoringService:
             lines.append("")
             lines.append("Dataflow:")
             lines.extend(dataflow_lines)
-        if complexity == "complex":
-            lines.append("")
-            lines.append("Reply with `yes`, `confirm`, `run it`, `execute`, or `submit` to run it.")
-            lines.append("Reply with `show json` to inspect the exact workflow JSON.")
+        lines.append("")
+        lines.append("Reply with `yes`, `ok`, `submit`, `do it`, `go ahead`, or `proceed` to run it.")
+        lines.append("Reply with `no`, `cancel`, `stop`, or `never mind` to discard it.")
+        lines.append("Reply with `show json` to inspect the exact workflow JSON.")
         return "\n".join(lines), complexity
 
     def submit(

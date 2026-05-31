@@ -257,6 +257,22 @@ class TestAgentBuiltins:
         reloaded = mr1._scoped_agents.require_agent(child.agent_id)
         assert reloaded.mission == "Investigate the repo"
 
+    def test_persistent_agent_builtins_show_derived_lifecycle_for_legacy_conflict(self, tmp_path):
+        mr1 = _build_mr1(tmp_path)
+        child = mr1._scoped_agents.create_child_agent(mr1._root_agent_id, "research")
+        child.run_status = "terminated"
+        mr1._scoped_agents.save_agent(child)
+
+        agents_output = mr1._handle_builtin("/agents")
+        agent_output = mr1._handle_builtin(f"/agent {child.agent_id}")
+        child_line = next(line for line in agents_output.splitlines() if child.agent_id in line)
+
+        assert "terminated" in child_line
+        assert "status:       active" in agent_output
+        assert "run_status:   terminated" in agent_output
+        assert "lifecycle:    terminated" in agent_output
+        assert "status_conflict: yes" in agent_output
+
     def test_runtime_agent_json_builtin_includes_assignment_packet(self, tmp_path):
         mr1 = _build_mr1(tmp_path)
         root = mr1._scoped_agents.ensure_root_agent()

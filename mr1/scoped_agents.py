@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_ROOT = Path(__file__).resolve().parent / "memory" / "agents"
+ACTIVE_AGENT_STATUS = "active"
+TERMINAL_AGENT_STATUSES = frozenset({"terminated", "archived", "dead"})
+TERMINAL_RUN_STATUSES = frozenset({"terminated", "completed", "failed", "dead"})
 
 
 def _now_iso() -> str:
@@ -47,6 +50,60 @@ def new_agent_id() -> str:
 def new_run_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     return f"run-{timestamp}-{uuid.uuid4().hex[:6]}"
+
+
+def _normalize_lifecycle_value(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def derive_lifecycle_state(
+    status: str | None,
+    run_status: str | None,
+) -> dict[str, Any]:
+    normalized_status = _normalize_lifecycle_value(status)
+    normalized_run_status = _normalize_lifecycle_value(run_status)
+    status_is_terminal = normalized_status in TERMINAL_AGENT_STATUSES
+    run_is_terminal = normalized_run_status in TERMINAL_RUN_STATUSES
+    status_conflict = normalized_status == ACTIVE_AGENT_STATUS and run_is_terminal
+    is_terminal = status_is_terminal or run_is_terminal
+    is_live = normalized_status == ACTIVE_AGENT_STATUS and not run_is_terminal
+    lifecycle_status = normalized_status or "-"
+    if status_is_terminal:
+        lifecycle_status = normalized_status
+    elif status_conflict:
+        lifecycle_status = "terminated"
+    elif normalized_status:
+        lifecycle_status = normalized_status
+    elif run_is_terminal:
+        lifecycle_status = "terminated"
+    elif normalized_run_status:
+        lifecycle_status = normalized_run_status
+    return {
+        "status": normalized_status or None,
+        "run_status": normalized_run_status or None,
+        "lifecycle_status": lifecycle_status,
+        "is_live": is_live,
+        "is_terminal": is_terminal,
+        "status_conflict": status_conflict,
+    }
+
+
+def derive_agent_lifecycle(agent: "PersistentAgent") -> dict[str, Any]:
+    return derive_lifecycle_state(agent.status, agent.run_status)
+
+
+def is_agent_terminal(agent: "PersistentAgent") -> bool:
+    return bool(derive_agent_lifecycle(agent)["is_terminal"])
+
+
+def is_agent_live(agent: "PersistentAgent") -> bool:
+    return bool(derive_agent_lifecycle(agent)["is_live"])
+
+
+def agent_display_status(agent: "PersistentAgent") -> str:
+    return str(derive_agent_lifecycle(agent)["lifecycle_status"])
 
 
 def _clone_json_value(value: Any) -> Any:
@@ -506,8 +563,9 @@ class PersistentAgentStore:
                 if agent_id:
                     existing = self.load_agent(agent_id)
                     if existing is not None:
-                        if existing.status == "terminated":
-                            existing.status = "active"
+                        if is_agent_terminal(existing):
+                            existing.status = ACTIVE_AGENT_STATUS
+                            existing.run_status = "idle"
                             self.save_agent(existing)
                         return existing
             agent = PersistentAgent(
@@ -532,7 +590,7 @@ class PersistentAgentStore:
         return agent_id == self.root_agent_id
 
     def is_terminated(self, agent_id: str) -> bool:
-        return self.require_agent(agent_id).status == "terminated"
+        return is_agent_terminal(self.require_agent(agent_id))
 
     def workspace_root(self) -> Path:
         return self._root.parent
@@ -627,7 +685,7 @@ class PersistentAgentStore:
         if not title:
             raise ValueError("agent title must be non-empty")
         parent = self.require_agent(caller_agent_id)
-        if parent.status == "terminated":
+        if is_agent_terminal(parent):
             raise ValueError(f"agent is terminated: {caller_agent_id}")
         child_clearance = parent.security_clearance if security_clearance is None else float(security_clearance)
         if not 0.0 <= child_clearance <= 1.0:
@@ -664,8 +722,13 @@ class PersistentAgentStore:
         if not self.can_manage_agent(caller_agent_id, target_agent_id):
             raise AgentScopeError("access denied: agent not in scope")
         agent = self.require_agent(target_agent_id)
-        if agent.status != "terminated":
+        if self.is_root_agent(target_agent_id):
+            raise ValueError("cannot terminate root agent")
+        lifecycle = derive_agent_lifecycle(agent)
+        if agent.status != "terminated" or agent.run_status != "terminated":
             agent.status = "terminated"
+            if not lifecycle["is_terminal"] or agent.run_status != "terminated":
+                agent.run_status = "terminated"
             self.save_agent(agent)
         return agent
 
@@ -787,7 +850,7 @@ class PersistentAgentStore:
         if not self.can_manage_agent(caller_agent_id, target_agent_id):
             raise AgentScopeError("access denied: agent not in scope")
         agent = self.require_agent(target_agent_id)
-        if agent.status == "terminated":
+        if is_agent_terminal(agent):
             raise ValueError(f"agent terminated: {target_agent_id}")
         normalized_assignment_packet = (
             _clone_json_value(assignment_packet)

@@ -43,7 +43,12 @@ from mr1.orchestrator.identity import (
     _now_iso as _orchestrator_now_iso,
 )
 from mr1.orchestrator.prompts import MRN_SYSTEM_PROMPT as _SYSTEM_PROMPT
-from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
+from mr1.scoped_agents import (
+    AgentScopeError,
+    PersistentAgent,
+    PersistentAgentStore,
+    is_agent_terminal,
+)
 from mr1.scheduler import Scheduler, WorkflowSpecError
 from mr1.tools import ToolRegistry, default_tool_registry
 from mr1.watchers import WatcherRegistry, default_watcher_registry
@@ -252,7 +257,7 @@ class MRnStepRunner:
         if not self._scoped_agents.can_manage_agent(resolved_caller, agent_id):
             raise AgentScopeError("access denied: agent not in scope")
         agent = self._scoped_agents.require_agent(agent_id)
-        if agent.status == "terminated":
+        if is_agent_terminal(agent):
             raise ValueError(f"agent terminated: {agent_id}")
         if not (agent.mission and agent.mission.strip()):
             raise ValueError(f"no mission assigned: {agent_id}")

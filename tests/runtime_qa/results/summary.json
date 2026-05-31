@@ -1,0 +1,52 @@
+{
+  "by_category": {
+    "agent_lifecycle": {
+      "findings": 0,
+      "scenarios": 1
+    },
+    "ambiguity": {
+      "findings": 0,
+      "scenarios": 5
+    },
+    "approval": {
+      "findings": 0,
+      "scenarios": 2
+    },
+    "delegation": {
+      "findings": 0,
+      "scenarios": 3
+    },
+    "memory": {
+      "findings": 0,
+      "scenarios": 1
+    },
+    "multi_turn": {
+      "findings": 0,
+      "scenarios": 1
+    },
+    "observability": {
+      "findings": 0,
+      "scenarios": 3
+    },
+    "routing": {
+      "findings": 0,
+      "scenarios": 5
+    },
+    "safety": {
+      "findings": 0,
+      "scenarios": 6
+    },
+    "state": {
+      "findings": 0,
+      "scenarios": 2
+    },
+    "workflow": {
+      "findings": 0,
+      "scenarios": 3
+    }
+  },
+  "crashed_scenarios": [],
+  "findings_by_severity": {},
+  "total_elapsed_s": 409.32,
+  "total_scenarios": 32
+}

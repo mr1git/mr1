@@ -11,7 +11,12 @@ from typing import Any, Optional
 from mr1.capability_policy import CapabilityApprovalRequest, CapabilityApprovalStore
 from mr1.event_log import EventLog, SystemEvent
 from mr1.messages import MessageStore, PersistentMessage
-from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
+from mr1.scoped_agents import (
+    AgentScopeError,
+    PersistentAgent,
+    PersistentAgentStore,
+    derive_agent_lifecycle,
+)
 from mr1.scheduler import WorkflowSpecError
 from mr1.workflow_models import TaskStatus, Workflow
 from mr1.workflow_store import WorkflowStore
@@ -108,6 +113,16 @@ def _agent_runtime_activity_payload(
         "active_workflows": active_workflows,
         "has_running_processes": has_running_processes,
         "runtime_activity": runtime_activity,
+    }
+
+
+def _agent_lifecycle_payload(agent: PersistentAgent) -> dict[str, Any]:
+    lifecycle = derive_agent_lifecycle(agent)
+    return {
+        "lifecycle_status": lifecycle["lifecycle_status"],
+        "is_live": lifecycle["is_live"],
+        "is_terminal": lifecycle["is_terminal"],
+        "status_conflict": lifecycle["status_conflict"],
     }
 
 
@@ -317,7 +332,7 @@ class RuntimeAccess:
         inbox = self._message_store.list_inbox(agent.agent_id)
         outbox = self._message_store.list_outbox(agent.agent_id)
         pending_parent = _pending_parent_messages(agent, self._message_store)
-        return {
+        payload = {
             "agent_id": agent.agent_id,
             "title": agent.title,
             "agent_type": agent.agent_type,
@@ -342,6 +357,8 @@ class RuntimeAccess:
             "pending_parent_messages": [_message_peer_preview(item) for item in pending_parent[:3]],
             "pending_parent_questions": len(pending_parent),
         }
+        payload.update(_agent_lifecycle_payload(agent))
+        return payload
 
     def _workflow_preview_payload(self, workflow: Workflow) -> dict[str, Any]:
         tasks = list(workflow.tasks.values())
@@ -441,6 +458,7 @@ class RuntimeAccess:
         if not full:
             return self._agent_preview_payload(agent)
         payload = agent.to_dict()
+        payload.update(_agent_lifecycle_payload(agent))
         payload.update(self._agent_runtime_activity_payload(agent))
         last_run = agent.last_run or {}
         payload["latest_run_id"] = last_run.get("run_id")

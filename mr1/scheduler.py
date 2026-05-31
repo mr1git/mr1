@@ -77,7 +77,7 @@ from mr1.tools import (
 )
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import PersistentAgentStore, is_agent_terminal
 from mr1.scheduler_core.attempts import (
     AttemptManager,
     UNSET as ATTEMPT_UNSET,
@@ -335,7 +335,7 @@ def build_workflow_from_spec(
     scoped_agents = scoped_agent_store or PersistentAgentStore()
     resolved_owner_agent_id = owner_agent_id or scoped_agents.root_agent_id
     owner_agent = scoped_agents.require_agent(resolved_owner_agent_id)
-    if owner_agent.status == "terminated":
+    if is_agent_terminal(owner_agent):
         raise WorkflowSpecError(f"agent is terminated: {resolved_owner_agent_id}")
 
     workflow_id = new_workflow_id()

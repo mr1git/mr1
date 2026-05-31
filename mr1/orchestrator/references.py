@@ -18,6 +18,7 @@ defined by the time this module loads.
 import re
 from typing import Any, Optional
 
+from mr1.scoped_agents import is_agent_live
 from mr1.orchestrator.root import (
     _AGENT_CREATED_REFERENCE_ALIASES,
     _AGENT_ID_PATTERN,
@@ -27,6 +28,7 @@ from mr1.orchestrator.root import (
     _WORKFLOW_ID_PATTERN,
     _normalize_routing_text,
 )
+_BULK_EXCLUSION_PATTERN = re.compile(r"\b(?:except|excluding|but not)\b(?P<suffix>.+)$", re.IGNORECASE)
 
 
 def agent_reference_payload(root, agent) -> dict[str, Any]:
@@ -61,6 +63,41 @@ def bulk_agent_action(normalized: str) -> str:
             return action
     return "manage"
 
+
+def bulk_agent_exclusion_ids(user_input: str, visible_agents: list[Any]) -> list[str]:
+    match = _BULK_EXCLUSION_PATTERN.search(user_input)
+    if match is None:
+        return []
+    suffix_raw = match.group("suffix")
+    suffix = _normalize_routing_text(suffix_raw)
+    excluded_ids = {
+        agent_id
+        for agent_id in _AGENT_ID_PATTERN.findall(suffix_raw)
+        if agent_id
+    }
+    for agent in visible_agents:
+        normalized_title = _normalize_routing_text(agent.title or "")
+        if normalized_title and re.search(rf"\b{re.escape(normalized_title)}\b", suffix):
+            excluded_ids.add(agent.agent_id)
+    return sorted(excluded_ids)
+
+
+def apply_bulk_agent_exclusions(
+    root,
+    candidates: list[Any],
+    excluded_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    excluded = set(excluded_ids)
+    kept_payloads: list[dict[str, Any]] = []
+    excluded_payloads: list[dict[str, Any]] = []
+    for candidate in candidates:
+        payload = root._agent_reference_payload(candidate)
+        if candidate.agent_id in excluded:
+            excluded_payloads.append(payload)
+        else:
+            kept_payloads.append(payload)
+    return kept_payloads, excluded_payloads
+
 def agent_title_reference_kind(root, normalized: str, title: str) -> Optional[str]:
     escaped_title = re.escape(title)
     if not re.search(rf"\b{escaped_title}\b", normalized):
@@ -81,7 +118,8 @@ def agent_title_reference_kind(root, normalized: str, title: str) -> Optional[st
 
     single_patterns = (
         rf"\bwhat\s+is\s+(?:that\s+|the\s+)?{escaped_title}\s+doing\b",
-        rf"\b(?:run|kill|terminate|resume|message|ask)\s+(?:that\s+|the\s+)?{escaped_title}\b",
+        rf"\b(?:run|kill|terminate|resume|pause|stop|message|send|ask|tell)\s+(?:that\s+|the\s+)?{escaped_title}\b",
+        rf"\brename\s+(?:that\s+|the\s+)?{escaped_title}\b",
         rf"\b(?:status|inbox|approval)\s+(?:for|of)?\s*(?:that\s+|the\s+)?{escaped_title}\b",
         rf"\bworkflow\s+owner\s+(?:for|of)?\s*(?:that\s+|the\s+)?{escaped_title}\b",
         rf"\b(?:that|the)\s+{escaped_title}\s+(?:agent|child)\b",
@@ -105,6 +143,7 @@ def resolve_runtime_references(
     bulk_targets: list[dict[str, Any]] = []
     normalized = _normalize_routing_text(user_input)
     visible_agents = root._scoped_agents.list_visible_agents(root._root_agent_id)
+    excluded_agent_ids = bulk_agent_exclusion_ids(user_input, visible_agents)
     agents_by_id = {agent.agent_id: agent for agent in visible_agents}
     workflows = root._workflow_store.list_workflows()
     workflows_by_id = {workflow.workflow_id: workflow for workflow in workflows}
@@ -136,7 +175,7 @@ def resolve_runtime_references(
 
     title_matches: dict[str, list[Any]] = {}
     for agent in visible_agents:
-        if agent.status != "terminated":
+        if is_agent_live(agent):
             title_matches.setdefault(agent.title.lower(), []).append(agent)
 
     for title, candidates in title_matches.items():
@@ -148,11 +187,18 @@ def resolve_runtime_references(
         if reference_kind is None:
             continue
         if reference_kind == "bulk":
+            action = root._bulk_agent_action(normalized)
+            filtered_candidates, excluded_candidates = apply_bulk_agent_exclusions(
+                root,
+                candidates,
+                excluded_agent_ids if action in {"kill", "terminate"} else [],
+            )
             bulk_targets.append({
                 "reference": f"{candidates[0].title} agents",
                 "kind": "agent",
-                "action": root._bulk_agent_action(normalized),
-                "candidates": [root._agent_reference_payload(item) for item in candidates],
+                "action": action,
+                "candidates": filtered_candidates,
+                "excluded_candidates": excluded_candidates,
             })
             continue
         if len(candidates) == 1:
@@ -226,13 +272,23 @@ def resolve_runtime_references(
             r"\b(?:kill|terminate)\s+(?:all\s+)?(?:those|these|the)\s+agents?\b",
             r"\b(?:yes[,.]?\s+)?(?:kill|terminate)\s+(?:all\s+)?(?:them|agents?)\b",
         )
-        child_agents = [a for a in visible_agents if a.agent_id != root._root_agent_id and a.status != "terminated"]
+        child_agents = [
+            a
+            for a in visible_agents
+            if a.agent_id != root._root_agent_id and is_agent_live(a)
+        ]
         if child_agents and any(re.search(p, normalized) for p in _kill_all_agents_patterns):
+            filtered_candidates, excluded_candidates = apply_bulk_agent_exclusions(
+                root,
+                child_agents,
+                excluded_agent_ids,
+            )
             bulk_targets.append({
                 "reference": "all agents",
                 "kind": "agent",
                 "action": "kill",
-                "candidates": [root._agent_reference_payload(a) for a in child_agents],
+                "candidates": filtered_candidates,
+                "excluded_candidates": excluded_candidates,
             })
 
     return {
@@ -260,10 +316,18 @@ def format_bulk_agent_target_clarification(
         f"{item.get('title') or item.get('id')} ({item['id']})"
         for item in candidates
     )
+    excluded_candidates = first.get("excluded_candidates", [])
+    excluded_text = ""
+    if excluded_candidates:
+        excluded_list = ", ".join(
+            f"{item.get('title') or item.get('id')} ({item['id']})"
+            for item in excluded_candidates
+        )
+        excluded_text = f" Excluded: {excluded_list}."
     action = first.get("action") or "manage"
     return (
         f"Bulk agent reference '{first.get('reference', 'agents')}' matches {len(candidates)} agent(s): "
-        f"{candidate_list}. Clarify the exact agent_ids you want me to {action}."
+        f"{candidate_list or 'none'}. Clarify the exact agent_ids you want me to {action}.{excluded_text}"
     )
 
 def resolved_workflow_target_id(root, resolved_references: dict[str, Any]) -> Optional[str]:
@@ -301,4 +365,3 @@ def explicit_agent_ids(
         if payload.get("kind") == "agent" and payload.get("id"):
             agent_ids.add(str(payload["id"]))
     return sorted(agent_ids)
-

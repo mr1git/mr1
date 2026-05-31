@@ -223,6 +223,10 @@ def test_runtime_access_preview_and_full_reads(
         item for item in runtime_access.list_agents(caller_agent_id=root.agent_id)
         if item["agent_id"] == child.agent_id
     )
+    assert agent_preview["lifecycle_status"] == "active"
+    assert agent_preview["is_live"] is True
+    assert agent_preview["is_terminal"] is False
+    assert agent_preview["status_conflict"] is False
     assert agent_preview["mission_truncated"] is True
     assert agent_preview["mission_full_available"] is True
     assert agent_preview["parent_request_truncated"] is True
@@ -230,6 +234,10 @@ def test_runtime_access_preview_and_full_reads(
     assert agent_preview["pending_parent_messages"][0]["message_id"] == message.message_id
 
     agent_detail = runtime_access.read_agent(child.agent_id, caller_agent_id=root.agent_id)
+    assert agent_detail["lifecycle_status"] == "active"
+    assert agent_detail["is_live"] is True
+    assert agent_detail["is_terminal"] is False
+    assert agent_detail["status_conflict"] is False
     assert agent_detail["mission"] == (render_assignment_mission(assignment_packet) or long_mission)
     assert agent_detail["parent_request"] == long_parent_request
     assert agent_detail["last_action"]["detail"] == long_last_action_detail
@@ -273,3 +281,30 @@ def test_runtime_access_preview_and_full_reads(
     assert recent_errors[0]["message_id"] == message.message_id
     assert recent_errors[0]["approval_request_id"] == approval.approval_request_id
     assert recent_errors[0]["record_path"].endswith("result.json")
+
+
+def test_runtime_access_marks_legacy_active_terminated_agent_as_terminal(
+    runtime_access: RuntimeAccess,
+    agent_store: PersistentAgentStore,
+):
+    root = agent_store.ensure_root_agent()
+    child = agent_store.create_child_agent(root.agent_id, "Sentinel")
+    child.run_status = "terminated"
+    agent_store.save_agent(child)
+
+    preview = next(
+        item for item in runtime_access.list_agents(caller_agent_id=root.agent_id)
+        if item["agent_id"] == child.agent_id
+    )
+    detail = runtime_access.read_agent(child.agent_id, caller_agent_id=root.agent_id)
+
+    assert preview["status"] == "active"
+    assert preview["run_status"] == "terminated"
+    assert preview["lifecycle_status"] == "terminated"
+    assert preview["is_live"] is False
+    assert preview["is_terminal"] is True
+    assert preview["status_conflict"] is True
+    assert detail["lifecycle_status"] == "terminated"
+    assert detail["is_live"] is False
+    assert detail["is_terminal"] is True
+    assert detail["status_conflict"] is True

@@ -27,7 +27,6 @@ import sys
 import threading
 import time
 import uuid
-import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -366,6 +365,7 @@ class MR1:
         self,
         event_sink: Optional[Callable[[dict[str, Any]], None]] = None,
         *,
+        state_manager: Optional[StateManager] = None,
         workflow_store: Optional[WorkflowStore] = None,
         scoped_agent_store: Optional[PersistentAgentStore] = None,
         message_store: Optional[MessageStore] = None,
@@ -385,7 +385,7 @@ class MR1:
             dispatcher=self._dispatcher,
             logger=self._logger,
         )
-        self._state = _resolve_state_manager()()
+        self._state = state_manager or _resolve_state_manager()()
         self._event_sink = event_sink
 
         # Load agent configs from YAML definitions.
@@ -395,7 +395,6 @@ class MR1:
 
         # The persistent claude process — created in start().
         self._process: Optional[MR1Process] = None
-        self._web_viz_server = None
         self._test_agent_lock = threading.Lock()
         self._test_agents: dict[str, TestAgentRecord] = {}
 
@@ -852,6 +851,20 @@ class MR1:
             f"Routing advice suggested '{route_advice.route}' "
             f"but MR1 executed '{final_route}'."
         )
+
+    @staticmethod
+    def _clarification_message_for_route_advice(route_advice: Optional[RouteAdvice]) -> str:
+        if route_advice is None:
+            return "Clarify the exact action you want me to take."
+        reason = route_advice.reason or ""
+        if "conflicting agent lifecycle actions" in reason:
+            return (
+                "Your request combines conflicting agent lifecycle actions "
+                "(create agents and then immediately destroy them). Clarify which action you want first."
+            )
+        if "no pending workflow draft exists" in reason:
+            return "No pending workflow draft exists to confirm or cancel."
+        return "Clarify the exact action you want me to take."
 
     def _agent_reference_payload(self, agent) -> dict[str, Any]:
         return references.agent_reference_payload(self, agent)
@@ -1314,6 +1327,7 @@ class MR1:
         action = first.get("action") or "manage"
         if action in {"kill", "terminate"}:
             candidates = first.get("candidates", [])
+            excluded_candidates = first.get("excluded_candidates", [])
             terminated = []
             errors = []
             for candidate in candidates:
@@ -1326,6 +1340,14 @@ class MR1:
                 except (ValueError, AgentScopeError) as exc:
                     errors.append(f"{agent_id}: {exc}")
             parts = [f"Terminated {len(terminated)} agent(s): {', '.join(terminated)}."] if terminated else []
+            if excluded_candidates:
+                excluded_text = ", ".join(
+                    f"{item.get('title') or item.get('id')} ({item.get('id')})"
+                    for item in excluded_candidates
+                    if item.get("id")
+                )
+                if excluded_text:
+                    parts.append(f"Excluded {len(excluded_candidates)} agent(s): {excluded_text}.")
             if errors:
                 parts.append(f"Errors: {'; '.join(errors)}")
             msg = " ".join(parts) if parts else "No agents terminated."
@@ -1472,7 +1494,7 @@ class MR1:
             action = "terminate"
         elif re.search(r"\bresume\b", normalized):
             action = "resume"
-        elif re.search(r"\b(message|send|ask)\b", normalized):
+        elif re.search(r"\b(message|send|ask|tell)\b", normalized):
             action = "message"
         if action is None:
             return None
@@ -1649,6 +1671,19 @@ class MR1:
         self._state.set_claude_session_id(session_id if isinstance(session_id, str) else None)
         return response
 
+    def _direct_response_claims_unverified_mutation(self, text: str) -> bool:
+        if not text:
+            return False
+        mutation_patterns = (
+            r"\brenam(?:ed|ing)\b",
+            r"\bpaus(?:ed|ing)\b",
+            r"\b(?:is|was)\s+paused\b",
+            r"\bdelet(?:ed|ing)\b",
+            r"\bremov(?:ed|ing)\b",
+            r"\b(?:created|creating|spawned|spawning)\b",
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in mutation_patterns)
+
     def _answer_directly_with_grounding(
         self,
         user_input: str,
@@ -1671,6 +1706,11 @@ class MR1:
             observation_request = parse_observation_request(raw)
             if observation_request.status == "none":
                 text, _ = self._parse_response(raw)
+                if self._direct_response_claims_unverified_mutation(text):
+                    text = (
+                        "I did not execute any runtime mutation on this turn, so I cannot claim that an agent or workflow "
+                        "was created, renamed, paused, or deleted. Use an explicit operational command instead."
+                    )
                 return {
                     "text": text,
                     "brain_prompt": prompt,
@@ -2095,11 +2135,6 @@ class MR1:
 
         self._emit_event(event["type"], **{k: v for k, v in event.items() if k != "type"})
 
-    def build_timeline_snapshot(self) -> dict[str, Any]:
-        from mr1.viz import build_snapshot
-
-        return build_snapshot(state_path=self._state._path, tasks_dir=_PKG_ROOT / "tasks")
-
     def _execute_delegation(self, directive: dict, user_input: str) -> str:
         """
         Spawn the delegated agent and block until it completes.
@@ -2254,6 +2289,10 @@ class MR1:
           3. For workflow turns: compile, validate, preview, submit
           4. For direct answers: ask MR1 to answer without delegation
         """
+        if user_input.strip().startswith("/"):
+            builtin_result = self._handle_builtin(user_input)
+            if builtin_result is not None:
+                return builtin_result
         turn_id = self._new_turn_id()
         self._record_conversation("user", user_input)
         runtime_grounding = self.build_runtime_grounding()
@@ -2271,7 +2310,7 @@ class MR1:
 
         if route_advice.route == "ask_clarification":
             return self._finalize_turn_response(
-                "Clarify the exact action you want me to take.",
+                self._clarification_message_for_route_advice(route_advice),
                 turn_id=turn_id,
                 route="ask_clarification",
                 route_advice=route_advice,
@@ -2514,36 +2553,6 @@ class MR1:
                 ambiguities=ambiguities,
             )
 
-        if authoring.complexity == "simple" and not authoring.needs_confirmation:
-            result = self._workflow_authoring.submit(
-                authoring.spec,
-                created_by=Provenance(type="agent", id="MR1"),
-                caller_agent_id=self._root_agent_id,
-                owner_agent_id=self._root_agent_id,
-                target_workflow_id=target_workflow_id,
-                workflow_metadata=self._workflow_authoring.workflow_metadata_from_authoring(authoring),
-            )
-            self._state.clear_pending_workflow()
-            self._state.add_decision(
-                user_input,
-                "modify_workflow" if mode == "modify" else "submit_workflow",
-                result.workflow_id,
-            )
-            workflow = self._workflow_store.load_workflow(result.workflow_id)
-            self._remember_created_workflow(
-                result.workflow_id,
-                title=workflow.title if workflow is not None else authoring.spec.get("title"),
-            )
-            return self._finalize_turn_response(
-                result.message,
-                turn_id=turn_id,
-                route=f"{mode}_workflow",
-                route_advice=route_advice,
-                runtime_grounding=runtime_grounding,
-                resolved_references=resolved_references,
-                ambiguities=ambiguities,
-            )
-
         draft = PendingWorkflowDraft(
             original_request=user_input,
             mode=mode,
@@ -2590,27 +2599,17 @@ class MR1:
     # ------------------------------------------------------------------
 
     def launch_visualizer(self) -> str:
-        """Explain how to switch to the primary Ink-based MR1 interface."""
+        """Explain how to switch to the read-only MR1 runtime TUI."""
         return (
-            "Timeline UI is now the primary MR1 interface. "
-            "Exit this plain session and run `python main.py` or `npm run viz`. "
-            "Use `python main.py --plain` to stay in the legacy loop."
+            "Runtime TUI is available as a separate read-only viewer. "
+            "Run `python -m mr1.tui` or `python main.py --tui`. "
+            "Use `python main.py` or `python main.py --plain` for chat."
         )
 
     def launch_web_visualizer(self) -> str:
-        from mr1.web_viz import WebVizServer
-
-        if self._web_viz_server is None:
-            self._web_viz_server = WebVizServer(self)
-        url = self._web_viz_server.start(open_browser=False)
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
         return (
-            f"MR1 web visualizer running at {url}. "
-            "It should open in your browser automatically. "
-            "You can also launch it directly with `python main.py --web`."
+            "The old browser visualizer was removed. "
+            "Use `python -m mr1.tui` or `python main.py --tui` for runtime inspection."
         )
 
     def spawn_test_agents(self, height: int) -> str:
@@ -2737,6 +2736,9 @@ class MR1:
     def _handle_agent_run_builtin(self, parts: list[str], usage: str) -> str:
         return root_builtins.handle_agent_run_builtin(self, parts, usage)
 
+    def _handle_agent_kill_all_builtin(self, parts: list[str], usage: str) -> str:
+        return root_builtins.handle_agent_kill_all_builtin(self, parts, usage)
+
     def _handle_message_builtin(self, cmd: str) -> str:
         return root_builtins.handle_message_builtin(self, cmd)
 
@@ -2790,9 +2792,6 @@ class MR1:
         killed = self._spawner.kill_all(reason)
         self.kill_test_agents()
         self._scheduler.shutdown(cancel_running=True)
-        if self._web_viz_server is not None:
-            self._web_viz_server.stop()
-            self._web_viz_server = None
         if self._process:
             self._process.kill()
         self._state.save()
@@ -2930,4 +2929,3 @@ class MR1:
                 _run_loop()
         else:
             _run_loop()
-

@@ -9,8 +9,12 @@ import pytest
 from mr1.kazi_runner import MockRunner
 from mr1.scoped_agents import (
     AgentScopeError,
+    PersistentAgent,
     PersistentAgentStore,
+    agent_display_status,
     build_assignment_packet,
+    is_agent_live,
+    is_agent_terminal,
     render_assignment_mission,
 )
 from mr1.scheduler import Scheduler, WorkflowSpecError, submit_spec_to_disk
@@ -198,12 +202,20 @@ class TestHierarchy:
         killed_self = agent_store.terminate_agent(left.agent_id, left.agent_id)
 
         assert killed_child.status == "terminated"
+        assert killed_child.run_status == "terminated"
         assert killed_self.status == "terminated"
+        assert killed_self.run_status == "terminated"
 
         with pytest.raises(AgentScopeError, match="access denied: agent not in scope"):
             agent_store.terminate_agent(left.agent_id, right.agent_id)
         with pytest.raises(AgentScopeError, match="access denied: agent not in scope"):
             agent_store.terminate_agent(left.agent_id, root.agent_id)
+
+    def test_root_cannot_be_terminated(self, agent_store):
+        root = agent_store.ensure_root_agent()
+
+        with pytest.raises(ValueError, match="cannot terminate root agent"):
+            agent_store.terminate_agent(root.agent_id, root.agent_id)
 
 
 class TestTerminationEffects:
@@ -243,3 +255,85 @@ class TestTerminationEffects:
 
         assert agent_store.can_agent_access_workflow(parent.agent_id, workflow) is True
         assert agent_store.can_agent_access_workflow(root.agent_id, workflow) is True
+
+
+class TestLifecycleHelpers:
+    def test_live_and_terminal_helpers_handle_legacy_conflicts(self):
+        active_idle = PersistentAgent(
+            agent_id="ag-idle",
+            agent_type="mrn",
+            title="Idle",
+            tree_level=2,
+            parent_agent_id="ag-root",
+            status="active",
+            run_status="idle",
+        )
+        active_waiting = PersistentAgent(
+            agent_id="ag-live",
+            agent_type="mrn",
+            title="Live",
+            tree_level=2,
+            parent_agent_id="ag-root",
+            status="active",
+            run_status="waiting",
+        )
+        active_working = PersistentAgent(
+            agent_id="ag-working",
+            agent_type="mrn",
+            title="Working",
+            tree_level=2,
+            parent_agent_id="ag-root",
+            status="active",
+            run_status="working",
+        )
+        legacy_terminated = PersistentAgent(
+            agent_id="ag-legacy-term",
+            agent_type="mrn",
+            title="Legacy",
+            tree_level=2,
+            parent_agent_id="ag-root",
+            status="active",
+            run_status="terminated",
+        )
+        legacy_completed = PersistentAgent(
+            agent_id="ag-legacy-complete",
+            agent_type="mrn",
+            title="LegacyComplete",
+            tree_level=2,
+            parent_agent_id="ag-root",
+            status="active",
+            run_status="completed",
+        )
+        terminated = PersistentAgent(
+            agent_id="ag-dead",
+            agent_type="mrn",
+            title="Dead",
+            tree_level=2,
+            parent_agent_id="ag-root",
+            status="terminated",
+            run_status="idle",
+        )
+
+        assert is_agent_live(active_idle) is True
+        assert is_agent_live(active_waiting) is True
+        assert is_agent_live(active_working) is True
+        assert is_agent_terminal(active_waiting) is False
+        assert is_agent_live(terminated) is False
+        assert is_agent_terminal(terminated) is True
+        assert is_agent_live(legacy_terminated) is False
+        assert is_agent_terminal(legacy_terminated) is True
+        assert is_agent_live(legacy_completed) is False
+        assert is_agent_terminal(legacy_completed) is True
+        assert agent_display_status(legacy_terminated) == "terminated"
+
+    def test_root_bootstrap_revives_legacy_terminal_root(self, agent_store):
+        root = agent_store.ensure_root_agent()
+        root.status = "active"
+        root.run_status = "terminated"
+        agent_store.save_agent(root)
+
+        revived = agent_store.ensure_root_agent()
+
+        assert revived.status == "active"
+        assert revived.run_status == "idle"
+        assert is_agent_live(revived) is True

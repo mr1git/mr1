@@ -1,0 +1,9 @@
+{
+  "category": "workflow",
+  "description": "Create workflow draft, confirm, then inspect",
+  "elapsed_s": 43.01,
+  "findings": [],
+  "scenario": "wf_create_confirm",
+  "session_error": null,
+  "turn_count": 3
+}

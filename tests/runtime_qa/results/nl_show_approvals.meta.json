@@ -1,0 +1,9 @@
+{
+  "category": "routing",
+  "description": "'show me pending approvals' should map to inspect, not create",
+  "elapsed_s": 0.07,
+  "findings": [],
+  "scenario": "nl_show_approvals",
+  "session_error": null,
+  "turn_count": 1
+}
