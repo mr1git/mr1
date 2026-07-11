@@ -41,6 +41,7 @@ def _build_mr1(tmp_path, workflow_store, agent_store, message_store, *, workflow
         workflow_runner=MockRunner(),
         workflow_auto_tick=False,
         workflow_compiler=workflow_compiler or (lambda *_: "{}"),
+        inbox_auto_triage=False,
     )
     mr1._state = StateManager(state_path=tmp_path / "mr1_state.json")
     return mr1
@@ -575,3 +576,37 @@ def test_builtin_inbox_triage_formats_output_and_persists_pending_draft(
     assert "summary: triage summary" in output
     assert "confirmation_required" in output
     assert mr1._state.pending_workflow is not None
+
+
+def test_inbox_triage_failure_is_reported_and_does_not_disable_future_passes(
+    workflow_store,
+    agent_store,
+    message_store,
+    tmp_path,
+):
+    mr1 = _build_mr1(tmp_path, workflow_store, agent_store, message_store)
+    _root_message(message_store, agent_store)
+    calls: list[str] = []
+
+    class FailingRunner:
+        def run(self, policy, caller_agent_id=None):
+            calls.append("failed")
+            raise ValueError("triage exploded")
+
+    class SuccessfulRunner:
+        def run(self, policy, caller_agent_id=None):
+            calls.append("succeeded")
+            return None
+
+    runners = [FailingRunner(), SuccessfulRunner()]
+    mr1._make_inbox_triage_runner = lambda: runners.pop(0)
+
+    mr1._run_inbox_triage_pass()
+    mr1._run_inbox_triage_pass()
+
+    assert calls == ["failed", "succeeded"]
+    assert mr1._state.runtime_errors[-1]["source"] == "inbox_triage"
+    events = mr1._event_log.filter_events(event_type="inbox_triage_failed")
+    assert len(events) == 1
+    assert events[0].metadata["error_type"] == "ValueError"
+    assert events[0].metadata["unread_count"] == 1

@@ -60,6 +60,7 @@ from mr1.capability_policy import (
     CapabilityApprovalDecision,
     CapabilityApprovalStore,
 )
+from mr1.brain_tools import governed_brain_tools
 from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
 from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepRunner
@@ -279,6 +280,14 @@ _PERSISTENT_CHILD_TITLE_PATTERNS = (
     re.compile(r"\bnamed\s+(MR\d+)\b", re.IGNORECASE),
 )
 
+_EXPLICIT_PERSISTENT_CHILD_TITLE_PATTERNS = (
+    re.compile(r"\bnamed\s+['\"]([^'\"]{1,64})['\"]", re.IGNORECASE),
+    re.compile(r"\bcalled\s+['\"]([^'\"]{1,64})['\"]", re.IGNORECASE),
+    re.compile(r"\bpersistent\s+agent\s+['\"]([^'\"]{1,64})['\"]", re.IGNORECASE),
+    re.compile(r"\bnamed\s+([A-Za-z][A-Za-z0-9_-]{1,63})\b", re.IGNORECASE),
+    re.compile(r"\bcalled\s+([A-Za-z][A-Za-z0-9_-]{1,63})\b", re.IGNORECASE),
+)
+
 _META_EXPLANATION_PATTERNS = (
     re.compile(r"\bin what situation(?:s)? (?:would you|you would)\b", re.IGNORECASE),
     re.compile(r"\bwhat situation(?:s)? would you use\b", re.IGNORECASE),
@@ -392,6 +401,7 @@ class MR1:
         self._mr1_config = _load_agent_config(_MR1_CONFIG_PATH)
         self._mrn_config = _load_agent_config(_MRN_CONFIG_PATH)
         self._kazi_config = _load_agent_config(_KAZI_CONFIG_PATH)
+        self._mr1_brain_tools = governed_brain_tools(self._mr1_config.get("allowed_tools"))
 
         # The persistent claude process — created in start().
         self._process: Optional[MR1Process] = None
@@ -464,7 +474,7 @@ class MR1:
         self._process = MR1Process(
             system_prompt=system_prompt,
             model=self._mr1_config["model"],
-            tools=self._mr1_config["allowed_tools"],
+            tools=self._mr1_brain_tools,
             session_id=self._state.claude_session_id,
         )
         self._process.start()
@@ -484,7 +494,7 @@ class MR1:
             f"Model: {self._mr1_config['model']}\n"
             f"Lifetime: {self._mr1_config['lifetime']}\n"
             f"Memory access: {self._mr1_config['memory_access']}\n"
-            f"Available tools: {', '.join(self._mr1_config['allowed_tools'])}\n"
+            f"Available tools: {', '.join(self._mr1_brain_tools)}\n"
         )
         prompt = f"{_ORCHESTRATOR_PROMPT}\n== AGENT CONFIG ==\n{config_block}"
         if memory_context:
@@ -670,6 +680,7 @@ class MR1:
         ambiguities: list[dict[str, Any]],
         route_advice: Optional[RouteAdvice] = None,
         route_advice_override_reason: Optional[str] = None,
+        routing_decision: Optional[dict[str, Any]] = None,
         brain_prompt: Optional[str] = None,
         brain_response: Optional[str] = None,
         full_payload: Optional[str] = None,
@@ -681,6 +692,7 @@ class MR1:
             "route": route,
             "route_advice": route_advice.to_dict() if route_advice is not None else None,
             "route_advice_override_reason": route_advice_override_reason,
+            "routing_decision": routing_decision,
             "resolved_references": resolved_references,
             "ambiguities": ambiguities,
             "runtime_grounding": runtime_grounding,
@@ -710,7 +722,14 @@ class MR1:
         brain_response: Optional[str] = None,
         full_payload: Optional[str] = None,
     ) -> str:
-        self._write_turn_artifact(
+        routing_decision = self._build_routing_decision(
+            turn_id=turn_id,
+            final_route=route,
+            route_advice=route_advice,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+        artifact_path = self._write_turn_artifact(
             turn_id=turn_id,
             user_input=self._state.conversation[-1]["text"] if self._state.conversation else "",
             route=route,
@@ -718,13 +737,17 @@ class MR1:
             runtime_grounding=runtime_grounding,
             resolved_references=resolved_references,
             ambiguities=ambiguities,
-            route_advice_override_reason=self._route_advice_override_reason(
-                route_advice,
-                final_route=route,
-            ),
+            route_advice_override_reason=routing_decision.get("override_reason"),
+            routing_decision=routing_decision,
             brain_prompt=brain_prompt,
             brain_response=brain_response,
             full_payload=full_payload,
+        )
+        self._emit_runtime_turn_event(
+            turn_id=turn_id,
+            final_route=route,
+            routing_decision=routing_decision,
+            turn_artifact_path=artifact_path,
         )
         return self._record_local_response(text, kind=kind)
 
@@ -813,6 +836,8 @@ class MR1:
             return final_route in {
                 "inspect_task",
                 "inspect_task_clarify",
+                "inspect_agent",
+                "inspect_agent_clarify",
                 "inspect_workflow",
                 "inspect_workflow_findings",
                 "inspect_workflow_clarify",
@@ -837,20 +862,217 @@ class MR1:
             return final_route == "ask_clarification"
         return final_route == advice_route
 
+    @staticmethod
+    def _final_action_for_route(final_route: str) -> str:
+        if final_route == "direct_answer":
+            return "direct_response"
+        if final_route == "persistent_delegation":
+            return "persistent_agent"
+        if final_route in {
+            "create_workflow",
+            "modify_workflow",
+            "show_json_preview",
+            "cancel_preview",
+            "confirm_preview",
+        }:
+            return "workflow_authoring"
+        if final_route in {
+            "inspect_task",
+            "inspect_task_clarify",
+            "inspect_workflow",
+            "inspect_workflow_findings",
+            "inspect_workflow_clarify",
+            "inspect_agent",
+            "inspect_agent_clarify",
+        }:
+            return "inspect_existing_state"
+        if final_route in {
+            "run_commands",
+            "message_reply",
+            "approval_action",
+        }:
+            return "run_commands"
+        if final_route in {
+            "ask_clarification",
+            "clarify_reference",
+            "clarify_bulk_agent_operation",
+        }:
+            return "ask_clarification"
+        return final_route
+
+    @staticmethod
+    def _matched_signal_payload(route_advice: Optional[RouteAdvice]) -> dict[str, Any]:
+        if route_advice is None:
+            return {}
+        signals = dict(route_advice.signals or {})
+        return {
+            key: list(value)
+            for key, value in signals.items()
+            if isinstance(value, list) and value
+        }
+
+    def _missing_routing_signals(
+        self,
+        route_advice: Optional[RouteAdvice],
+        *,
+        final_route: str,
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> list[str]:
+        missing: list[str] = []
+        signals = dict((route_advice.signals or {}) if route_advice is not None else {})
+        signal_labels = {
+            "matched_operational_verbs": "operational verbs",
+            "matched_inspection_phrases": "inspection phrases",
+            "matched_persistent_agent_patterns": "persistent-agent patterns",
+            "matched_workflow_patterns": "workflow patterns",
+        }
+        for key, label in signal_labels.items():
+            if not signals.get(key):
+                missing.append(label)
+        if ambiguities:
+            missing.append("single unambiguous runtime reference")
+        elif final_route in {
+            "clarify_reference",
+            "inspect_task_clarify",
+            "inspect_workflow_clarify",
+            "inspect_agent_clarify",
+        }:
+            missing.append("resolved runtime reference")
+        elif final_route == "ask_clarification":
+            missing.append("safe execute-now command details")
+        if route_advice is not None and route_advice.route == "run_commands" and not resolved_references:
+            missing.append("resolved runtime target")
+        return list(dict.fromkeys(missing))
+
+    def _route_advice_override_cause(
+        self,
+        route_advice: Optional[RouteAdvice],
+        *,
+        final_route: str,
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> Optional[str]:
+        if self._route_matches_advice(route_advice, final_route=final_route):
+            return None
+        if route_advice is None:
+            return None
+        if ambiguities:
+            return (
+                "The advisor found an executable route, but runtime reference resolution "
+                "produced multiple valid targets and MR1 stopped for disambiguation."
+            )
+        if final_route == "clarify_reference":
+            return (
+                "The advisor found operational intent, but MR1 could not resolve a single runtime "
+                "reference to execute against."
+            )
+        if final_route in {
+            "inspect_task_clarify",
+            "inspect_workflow_clarify",
+            "inspect_agent_clarify",
+        }:
+            return "Inspection required a single resolved runtime object before MR1 could inspect state safely."
+        if final_route == "ask_clarification":
+            return (
+                "The advisor found intent signals, but MR1 did not have enough concrete target or command "
+                "detail to execute safely and therefore asked for clarification."
+            )
+        return (
+            "MR1 applied local runtime resolution and safety checks, which changed the final route after "
+            "the advisory lexical pass."
+        )
+
+    def _build_routing_decision(
+        self,
+        *,
+        turn_id: str,
+        final_route: str,
+        route_advice: Optional[RouteAdvice],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        override_cause = self._route_advice_override_cause(
+            route_advice,
+            final_route=final_route,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+        override_reason = None
+        if route_advice is not None and override_cause is not None:
+            override_reason = (
+                f"Routing advice suggested '{route_advice.route}' but MR1 executed '{final_route}' "
+                f"because {override_cause[0].lower() + override_cause[1:]}"
+            )
+        return {
+            "turn_id": turn_id,
+            "advisor_route": route_advice.route if route_advice is not None else None,
+            "advisor_confidence": route_advice.confidence if route_advice is not None else None,
+            "advisor_reason": route_advice.reason if route_advice is not None else None,
+            "final_route": final_route,
+            "final_action": self._final_action_for_route(final_route),
+            "matched_signals": self._matched_signal_payload(route_advice),
+            "missing_signals": self._missing_routing_signals(
+                route_advice,
+                final_route=final_route,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            ),
+            "resolved_references": sorted({
+                str(payload.get("id"))
+                for payload in resolved_references.values()
+                if isinstance(payload, dict) and payload.get("id")
+            }),
+            "ambiguity_count": len(ambiguities),
+            "override_applied": override_cause is not None,
+            "override_cause": override_cause,
+            "override_reason": override_reason,
+        }
+
+    def _emit_runtime_turn_event(
+        self,
+        *,
+        turn_id: str,
+        final_route: str,
+        routing_decision: dict[str, Any],
+        turn_artifact_path: Path,
+    ) -> None:
+        final_action = routing_decision.get("final_action") or self._final_action_for_route(final_route)
+        self._event_log.emit(
+            event_type="runtime_turn_decided",
+            actor_id=self._root_agent_id,
+            actor_type="mr1",
+            target_id=turn_id,
+            target_type="turn",
+            status=str(final_action),
+            summary=f"runtime turn decided: {final_action}",
+            record_path=str(turn_artifact_path),
+            metadata=dict(routing_decision),
+        )
+        self._emit_event(
+            "runtime_turn_decided",
+            turn_id=turn_id,
+            final_route=final_route,
+            final_action=final_action,
+            advisor_route=routing_decision.get("advisor_route"),
+            advisor_confidence=routing_decision.get("advisor_confidence"),
+            advisor_reason=routing_decision.get("advisor_reason"),
+            override_applied=routing_decision.get("override_applied"),
+        )
+
     def _route_advice_override_reason(
         self,
         route_advice: Optional[RouteAdvice],
         *,
         final_route: str,
     ) -> Optional[str]:
-        if self._route_matches_advice(route_advice, final_route=final_route):
-            return None
-        if route_advice is None:
-            return None
-        return (
-            f"Routing advice suggested '{route_advice.route}' "
-            f"but MR1 executed '{final_route}'."
-        )
+        return self._build_routing_decision(
+            turn_id="turn-override-preview",
+            final_route=final_route,
+            route_advice=route_advice,
+            resolved_references={},
+            ambiguities=[],
+        ).get("override_reason")
 
     @staticmethod
     def _clarification_message_for_route_advice(route_advice: Optional[RouteAdvice]) -> str:
@@ -1413,7 +1635,7 @@ class MR1:
                     body=(
                         f"Approval request {updated.approval_request_id} is now {updated.status}. "
                         f"Reason: {reason}. "
-                        "Retry or continue your capability step accordingly."
+                        "Blocked workflow work will resume automatically when applicable."
                     ),
                     workflow_id=updated.workflow_id,
                     task_id=updated.task_id,
@@ -1795,13 +2017,15 @@ class MR1:
         )
         raw = self._send_to_brain(design_prompt)
         design_text, _ = self._parse_response(raw)
+        explicit_title = self._extract_explicit_requested_child_title(user_input)
 
         first_line = (design_text or "").split("\n")[0].strip()
         if first_line.upper().startswith("AGENT_TITLE:"):
-            agent_title = first_line.split(":", 1)[1].strip() or self._extract_requested_child_title(user_input)
+            designed_title = first_line.split(":", 1)[1].strip()
+            agent_title = explicit_title or designed_title or self._extract_requested_child_title(user_input)
             mission_body = (design_text[len(first_line):]).strip()
         else:
-            agent_title = self._extract_requested_child_title(user_input)
+            agent_title = explicit_title or self._extract_requested_child_title(user_input)
             mission_body = design_text or ""
 
         try:
@@ -1944,17 +2168,13 @@ class MR1:
         )
 
     def _extract_requested_child_title(self, user_input: str) -> str:
+        explicit_title = self._extract_explicit_requested_child_title(user_input)
+        if explicit_title:
+            return explicit_title
         for pattern in _PERSISTENT_CHILD_TITLE_PATTERNS:
             match = pattern.search(user_input)
             if match:
                 return match.group(1).upper()
-        generic_named_match = re.search(
-            r"\bnamed\s+([A-Za-z][A-Za-z0-9_-]{1,63})\b",
-            user_input,
-            flags=re.IGNORECASE,
-        )
-        if generic_named_match:
-            return generic_named_match.group(1)
         fallback_matches = re.findall(r"\b(MR\d+)\b", user_input, flags=re.IGNORECASE)
         for item in fallback_matches:
             normalized = item.upper()
@@ -1980,6 +2200,20 @@ class MR1:
                 if candidate.lower() not in existing_titles:
                     return candidate
         return "MR2"
+
+    def _extract_explicit_requested_child_title(self, user_input: str) -> Optional[str]:
+        for pattern in _PERSISTENT_CHILD_TITLE_PATTERNS:
+            match = pattern.search(user_input)
+            if match:
+                return match.group(1).upper()
+        for pattern in _EXPLICIT_PERSISTENT_CHILD_TITLE_PATTERNS:
+            match = pattern.search(user_input)
+            if not match:
+                continue
+            title = match.group(1).strip()
+            if title:
+                return title
+        return None
 
     def _build_persistent_delegation_context(self) -> dict[str, Any]:
         agent_ids: list[str] = []
@@ -2765,25 +2999,55 @@ class MR1:
             pending_workflow_state=self._state,
         )
 
+    def _record_inbox_triage_failure(
+        self,
+        exc: Exception,
+        *,
+        unread_count: int,
+    ) -> None:
+        error_text = f"{type(exc).__name__}: {exc}"
+        self._state.record_runtime_error(
+            "inbox_triage",
+            error_text,
+            details={"unread_count": unread_count},
+        )
+        self._event_log.emit(
+            event_type="inbox_triage_failed",
+            actor_id=self._root_agent_id,
+            actor_type="mr1",
+            target_id=self._root_agent_id,
+            target_type="agent",
+            status="error",
+            summary="background inbox triage failed",
+            metadata={
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "unread_count": unread_count,
+            },
+        )
+
+    def _run_inbox_triage_pass(self) -> None:
+        unread = [
+            m for m in self._message_store.list_inbox(self._root_agent_id)
+            if m.status == "unread"
+        ]
+        if not unread:
+            return
+        try:
+            runner = self._make_inbox_triage_runner()
+            runner.run(
+                InboxTriagePolicy(max_messages=10, max_actions=5),
+                caller_agent_id=self._root_agent_id,
+            )
+        except Exception as exc:
+            self._record_inbox_triage_failure(exc, unread_count=len(unread))
+
     def _run_inbox_loop(self) -> None:
         while not self._inbox_stop.is_set():
             self._inbox_stop.wait(self._inbox_triage_interval_s)
             if self._inbox_stop.is_set():
                 break
-            try:
-                unread = [
-                    m for m in self._message_store.list_inbox(self._root_agent_id)
-                    if m.status == "unread"
-                ]
-                if not unread:
-                    continue
-                runner = self._make_inbox_triage_runner()
-                runner.run(
-                    InboxTriagePolicy(max_messages=10, max_actions=5),
-                    caller_agent_id=self._root_agent_id,
-                )
-            except Exception:
-                pass
+            self._run_inbox_triage_pass()
 
     def shutdown(self, reason: str = "user") -> int:
         self._inbox_stop.set()

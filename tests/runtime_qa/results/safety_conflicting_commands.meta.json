@@ -1,7 +1,7 @@
 {
   "category": "safety",
   "description": "Conflicting NL: 'create three agents and kill them all'",
-  "elapsed_s": 0.08,
+  "elapsed_s": 0.07,
   "findings": [],
   "scenario": "safety_conflicting_commands",
   "session_error": null,

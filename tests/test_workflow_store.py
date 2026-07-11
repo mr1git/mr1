@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 
 import pytest
 
@@ -278,3 +279,37 @@ class TestLockingAtomicity:
             ))
         assert store.load_workflow(wf.workflow_id) is not None
         assert len(store.load_events(wf.workflow_id)) == 1
+
+    def test_cross_instance_locked_mutations_are_serialized(self, tmp_path):
+        store_a = WorkflowStore(root=tmp_path / "workflows")
+        store_b = WorkflowStore(root=tmp_path / "workflows")
+        wf = _make_workflow()
+        wf.metadata["counter"] = 0
+        store_a.save_workflow(wf)
+
+        errors: list[BaseException] = []
+
+        def bump(store: WorkflowStore, delay_s: float) -> None:
+            try:
+                with store.locked():
+                    current = store.load_workflow(wf.workflow_id)
+                    assert current is not None
+                    counter = int(current.metadata.get("counter", 0))
+                    time.sleep(delay_s)
+                    current.metadata["counter"] = counter + 1
+                    store.save_workflow(current)
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=bump, args=(store_a, 0.05))
+        second = threading.Thread(target=bump, args=(store_b, 0.0))
+        first.start()
+        time.sleep(0.01)
+        second.start()
+        first.join()
+        second.join()
+
+        assert not errors
+        updated = store_a.load_workflow(wf.workflow_id)
+        assert updated is not None
+        assert updated.metadata["counter"] == 2

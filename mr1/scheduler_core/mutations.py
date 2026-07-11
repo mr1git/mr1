@@ -198,11 +198,18 @@ class WorkflowMutationEngine:
         self._validate_spec = validate_spec
         self._error_cls = error_cls
 
+    def _ensure_workflow_mutable(self, workflow: Workflow) -> None:
+        if workflow.status is WorkflowStatus.CANCELLED:
+            raise self._error_cls(
+                f"workflow cancelled and cannot be mutated: {workflow.workflow_id}"
+            )
+
     def rerun_task(self, workflow_id: str, label_or_task_id: str) -> str:
         with self._store.locked():
             workflow = self._store.load_workflow(workflow_id)
             if workflow is None:
                 raise self._error_cls(f"workflow not found: {workflow_id}")
+            self._ensure_workflow_mutable(workflow)
             task = task_for_label_or_id(workflow, label_or_task_id)
             if task is None:
                 raise self._error_cls(
@@ -366,6 +373,7 @@ class WorkflowMutationEngine:
             workflow = self._store.load_workflow(workflow_id)
             if workflow is None:
                 raise self._error_cls(f"workflow not found: {workflow_id}")
+            self._ensure_workflow_mutable(workflow)
             new_tasks = require_fragment_tasks(spec_fragment, error_cls=self._error_cls)
             merged = workflow_to_spec(workflow)
             merged["tasks"].extend(new_tasks)
@@ -404,6 +412,7 @@ class WorkflowMutationEngine:
             workflow = self._store.load_workflow(workflow_id)
             if workflow is None:
                 raise self._error_cls(f"workflow not found: {workflow_id}")
+            self._ensure_workflow_mutable(workflow)
             anchor = task_for_label_or_id(workflow, after_task)
             if anchor is None:
                 raise self._error_cls(f"task not found in workflow {workflow_id}: {after_task}")
@@ -473,6 +482,7 @@ class WorkflowMutationEngine:
             workflow = self._store.load_workflow(workflow_id)
             if workflow is None:
                 raise self._error_cls(f"workflow not found: {workflow_id}")
+            self._ensure_workflow_mutable(workflow)
             task = task_for_label_or_id(workflow, target_task)
             if task is None:
                 raise self._error_cls(f"task not found in workflow {workflow_id}: {target_task}")

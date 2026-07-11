@@ -193,6 +193,11 @@ class CapabilityGate:
         request = CapabilityRequest(
             actor_id=workflow.owner_agent_id or self._scoped_agents.root_agent_id,
             actor_type=self.workflow_actor_type(workflow),
+            actor_clearance=float(
+                self._scoped_agents.require_agent(
+                    workflow.owner_agent_id or self._scoped_agents.root_agent_id
+                ).security_clearance
+            ),
             invocation_mode="workflow",
             capability_name=capability_name,
             args=self.capability_args_for_task(task),
@@ -211,7 +216,7 @@ class CapabilityGate:
             request,
             metadata,
             config_schema=capability.get("config_schema", {}),
-            approved_request=self._approval_store.active_approval_for_request(request, metadata),
+            approval_request=self._approval_store.approval_for_request(request, metadata),
         ).to_dict()
         audit_path = self.policy_audit_path(workflow, task, attempt_id)
         self.write_policy_audit(
@@ -260,14 +265,16 @@ class CapabilityGate:
         request: CapabilityRequest,
         decision: dict[str, Any],
         *,
+        target_status: TaskStatus,
         approval_request_id: Optional[str] = None,
         audit_path: Optional[Path] = None,
     ) -> dict[str, Any]:
+        error_type = "approval_required" if target_status is TaskStatus.BLOCKED else "policy_block"
         payload = {
             "task_id": task.task_id,
             "workflow_id": workflow.workflow_id,
             "attempt_id": task.current_attempt,
-            "status": TaskStatus.FAILED.value,
+            "status": target_status.value,
             "summary": decision["reason"],
             "text": "",
             "data": {
@@ -277,8 +284,8 @@ class CapabilityGate:
             },
             "metrics": {},
             "error": decision["reason"],
-            "error_type": "policy_block",
-            "failure_type": "policy_block",
+            "error_type": error_type,
+            "failure_type": error_type,
             "retryable": False,
         }
         if audit_path is not None:
@@ -373,6 +380,11 @@ class CapabilityGate:
                 task,
                 request,
                 decision,
+                target_status=(
+                    TaskStatus.BLOCKED
+                    if decision["status"] == "requires_approval" else
+                    TaskStatus.FAILED
+                ),
                 approval_request_id=approval_request_id,
                 audit_path=audit_path,
             ),

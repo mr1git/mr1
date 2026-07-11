@@ -49,7 +49,7 @@ class MR1Process:
             raise RuntimeError(f"claude CLI is unavailable: {detail}")
         self._available = True
 
-    def send(self, message: str) -> str:
+    def send(self, message: str, *, retriable: bool = False) -> str:
         """
         Execute a single Claude turn and return the final result text.
         """
@@ -57,9 +57,11 @@ class MR1Process:
             return "[MR1 ERROR] Process is not running."
 
         result_text, error_text = self._invoke(message, resume=bool(self._session_id))
-        if error_text and self._session_id:
+        if error_text and self._session_id and retriable:
             self._session_id = None
             result_text, error_text = self._invoke(message, resume=False)
+        elif error_text and self._session_id:
+            self._session_id = None
 
         if error_text:
             return f"[MR1 ERROR] {error_text}"

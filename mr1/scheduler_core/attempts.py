@@ -7,7 +7,7 @@ from typing import Any, Optional
 from mr1.kazi_runner import RunHandle, RunResult, RunStatus
 from mr1.scheduler_core.events import SchedulerEventAdapter
 from mr1.workflow_models import Task, TaskAttempt, TaskStatus, Workflow
-from mr1.workflow_store import WorkflowStore
+from mr1.workflow_store import WorkflowStore, sync_task_view, sync_workflow_view
 
 
 UNSET = object()
@@ -164,7 +164,16 @@ class AttemptManager:
         run_handle: Optional[RunHandle] = None,
     ) -> int:
         attempt_id = task.current_attempt or (task.attempt_count + 1)
+        original_workflow = workflow
+        original_task = task
         with self._store.locked():
+            task_id = task.task_id
+            workflow = self._store.load_workflow(workflow.workflow_id)
+            if workflow is None:
+                raise RuntimeError(f"workflow not found during attempt start: {task.workflow_id}")
+            task = workflow.tasks.get(task_id)
+            if task is None:
+                raise RuntimeError(f"task not found during attempt start: {task_id}")
             stdout_path, stderr_path = self._store.task_attempt_log_paths(
                 workflow.workflow_id,
                 task.task_id,
@@ -241,6 +250,8 @@ class AttemptManager:
                 attempt_id,
                 extra_events,
             )
+            sync_workflow_view(original_workflow, workflow)
+            sync_task_view(original_task, task)
         return attempt_id
 
     def finish_attempt(
@@ -275,7 +286,16 @@ class AttemptManager:
         extra_events: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
     ) -> None:
         attempt_id = task.current_attempt or None
+        original_workflow = workflow
+        original_task = task
         with self._store.locked():
+            task_id = task.task_id
+            workflow = self._store.load_workflow(workflow.workflow_id)
+            if workflow is None:
+                raise RuntimeError(f"workflow not found during attempt finish: {task.workflow_id}")
+            task = workflow.tasks.get(task_id)
+            if task is None:
+                raise RuntimeError(f"task not found during attempt finish: {task_id}")
             now_iso = self._now()
             task.status = new_status
             task.finished_at = now_iso
@@ -367,3 +387,5 @@ class AttemptManager:
                 attempt_id,
                 extra_events,
             )
+            sync_workflow_view(original_workflow, workflow)
+            sync_task_view(original_task, task)

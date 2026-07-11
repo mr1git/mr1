@@ -1,0 +1,9 @@
+{
+  "category": "workflow",
+  "description": "Rerun a task from a CANCELLED workflow \u2014 should be refused or at minimum not silently reopen the workflow",
+  "elapsed_s": 469.33,
+  "findings": [],
+  "scenario": "wf_rerun_after_cancel",
+  "session_error": null,
+  "turn_count": 3
+}

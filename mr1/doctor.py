@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+# repair_state_file is defined near the bottom of this module alongside the
+# other operator utilities (create_snapshot, list_snapshots, inspect_snapshot).
+
 from mr1.capabilities import default_capability_registry
 from mr1.capability_policy import CapabilityApprovalDecision, CapabilityApprovalRequest, CapabilityMetadata
 from mr1.event_log import (
@@ -1612,3 +1615,57 @@ def inspect_snapshot(runtime_root: Path, snapshot_id: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"invalid snapshot manifest: {manifest_path}")
     return payload
+
+
+def repair_state_file(state_path: Path) -> dict[str, Any]:
+    """Quarantine a corrupt MR1 state file so that MR1 can start fresh.
+
+    The corrupt file is *renamed* to ``<stem>.bad.<timestamp><suffix>`` in the
+    same directory — its contents are preserved for operator investigation.
+    A fresh state file is NOT created automatically; MR1 will initialise one
+    on its next start.
+
+    Raises ValueError if the file does not exist or appears structurally valid
+    (i.e. does not need repair).  Never deletes or reinitialises state silently.
+
+    Recovery workflow
+    -----------------
+    1. MR1 fails to start with ``StateCorruptionError``.
+    2. Operator runs: ``python -m mr1.workflow_cli repair-state``
+    3. The corrupt file is quarantined; path is printed.
+    4. Operator investigates the quarantined file at their leisure.
+    5. Restart MR1 — a fresh state is created automatically.
+    """
+    path = Path(state_path)
+    if not path.exists():
+        raise ValueError(f"state file does not exist: {path}")
+
+    is_corrupt = False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            is_corrupt = True
+    except (json.JSONDecodeError, OSError):
+        is_corrupt = True
+
+    if not is_corrupt:
+        raise ValueError(
+            f"state file appears structurally valid; no repair needed: {path}\n"
+            "Run 'doctor' to diagnose whether a different problem exists."
+        )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    quarantine_path = path.with_name(f"{path.stem}.bad.{timestamp}{path.suffix}")
+    path.rename(quarantine_path)
+
+    return {
+        "action": "quarantined",
+        "original_path": str(path),
+        "quarantined_path": str(quarantine_path),
+        "message": (
+            f"Corrupt state file quarantined to:\n  {quarantine_path}\n\n"
+            "The original data is preserved for investigation.\n"
+            "MR1 will initialise a fresh state on next start."
+        ),
+    }

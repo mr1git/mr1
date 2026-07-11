@@ -198,9 +198,8 @@ def _format_approval_decision_result(
     lines = ["Approved." if approval.status == "approved" else "Denied."]
     if approval.status == "approved" and approval.workflow_id and approval.task_id:
         lines.extend([
-            "This does not automatically rerun the failed task.",
-            "To retry:",
-            f"  /workflow rerun {approval.workflow_id} {approval.task_id}",
+            "Blocked workflow task reopened automatically.",
+            "The scheduler will resume it on the next tick.",
         ])
     if (
         approval.status == "approved"

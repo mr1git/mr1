@@ -17,12 +17,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import multiprocessing
 import sys
 import tempfile
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +110,13 @@ def _run_one(scenario: Scenario, *, verbose: bool = False) -> dict[str, Any]:
     return meta
 
 
+def _run_one_named(scenario_name: str, *, verbose: bool = False) -> dict[str, Any]:
+    selected = _select_scenarios([scenario_name], None)
+    if not selected:
+        raise ValueError(f"unknown scenario: {scenario_name}")
+    return _run_one(selected[0], verbose=verbose)
+
+
 def _summarize(metas: list[dict[str, Any]]) -> dict[str, Any]:
     by_severity: dict[str, int] = {}
     by_category: dict[str, dict[str, int]] = {}
@@ -185,8 +192,14 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
     else:
-        with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-            futures = {ex.submit(_run_one, s, verbose=False): s for s in selected}
+        with ProcessPoolExecutor(
+            max_workers=args.jobs,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as ex:
+            futures = {
+                ex.submit(_run_one_named, s.name, verbose=False): s
+                for s in selected
+            }
             for fut in as_completed(futures):
                 scen = futures[fut]
                 try:

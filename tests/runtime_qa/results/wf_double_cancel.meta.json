@@ -1,0 +1,9 @@
+{
+  "category": "workflow",
+  "description": "Cancelling an already-cancelled workflow should return a clear 'already cancelled' error, not 'not found'",
+  "elapsed_s": 419.64,
+  "findings": [],
+  "scenario": "wf_double_cancel",
+  "session_error": null,
+  "turn_count": 3
+}

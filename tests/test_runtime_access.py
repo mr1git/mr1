@@ -178,6 +178,7 @@ def test_runtime_access_preview_and_full_reads(
     request = CapabilityRequest(
         actor_id=child.agent_id,
         actor_type="mrn",
+        actor_clearance=child.security_clearance,
         invocation_mode="direct",
         capability_name="read_file",
         args={"path": "README.md"},

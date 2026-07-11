@@ -292,3 +292,34 @@ def test_runtime_qa_routing_phrases_route_as_expected(user_text, expected_route)
     )
 
     assert advice.route == expected_route
+
+
+def test_route_advice_exposes_operational_and_inspection_signals():
+    advice = build_route_advice(
+        "show me pending approvals",
+        runtime_grounding=_runtime_grounding(
+            approvals=[{"approval_request_id": "cap_approval_test"}],
+        ),
+    )
+
+    assert advice.signals["matched_inspection_phrases"]
+    assert "show" in advice.signals["matched_inspection_phrases"]
+    assert advice.signals["matched_operational_verbs"] == []
+
+
+def test_route_advice_exposes_persistent_and_workflow_signals():
+    persistent = build_route_advice(
+        "spawn an agent for me",
+        runtime_grounding=_runtime_grounding(),
+    )
+    workflow = build_route_advice(
+        "create a workflow that lists files in /tmp and writes the count to a report",
+        runtime_grounding=_runtime_grounding(),
+    )
+
+    assert "spawn/make/add/start agent imperative" in persistent.signals["matched_persistent_agent_patterns"]
+    assert any(
+        item.startswith("workflow create marker:")
+        for item in workflow.signals["matched_workflow_patterns"]
+    )
+    assert "workflow action word:create" in workflow.signals["matched_workflow_patterns"]

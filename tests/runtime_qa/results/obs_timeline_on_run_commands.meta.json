@@ -1,0 +1,9 @@
+{
+  "category": "observability",
+  "description": "A run_commands turn should emit a runtime decision event with inspectable signals",
+  "elapsed_s": 0.07,
+  "findings": [],
+  "scenario": "obs_timeline_on_run_commands",
+  "session_error": null,
+  "turn_count": 2
+}

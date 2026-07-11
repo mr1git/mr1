@@ -1,0 +1,9 @@
+{
+  "category": "workflow",
+  "description": "Submit a workflow spec that is not valid JSON \u2014 must return parse error",
+  "elapsed_s": 0.01,
+  "findings": [],
+  "scenario": "wf_submit_invalid_json",
+  "session_error": null,
+  "turn_count": 1
+}

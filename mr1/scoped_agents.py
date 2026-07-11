@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,6 +27,12 @@ _DEFAULT_ROOT = Path(__file__).resolve().parent / "memory" / "agents"
 ACTIVE_AGENT_STATUS = "active"
 TERMINAL_AGENT_STATUSES = frozenset({"terminated", "archived", "dead"})
 TERMINAL_RUN_STATUSES = frozenset({"terminated", "completed", "failed", "dead"})
+MAX_AUTONOMOUS_CLEARANCE = 0.99
+
+# Index file mapping normalized_casefold_title → agent_id.
+# Terminated agents remain in the index: their titles are permanently reserved
+# to prevent reuse. This is intentional and matches the current semantics.
+_TITLE_INDEX_FILE = ".title_index.json"
 
 
 def _now_iso() -> str:
@@ -56,6 +63,17 @@ def _normalize_lifecycle_value(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip().lower()
+
+
+def _title_has_control_chars(title: str) -> bool:
+    return any(
+        ch == "\x7f" or unicodedata.category(ch) == "Cc"
+        for ch in title
+    )
+
+
+def _normalize_agent_title(title: str) -> str:
+    return title.strip().casefold()
 
 
 def derive_lifecycle_state(
@@ -335,7 +353,7 @@ class PersistentAgent:
     parent_request: Optional[str] = None
     last_run: Optional[dict[str, Any]] = None
     step_context: dict[str, Any] = field(default_factory=dict)
-    security_clearance: float = 1.0
+    security_clearance: float = MAX_AUTONOMOUS_CLEARANCE
     scope_roots: list[str] = field(default_factory=list)
     scope_grants: list[dict[str, Any]] = field(default_factory=list)
     assignment_packet: Optional[dict[str, Any]] = None
@@ -375,7 +393,7 @@ class PersistentAgent:
         agent_type = data["agent_type"]
         security_clearance = data.get("security_clearance")
         if security_clearance is None and agent_type in {"mr1", "mrn"}:
-            security_clearance = 1.0
+            security_clearance = MAX_AUTONOMOUS_CLEARANCE
         return cls(
             agent_id=data["agent_id"],
             agent_type=agent_type,
@@ -452,6 +470,10 @@ class PersistentAgentStore:
         return self._root
 
     @property
+    def _title_index_path(self) -> Path:
+        return self._root / _TITLE_INDEX_FILE
+
+    @property
     def root_agent_id_path(self) -> Path:
         return self._root / ".root_agent_id"
 
@@ -516,14 +538,104 @@ class PersistentAgentStore:
         if not memory_path.exists():
             memory_path.write_text("", encoding="utf-8")
 
+    def _read_agent_file(self, path: Path) -> Optional[PersistentAgent]:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return PersistentAgent.from_dict(json.load(handle))
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            return None
+
+    def _load_title_index_locked(self) -> dict[str, str]:
+        """Return the title index {normalized_title: agent_id}, rebuilding if missing/corrupt."""
+        path = self._title_index_path
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+                if isinstance(raw, dict):
+                    return {str(k): str(v) for k, v in raw.items()}
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
+        return self._rebuild_title_index_locked()
+
+    def _rebuild_title_index_locked(self) -> dict[str, str]:
+        """Full scan → rebuild title index. O(n). Terminated agents are included
+        so their titles remain permanently reserved (same semantics as before)."""
+        index: dict[str, str] = {}
+        for path in sorted(self._root.glob("ag-*.json")):
+            agent = self._read_agent_file(path)
+            if agent is None:
+                continue
+            normalized = _normalize_agent_title(agent.title)
+            if normalized:
+                index[normalized] = agent.agent_id
+        self._save_title_index_locked(index)
+        return index
+
+    def _save_title_index_locked(self, index: dict[str, str]) -> None:
+        path = self._title_index_path
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(index, handle, indent=2, sort_keys=True)
+        tmp.replace(path)
+
+    def _find_title_conflict_locked(
+        self,
+        title: str,
+        *,
+        excluding_agent_id: str | None = None,
+    ) -> Optional[PersistentAgent]:
+        """O(1) title conflict check via the title index (one index file read + at most
+        one agent file read to verify). Falls back to a full rebuild if the index is
+        stale (i.e., the indexed agent no longer has that title)."""
+        normalized_title = _normalize_agent_title(title)
+        if not normalized_title:
+            return None
+        index = self._load_title_index_locked()
+        conflicting_id = index.get(normalized_title)
+        if conflicting_id is None:
+            return None
+        if excluding_agent_id and conflicting_id == excluding_agent_id:
+            return None
+        # Verify the indexed agent still holds this title (self-healing for stale entries).
+        candidate = self._read_agent_file(self.agent_path(conflicting_id))
+        if candidate is None or _normalize_agent_title(candidate.title) != normalized_title:
+            index.pop(normalized_title, None)
+            self._save_title_index_locked(index)
+            return None
+        return candidate
+
     def save_agent(self, agent: PersistentAgent) -> None:
         with self._lock:
-            self.ensure_agent_files(agent.agent_id)
             target = self.agent_path(agent.agent_id)
+            existing = self._read_agent_file(target) if target.exists() else None
+            title_changed = (
+                existing is None
+                or _normalize_agent_title(existing.title) != _normalize_agent_title(agent.title)
+            )
+            old_normalized = (
+                _normalize_agent_title(existing.title) if existing is not None else None
+            )
+            new_normalized = _normalize_agent_title(agent.title)
+            if title_changed:
+                conflict = self._find_title_conflict_locked(
+                    agent.title,
+                    excluding_agent_id=agent.agent_id,
+                )
+                if conflict is not None:
+                    raise ValueError(f"agent title already exists: {conflict.title}")
+            self.ensure_agent_files(agent.agent_id)
             tmp = target.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(agent.to_dict(), handle, indent=2)
             tmp.replace(target)
+            # Update title index atomically after the agent file is persisted.
+            if title_changed:
+                index = self._load_title_index_locked()
+                if old_normalized is not None and index.get(old_normalized) == agent.agent_id:
+                    del index[old_normalized]
+                index[new_normalized] = agent.agent_id
+                self._save_title_index_locked(index)
 
     def load_agent(self, agent_id: str) -> Optional[PersistentAgent]:
         with self._lock:
@@ -545,13 +657,11 @@ class PersistentAgentStore:
         with self._lock:
             agents: list[PersistentAgent] = []
             for path in sorted(self._root.glob("ag-*.json")):
-                try:
-                    with open(path, "r", encoding="utf-8") as handle:
-                        agent = PersistentAgent.from_dict(json.load(handle))
-                    self.ensure_agent_files(agent.agent_id)
-                    agents.append(agent)
-                except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                agent = self._read_agent_file(path)
+                if agent is None:
                     continue
+                self.ensure_agent_files(agent.agent_id)
+                agents.append(agent)
             agents.sort(key=lambda item: (item.tree_level, item.created_at, item.agent_id))
             return agents
 
@@ -574,7 +684,7 @@ class PersistentAgentStore:
                 title="MR1",
                 tree_level=1,
                 parent_agent_id=None,
-                security_clearance=1.0,
+                security_clearance=MAX_AUTONOMOUS_CLEARANCE,
             )
             self.save_agent(agent)
             tmp = pointer.with_suffix(".tmp")
@@ -684,6 +794,10 @@ class PersistentAgentStore:
         title = title.strip()
         if not title:
             raise ValueError("agent title must be non-empty")
+        if title.casefold() == "all":
+            raise ValueError("agent title 'all' is reserved")
+        if _title_has_control_chars(title):
+            raise ValueError("agent title must not contain control characters")
         parent = self.require_agent(caller_agent_id)
         if is_agent_terminal(parent):
             raise ValueError(f"agent is terminated: {caller_agent_id}")
@@ -760,7 +874,7 @@ class PersistentAgentStore:
         from mr1.capability_policy import normalize_path
 
         granter = self.require_agent(granting_agent_id)
-        if granter.security_clearance < 1.0:
+        if not self.is_root_agent(granting_agent_id) and granter.security_clearance < 1.0:
             raise AgentScopeError("access denied: insufficient security clearance for scope grant")
         normalized_path = str(normalize_path(path))
         if not (self.is_root_agent(granting_agent_id) or self.can_agent_access_path(granting_agent_id, normalized_path)):
@@ -810,7 +924,7 @@ class PersistentAgentStore:
         from mr1.capability_policy import normalize_path
 
         granter = self.require_agent(granting_agent_id)
-        if granter.security_clearance < 1.0:
+        if not self.is_root_agent(granting_agent_id) and granter.security_clearance < 1.0:
             raise AgentScopeError("access denied: insufficient security clearance for scope revoke")
         normalized_path = str(normalize_path(path))
         target = self.require_agent(target_agent_id)

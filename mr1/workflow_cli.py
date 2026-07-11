@@ -120,6 +120,7 @@ from mr1.cli.agents import (
 )
 from mr1.cli.memory import (
     _cmd_doctor as _cmd_doctor,
+    _cmd_repair_state as _cmd_repair_state,
     _cmd_memory_agent as _cmd_memory_agent,
     _cmd_memory_capabilities as _cmd_memory_capabilities,
     _cmd_memory_curate as _cmd_memory_curate,

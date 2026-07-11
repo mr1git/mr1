@@ -59,6 +59,7 @@ from mr1.orchestrator.state import (
     _MAX_DECISIONS as _MAX_DECISIONS,
     _STATE_PATH as _STATE_PATH,
     _TERMINAL_TASK_STATUSES as _TERMINAL_TASK_STATUSES,
+    StateCorruptionError as StateCorruptionError,
     StateManager as StateManager,
 )
 

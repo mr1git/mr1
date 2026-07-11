@@ -119,6 +119,7 @@ class CapabilityRunner:
         request = CapabilityRequest(
             actor_id=caller_agent_id,
             actor_type=caller_type,
+            actor_clearance=self._resolve_caller_clearance(caller_agent_id),
             invocation_mode=mode,
             capability_name=name,
             args=dict(config),
@@ -137,7 +138,7 @@ class CapabilityRunner:
             request,
             metadata,
             config_schema=meta.get("config_schema", {}),
-            approved_request=self._approval_store.active_approval_for_request(request, metadata),
+            approval_request=self._approval_store.approval_for_request(request, metadata),
         )
         audit_id = self._new_audit_id(caller_agent_id)
         audit_path = self._agents.capability_audit_path(caller_agent_id, audit_id)
@@ -326,6 +327,9 @@ class CapabilityRunner:
 
     def _resolve_caller_type(self, caller_agent_id: str) -> str:
         return "mr1" if self._agents.is_root_agent(caller_agent_id) else "mrn"
+
+    def _resolve_caller_clearance(self, caller_agent_id: str) -> float:
+        return float(self._agents.require_agent(caller_agent_id).security_clearance)
 
     def _route_approval(self, approval) -> tuple[str, bool]:
         from mr1.capability_policy import maybe_route_approval_request

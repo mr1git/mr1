@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import MAX_AUTONOMOUS_CLEARANCE, PersistentAgentStore
 from mr1.workflow_store import WorkflowStore
 
 
@@ -29,9 +29,9 @@ _ALLOWED_APPROVAL_STATUSES = frozenset({"pending", "approved", "denied", "expire
 _ALLOWED_APPROVAL_DECISIONS = frozenset({"approved", "denied"})
 _ALLOWED_APPROVAL_SCOPES = frozenset({"single_use", "grant_scope"})
 _ALLOWED_ACTOR_THRESHOLDS = {
-    "mr1": {"direct": 0.50, "workflow": 1.00},
-    "mrn": {"direct": 0.20, "workflow": 1.00},
-    "kazi": {"direct": 0.00, "workflow": 1.00},
+    "mr1": {"direct": 0.50, "workflow": MAX_AUTONOMOUS_CLEARANCE},
+    "mrn": {"direct": 0.20, "workflow": MAX_AUTONOMOUS_CLEARANCE},
+    "kazi": {"direct": 0.00, "workflow": MAX_AUTONOMOUS_CLEARANCE},
 }
 
 
@@ -181,6 +181,7 @@ class CapabilityMetadata:
 class CapabilityRequest:
     actor_id: str
     actor_type: str
+    actor_clearance: float
     invocation_mode: str
     capability_name: str
     args: dict[str, Any]
@@ -192,6 +193,8 @@ class CapabilityRequest:
     def __post_init__(self) -> None:
         if self.actor_type not in _ALLOWED_ACTOR_TYPES:
             raise ValueError(f"invalid actor_type '{self.actor_type}'")
+        if not 0.0 <= float(self.actor_clearance) <= 1.0:
+            raise ValueError(f"invalid actor_clearance '{self.actor_clearance}'")
         if self.invocation_mode not in _ALLOWED_INVOCATION_MODES:
             raise ValueError(f"invalid invocation_mode '{self.invocation_mode}'")
         if not isinstance(self.args, dict):
@@ -201,6 +204,7 @@ class CapabilityRequest:
         return {
             "actor_id": self.actor_id,
             "actor_type": self.actor_type,
+            "actor_clearance": self.actor_clearance,
             "invocation_mode": self.invocation_mode,
             "capability_name": self.capability_name,
             "args": dict(self.args),
@@ -215,6 +219,7 @@ class CapabilityRequest:
         return cls(
             actor_id=data["actor_id"],
             actor_type=data["actor_type"],
+            actor_clearance=float(data.get("actor_clearance", 0.0)),
             invocation_mode=data["invocation_mode"],
             capability_name=data["capability_name"],
             args=dict(data.get("args", {})),
@@ -969,6 +974,13 @@ class CapabilityApprovalStore:
             return None
         return approval
 
+    def approval_for_request(
+        self,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+    ) -> Optional[CapabilityApprovalRequest]:
+        return self.load(approval_request_id_for(request, metadata))
+
     def mark_used(
         self,
         approval_request_id: str,
@@ -1026,7 +1038,10 @@ class CapabilityApprovalStore:
         ):
             raise ValueError("approval decision rejected: decider is not designated approver or higher ancestor")
         decider = scoped_agent_store.require_agent(decision.decided_by)
-        if decider.security_clearance < approval.risk_score:
+        if (
+            not scoped_agent_store.is_root_agent(decision.decided_by)
+            and decider.security_clearance < approval.risk_score
+        ):
             raise ValueError("approval decision rejected: insufficient security clearance")
         updated_payload = approval.to_dict()
         updated_payload["decision_history"] = list(approval.decision_history) + [decision.to_dict()]
@@ -1065,7 +1080,78 @@ class CapabilityApprovalStore:
                 approval.requested_scope_path,
                 reason=decision.reason,
             )
+        if decision.decision == "approved":
+            self._resume_blocked_workflow_task(updated)
         return updated
+
+    def expire_requests_for_workflow(
+        self,
+        workflow_id: str,
+        *,
+        reason: str,
+    ) -> list[str]:
+        expired_ids: list[str] = []
+        for approval in self.list_requests():
+            if approval.workflow_id != workflow_id or approval.status != "pending":
+                continue
+            updated = CapabilityApprovalRequest.from_dict({
+                **approval.to_dict(),
+                "status": "expired",
+            })
+            path = self.save(updated)
+            self._event_log.emit(
+                event_type="approval_expired",
+                actor_id=approval.requesting_actor_id,
+                actor_type=approval.original_request.actor_type,
+                target_id=approval.approval_request_id,
+                target_type="approval_request",
+                status="expired",
+                summary=f"approval expired: {approval.capability_name}",
+                workflow_id=approval.workflow_id,
+                task_id=approval.task_id,
+                step_id=approval.original_step_id,
+                approval_request_id=approval.approval_request_id,
+                record_path=str(path),
+                metadata={
+                    "capability_name": approval.capability_name,
+                    "reason": reason,
+                },
+            )
+            expired_ids.append(approval.approval_request_id)
+        return expired_ids
+
+    def _resume_blocked_workflow_task(self, approval: CapabilityApprovalRequest) -> None:
+        if not approval.workflow_id or not approval.task_id:
+            return
+        from mr1.scheduler_core.dependencies import status_for_reset
+        from mr1.scheduler_core.state_machine import reopen_workflow, reset_task_runtime_state
+        from mr1.workflow_events import WorkflowEventLog
+        from mr1.workflow_models import TaskStatus, WorkflowStatus
+
+        store = WorkflowStore(self._root.parent / "workflows")
+        with store.locked():
+            workflow = store.load_workflow(approval.workflow_id)
+            if workflow is None or workflow.status is WorkflowStatus.CANCELLED:
+                return
+            task = workflow.tasks.get(approval.task_id)
+            if task is None:
+                return
+            if task.status is not TaskStatus.BLOCKED:
+                return
+            if task.last_error_type != "approval_required":
+                return
+            reset_task_runtime_state(task, status=status_for_reset(workflow, task))
+            reopen_workflow(workflow)
+            store.save_workflow(workflow)
+            WorkflowEventLog(store, default_agent_id="approval").task_unblocked(
+                workflow.workflow_id,
+                task.task_id,
+                message="approval granted; task reopened",
+                metadata={
+                    "status": task.status.value,
+                    "approval_request_id": approval.approval_request_id,
+                },
+            )
 
 
 class CapabilityAuditWriter:
@@ -1089,11 +1175,11 @@ class PolicyEngine:
         metadata: CapabilityMetadata,
         *,
         config_schema: Optional[dict[str, Any]] = None,
-        approved_request: Optional[CapabilityApprovalRequest] = None,
+        approval_request: Optional[CapabilityApprovalRequest] = None,
     ) -> CapabilityDecision:
         schema = dict(config_schema or {})
         approved_override = self._approved_override_matches(
-            approved_request,
+            approval_request,
             request=request,
             metadata=metadata,
         )
@@ -1127,7 +1213,18 @@ class PolicyEngine:
                 reason="unknown_actor_policy",
                 risk_score=metadata.risk_score,
             )
-        max_risk = thresholds[request.invocation_mode]
+        if approval_request is not None and approval_request.status == "denied":
+            return self._decision(
+                allowed=False,
+                status="denied",
+                reason="approval_previously_denied",
+                risk_score=metadata.risk_score,
+                metadata_payload={"approval_request_id": approval_request.approval_request_id},
+            )
+        max_risk = min(
+            thresholds[request.invocation_mode],
+            float(request.actor_clearance),
+        )
         if metadata.risk_score > max_risk and not approved_override:
             return self._decision(
                 allowed=False,
@@ -1144,7 +1241,7 @@ class PolicyEngine:
                     status="allowed",
                     reason="approved_override",
                     risk_score=metadata.risk_score,
-                    metadata_payload={"approval_request_id": approved_request.approval_request_id},
+                    metadata_payload={"approval_request_id": approval_request.approval_request_id},
                 )
             return scope_decision
         return self._decision(
@@ -1153,8 +1250,8 @@ class PolicyEngine:
             reason="approved_override" if approved_override else "allowed",
             risk_score=metadata.risk_score,
             metadata_payload=(
-                {"approval_request_id": approved_request.approval_request_id}
-                if approved_override and approved_request is not None else
+                {"approval_request_id": approval_request.approval_request_id}
+                if approved_override and approval_request is not None else
                 None
             ),
         )

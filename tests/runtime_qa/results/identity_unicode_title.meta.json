@@ -1,0 +1,9 @@
+{
+  "category": "identity",
+  "description": "Unicode and emoji agent titles must survive create/list/kill round-trip",
+  "elapsed_s": 0.04,
+  "findings": [],
+  "scenario": "identity_unicode_title",
+  "session_error": null,
+  "turn_count": 5
+}

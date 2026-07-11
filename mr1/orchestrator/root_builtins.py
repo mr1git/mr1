@@ -28,6 +28,31 @@ _KNOWN_COMMAND_HINT = (
     "/message, /approvals, /tools, /capabilities, /schema, /help."
 )
 
+_WORKFLOW_USAGE_BY_SUBCOMMAND = {
+    "append": "Usage: /workflow append <workflow_id> <path>",
+    "cancel": "Usage: /workflow cancel <workflow_id>",
+    "insert": "Usage: /workflow insert <workflow_id> <after_task> <path>",
+    "replace": "Usage: /workflow replace [-r] <workflow_id> <task> <path>",
+    "rerun": "Usage: /workflow rerun <workflow_id> <task>",
+    "submit": "Usage: /workflow submit <path>",
+    "trigger": "Usage: /workflow trigger <workflow_id> <label-or-task-id> [event_name]",
+}
+
+
+def _workflow_usage(subcommand: Optional[str] = None) -> str:
+    if subcommand:
+        return _WORKFLOW_USAGE_BY_SUBCOMMAND[subcommand]
+    return "\n".join([
+        "Usage: /workflow <workflow_id>",
+        _WORKFLOW_USAGE_BY_SUBCOMMAND["submit"],
+        _WORKFLOW_USAGE_BY_SUBCOMMAND["rerun"],
+        _WORKFLOW_USAGE_BY_SUBCOMMAND["cancel"],
+        _WORKFLOW_USAGE_BY_SUBCOMMAND["append"],
+        _WORKFLOW_USAGE_BY_SUBCOMMAND["insert"],
+        _WORKFLOW_USAGE_BY_SUBCOMMAND["replace"],
+        _WORKFLOW_USAGE_BY_SUBCOMMAND["trigger"],
+    ])
+
 
 def handle_builtin(root, cmd: str) -> Optional[str]:
     """
@@ -115,25 +140,33 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
         return root._handle_capability_builtin(cmd)
     if cmd == "/schema" or cmd.startswith("/schema "):
         return root._handle_schema_builtin(cmd)
-    if cmd.startswith("/workflow "):
-        rest = cmd[len("/workflow "):].strip()
+    if cmd == "/workflow" or cmd.startswith("/workflow "):
+        rest = cmd[len("/workflow"):].strip()
+        if not rest:
+            return _workflow_usage()
+        if rest == "submit":
+            return _workflow_usage("submit")
         if rest.startswith("submit "):
             path_str = rest[len("submit "):].strip()
             return root._submit_workflow_from_path(path_str)
+        if rest == "rerun":
+            return _workflow_usage("rerun")
         if rest.startswith("rerun "):
             parts = rest.split(maxsplit=2)
             if len(parts) != 3:
-                return "Usage: /workflow rerun <workflow_id> <task>"
+                return _workflow_usage("rerun")
             try:
                 task_id = root._scheduler.rerun_task(parts[1], parts[2])
             except WorkflowSpecError as exc:
                 return str(exc)
             root._scheduler.tick()
             return f"rerun scheduled: {task_id}"
+        if rest == "cancel":
+            return _workflow_usage("cancel")
         if rest.startswith("cancel "):
             parts = rest.split(maxsplit=1)
             if len(parts) != 2:
-                return "Usage: /workflow cancel <workflow_id>"
+                return _workflow_usage("cancel")
             try:
                 cancelled = root._scheduler.cancel_workflow(parts[1])
             except WorkflowSpecError as exc:
@@ -143,10 +176,12 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
                 f"workflow cancelled: {parts[1]}"
                 if cancelled else f"workflow not found: {parts[1]}"
             )
+        if rest == "append":
+            return _workflow_usage("append")
         if rest.startswith("append "):
             parts = rest.split(maxsplit=2)
             if len(parts) != 3:
-                return "Usage: /workflow append <workflow_id> <path>"
+                return _workflow_usage("append")
             spec, error = workflow_cli._load_json_file(parts[2])
             if error:
                 return error
@@ -156,10 +191,12 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
                 return str(exc)
             root._scheduler.tick()
             return f"workflow updated: {workflow_id}"
+        if rest == "insert":
+            return _workflow_usage("insert")
         if rest.startswith("insert "):
             parts = rest.split(maxsplit=3)
             if len(parts) != 4:
-                return "Usage: /workflow insert <workflow_id> <after_task> <path>"
+                return _workflow_usage("insert")
             spec, error = workflow_cli._load_json_file(parts[3])
             if error:
                 return error
@@ -169,17 +206,19 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
                 return str(exc)
             root._scheduler.tick()
             return f"workflow updated: {workflow_id}"
+        if rest == "replace" or rest == "replace -r":
+            return _workflow_usage("replace")
         if rest.startswith("replace "):
             try:
                 parts = shlex.split(rest)
             except ValueError:
-                return "Usage: /workflow replace [-r] <workflow_id> <task> <path>"
+                return _workflow_usage("replace")
             rerun_after_replace = False
             if len(parts) > 1 and parts[1] == "-r":
                 rerun_after_replace = True
                 parts = [parts[0], *parts[2:]]
             if len(parts) != 4:
-                return "Usage: /workflow replace [-r] <workflow_id> <task> <path>"
+                return _workflow_usage("replace")
             spec, error = workflow_cli._load_json_file(parts[3])
             if error:
                 return error
@@ -191,10 +230,12 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
                 root._scheduler.tick()
                 return f"workflow updated and rerun: {workflow_id}"
             return f"workflow updated: {workflow_id}"
+        if rest == "trigger":
+            return _workflow_usage("trigger")
         if rest.startswith("trigger "):
             parts = rest.split(maxsplit=3)
             if len(parts) < 3:
-                return "Usage: /workflow trigger <workflow_id> <label-or-task-id> [event_name]"
+                return _workflow_usage("trigger")
             wf_id = parts[1]
             label_or_task_id = parts[2]
             event_name = parts[3] if len(parts) > 3 else None
@@ -828,6 +869,13 @@ def handle_approval_builtin(root, cmd: str) -> str:
         parts = shlex.split(cmd)
     except ValueError:
         return usage
+    if len(parts) == 1:
+        approvals = workflow_cli._visible_approvals(
+            root._approval_store,
+            root._scoped_agents,
+            root._root_agent_id,
+        )
+        return workflow_cli._format_approvals_table(approvals)
     if len(parts) < 2:
         return usage
 

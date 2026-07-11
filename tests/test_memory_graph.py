@@ -58,7 +58,7 @@ def _make_tool_workflow(
     agent_store: PersistentAgentStore,
 ) -> tuple[str, str, str]:
     root = agent_store.ensure_root_agent()
-    child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=1.0)
+    child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.99)
     child.scope_roots = [str(tmp_path)]
     agent_store.save_agent(child)
 

@@ -19,6 +19,7 @@ from mr1.doctor import (
     filter_doctor_report,
     inspect_snapshot,
     list_snapshots,
+    repair_state_file,
     run_doctor,
 )
 from mr1.event_log import EventLog
@@ -238,6 +239,7 @@ def _seed_pending_approval(runtime_root: Path, agent_store: PersistentAgentStore
         original_request=CapabilityRequest(
             actor_id=child.agent_id,
             actor_type="mrn",
+            actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
             args={"path": str(runtime_root / "secret.txt")},
@@ -668,3 +670,108 @@ def test_doctor_workflow_maintenance_presence_and_warning(runtime_root: Path, wo
 
     maintenance_check = next(item for item in report.checks if item.check_id == "memory.maintenance_workflow")
     assert maintenance_check.status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# N-7: State repair
+# ---------------------------------------------------------------------------
+
+class TestRepairStateFile:
+    """N-7: corrupt state files must be quarantineable via an explicit operator command."""
+
+    def test_repair_quarantines_corrupt_json(self, tmp_path):
+        state = tmp_path / "mr1_state.json"
+        state.write_text("{bad json!!!", encoding="utf-8")
+
+        result = repair_state_file(state)
+
+        assert result["action"] == "quarantined"
+        assert not state.exists(), "original path must be gone after quarantine"
+        quarantine = Path(result["quarantined_path"])
+        assert quarantine.exists(), "quarantined file must be preserved"
+        assert quarantine.read_text() == "{bad json!!!"
+
+    def test_repair_quarantines_non_dict_json(self, tmp_path):
+        state = tmp_path / "mr1_state.json"
+        state.write_text("[1, 2, 3]", encoding="utf-8")
+
+        result = repair_state_file(state)
+
+        assert result["action"] == "quarantined"
+        assert not state.exists()
+        assert Path(result["quarantined_path"]).exists()
+
+    def test_repair_raises_on_valid_state_file(self, tmp_path):
+        state = tmp_path / "mr1_state.json"
+        state.write_text('{"session_id": "abc"}', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="structurally valid"):
+            repair_state_file(state)
+
+        assert state.exists(), "valid file must not be modified"
+
+    def test_repair_raises_on_missing_file(self, tmp_path):
+        with pytest.raises(ValueError, match="does not exist"):
+            repair_state_file(tmp_path / "nonexistent.json")
+
+    def test_repair_quarantine_path_contains_timestamp(self, tmp_path):
+        state = tmp_path / "mr1_state.json"
+        state.write_text("{corrupt", encoding="utf-8")
+
+        result = repair_state_file(state)
+
+        quarantine_name = Path(result["quarantined_path"]).name
+        assert "bad" in quarantine_name
+        assert quarantine_name.startswith("mr1_state")
+
+    def test_statemanager_starts_fresh_after_repair(self, tmp_path):
+        from mr1.orchestrator.state import StateManager
+
+        state_path = tmp_path / "active" / "mr1_state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text("{corrupt json", encoding="utf-8")
+
+        repair_state_file(state_path)
+        assert not state_path.exists()
+
+        # StateManager should now initialise a fresh state rather than raising.
+        sm = StateManager(state_path=state_path)
+        assert sm.session_id is not None
+
+    def test_repair_cli_command_quarantines_file(self, tmp_path, capsys):
+        state = tmp_path / "mr1_state.json"
+        state.write_text("{bad", encoding="utf-8")
+
+        from mr1.workflow_store import WorkflowStore
+        from mr1.scoped_agents import PersistentAgentStore
+        from mr1.cli.memory import _cmd_repair_state
+        import argparse
+
+        # Build a minimal args namespace mirroring what the real parser produces.
+        args = argparse.Namespace(state_path=str(state), json=False)
+        store = WorkflowStore(root=tmp_path / "workflows")
+        sa = PersistentAgentStore(root=tmp_path / "agents")
+        rc = _cmd_repair_state(args, store, "test-actor", sa)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "quarantined" in out.lower()
+        assert not state.exists()
+
+    def test_repair_cli_returns_error_on_valid_file(self, tmp_path, capsys):
+        state = tmp_path / "mr1_state.json"
+        state.write_text('{"session_id": "ok"}', encoding="utf-8")
+
+        from mr1.workflow_store import WorkflowStore
+        from mr1.scoped_agents import PersistentAgentStore
+        from mr1.cli.memory import _cmd_repair_state
+        import argparse
+        import sys
+
+        args = argparse.Namespace(state_path=str(state), json=False)
+        store = WorkflowStore(root=tmp_path / "workflows")
+        sa = PersistentAgentStore(root=tmp_path / "agents")
+        rc = _cmd_repair_state(args, store, "test-actor", sa)
+
+        assert rc == 2
+        assert state.exists()

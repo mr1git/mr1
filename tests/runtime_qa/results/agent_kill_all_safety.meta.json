@@ -1,7 +1,7 @@
 {
   "category": "safety",
   "description": "kill-all all must NOT kill MR1 itself",
-  "elapsed_s": 0.07,
+  "elapsed_s": 0.03,
   "findings": [],
   "scenario": "agent_kill_all_safety",
   "session_error": null,

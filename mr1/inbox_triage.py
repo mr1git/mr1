@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 import yaml
 
 from mr1.agents import AgentRuntimeError, parse_agent_json_envelope
+from mr1.brain_tools import governed_brain_tools
 from mr1.core import Dispatcher, PermissionDenied
 from mr1.kazi_runner import MockRunner
 from mr1.messages import MessageStore, PersistentMessage
@@ -95,7 +96,7 @@ def _load_mr1_config(path: Path = _MR1_CONFIG_PATH) -> dict[str, Any]:
 
 def run_inbox_triage_reasoner(system_prompt: str, prompt: str) -> str:
     config = _load_mr1_config()
-    allowed_tools = list(config.get("allowed_tools") or [])
+    allowed_tools = governed_brain_tools(config.get("allowed_tools") or [])
     cmd = ["claude", "-p", prompt, "--output-format", "json"]
     if config.get("model"):
         cmd.extend(["--model", str(config["model"])])

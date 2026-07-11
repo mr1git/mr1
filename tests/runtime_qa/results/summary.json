@@ -10,11 +10,15 @@
     },
     "approval": {
       "findings": 0,
-      "scenarios": 2
+      "scenarios": 4
     },
     "delegation": {
       "findings": 0,
       "scenarios": 3
+    },
+    "identity": {
+      "findings": 0,
+      "scenarios": 4
     },
     "memory": {
       "findings": 0,
@@ -26,7 +30,7 @@
     },
     "observability": {
       "findings": 0,
-      "scenarios": 3
+      "scenarios": 6
     },
     "routing": {
       "findings": 0,
@@ -34,19 +38,19 @@
     },
     "safety": {
       "findings": 0,
-      "scenarios": 6
+      "scenarios": 7
     },
     "state": {
       "findings": 0,
-      "scenarios": 2
+      "scenarios": 3
     },
     "workflow": {
       "findings": 0,
-      "scenarios": 3
+      "scenarios": 10
     }
   },
   "crashed_scenarios": [],
   "findings_by_severity": {},
-  "total_elapsed_s": 409.32,
-  "total_scenarios": 32
+  "total_elapsed_s": 1109.76,
+  "total_scenarios": 50
 }

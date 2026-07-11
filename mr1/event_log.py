@@ -15,10 +15,16 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 
 EVENT_VERSION = 1
@@ -54,7 +60,10 @@ EVENT_KIND_BY_TYPE = {
     "approval_requested": "decision",
     "approval_approved": "decision",
     "approval_denied": "decision",
+    "approval_expired": "decision",
     "approval_consumed": "action",
+    "runtime_turn_decided": "decision",
+    "inbox_triage_failed": "action",
     "message_sent": "communication",
     "message_read": "communication",
     "mrn_step_started": "communication",
@@ -81,7 +90,10 @@ SEVERITY_BY_TYPE = {
     "approval_requested": "WARNING",
     "approval_approved": "INFO",
     "approval_denied": "WARNING",
+    "approval_expired": "WARNING",
     "approval_consumed": "INFO",
+    "runtime_turn_decided": "INFO",
+    "inbox_triage_failed": "ERROR",
     "message_sent": "INFO",
     "message_read": "INFO",
     "mrn_step_started": "INFO",
@@ -89,13 +101,19 @@ SEVERITY_BY_TYPE = {
     "mrn_reported": "INFO",
 }
 
+# Maximum number of events kept in the in-process cache. Older events remain on
+# disk in events.jsonl (the authoritative log) but are evicted from memory once
+# this limit is exceeded. At ~500 bytes each, 50 000 events ≈ 25 MB RAM.
+# list_events() / filter_events() return only the cached window; callers needing
+# full history should read events.jsonl directly.
+_MAX_CACHE_EVENTS = 50_000
 _EVENT_FILE_NAME = "events.jsonl"
 _CONTEXT_CORRELATION_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "mr1_event_correlation_id",
     default=None,
 )
 _LOCKS: dict[str, threading.RLock] = {}
-_LAST_APPEND_NS: dict[str, int] = {}
+_LOCK_SUFFIX = ".lock"
 
 
 def _now_iso_from_ns(now_ns: int) -> str:
@@ -106,10 +124,10 @@ def _now_iso() -> str:
     return _now_iso_from_ns(time.time_ns())
 
 
-def _normalized_timestamp_bucket(timestamp: str) -> str:
+def _normalized_timestamp(timestamp: str) -> str:
     dt = datetime.fromisoformat(timestamp)
     dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    return dt.isoformat(timespec="microseconds")
 
 
 def _canonical_json(payload: dict[str, Any]) -> str:
@@ -143,7 +161,7 @@ def _build_event_id(
         "step_id": step_id,
         "approval_request_id": approval_request_id,
         "audit_id": audit_id,
-        "normalized_timestamp_bucket": _normalized_timestamp_bucket(timestamp),
+        "normalized_timestamp": _normalized_timestamp(timestamp),
     }).encode("utf-8")).hexdigest()[:16]
     return f"evt-{digest}"
 
@@ -268,6 +286,22 @@ class SystemEvent:
         )
 
 
+@dataclass
+class _EventCache:
+    # Bounded sliding window: oldest events are popleft()'d when _MAX_CACHE_EVENTS is exceeded.
+    events: deque = field(default_factory=deque)
+    event_by_id: dict[str, SystemEvent] = field(default_factory=dict)
+    file_offset: int = 0
+    file_mtime_ns: int = 0
+    initialized: bool = False
+
+    @property
+    def last_index(self) -> int:
+        if not self.events:
+            return 0
+        return self.events[-1].event_index
+
+
 class EventLog:
     def __init__(self, root: Path):
         root_path = Path(root)
@@ -278,8 +312,9 @@ class EventLog:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         key = str(self._path.resolve(strict=False))
         self._lock = _LOCKS.setdefault(key, threading.RLock())
-        _LAST_APPEND_NS.setdefault(key, 0)
         self._lock_key = key
+        self._append_lock_path = self._path.with_name(f"{self._path.name}{_LOCK_SUFFIX}")
+        self._cache = _EventCache()
 
     @property
     def path(self) -> Path:
@@ -287,32 +322,27 @@ class EventLog:
 
     def append_event(self, event: SystemEvent) -> SystemEvent:
         with self._lock:
-            existing = self._get_event_locked(event.event_id)
-            if existing is not None:
-                return existing
-            if event.parent_event_id is not None:
-                parent = self._get_event_locked(event.parent_event_id)
-                if parent is None:
-                    raise ValueError(f"parent event not found: {event.parent_event_id}")
-            next_index = self._next_event_index_locked()
-            if event.event_index not in {0, next_index}:
-                raise ValueError(
-                    f"invalid event_index {event.event_index}; expected 0 or {next_index}"
-                )
-            now_ns = time.time_ns()
-            if now_ns < _LAST_APPEND_NS[self._lock_key]:
-                raise RuntimeError("event append order must be monotonic within one process")
-            persisted = SystemEvent.from_dict({
-                **event.to_dict(),
-                "event_index": next_index,
-            })
-            line = _canonical_json(persisted.to_dict()) + "\n"
-            with open(self._path, "a", encoding="utf-8") as handle:
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
-            _LAST_APPEND_NS[self._lock_key] = now_ns
-            return persisted
+            with self._append_guard_locked():
+                self._refresh_cache_locked()
+                existing = self._cache.event_by_id.get(event.event_id)
+                if existing is not None:
+                    return existing
+                if event.parent_event_id is not None:
+                    parent = self._cache.event_by_id.get(event.parent_event_id)
+                    if parent is None:
+                        raise ValueError(f"parent event not found: {event.parent_event_id}")
+                next_index = self._cache.last_index + 1 if self._cache.events else 1
+                if event.event_index not in {0, next_index}:
+                    raise ValueError(
+                        f"invalid event_index {event.event_index}; expected 0 or {next_index}"
+                    )
+                persisted = SystemEvent.from_dict({
+                    **event.to_dict(),
+                    "event_index": next_index,
+                })
+                self._append_persisted_event_locked(persisted)
+                self._cache_append_locked(persisted)
+                return persisted
 
     def emit(
         self,
@@ -475,6 +505,7 @@ class EventLog:
                 "capability_executed",
                 "approval_approved",
                 "approval_denied",
+                "approval_expired",
                 "workflow_task_completed",
             }:
                 blocked_by_key.pop(key, None)
@@ -509,33 +540,16 @@ class EventLog:
         return sorted(self.list_events(), key=lambda item: item.event_index, reverse=True)[:limit]
 
     def _next_event_index_locked(self) -> int:
-        events = self._load_events_locked()
-        if not events:
-            return 1
-        return events[-1].event_index + 1
+        self._refresh_cache_locked()
+        return self._cache.last_index + 1 if self._cache.events else 1
 
     def _get_event_locked(self, event_id: str) -> Optional[SystemEvent]:
-        for event in self._load_events_locked():
-            if event.event_id == event_id:
-                return event
-        return None
+        self._refresh_cache_locked()
+        return self._cache.event_by_id.get(event_id)
 
     def _load_events_locked(self) -> list[SystemEvent]:
-        if not self._path.exists():
-            return []
-        events: list[SystemEvent] = []
-        with open(self._path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                    events.append(SystemEvent.from_dict(payload))
-                except (json.JSONDecodeError, KeyError, ValueError):
-                    continue
-        events.sort(key=lambda item: item.event_index)
-        return events
+        self._refresh_cache_locked()
+        return list(self._cache.events)
 
     def _resolve_correlation_id_locked(
         self,
@@ -598,7 +612,7 @@ class EventLog:
             parent_type = "capability_allowed"
         elif event_type == "approval_requested":
             parent_type = "capability_blocked"
-        elif event_type in {"approval_approved", "approval_denied"}:
+        elif event_type in {"approval_approved", "approval_denied", "approval_expired"}:
             parent_type = "approval_requested"
         elif event_type == "approval_consumed":
             parent_type = "approval_approved"
@@ -632,10 +646,130 @@ class EventLog:
         return parent.event_id if parent is not None else None
 
     def _find_latest_locked(self, predicate) -> Optional[SystemEvent]:
-        for event in reversed(self._load_events_locked()):
+        self._refresh_cache_locked()
+        for event in reversed(self._cache.events):
             if predicate(event):
                 return event
         return None
+
+    @contextlib.contextmanager
+    def _append_guard_locked(self) -> Iterator[None]:
+        self._append_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._append_lock_path, "a+b") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _refresh_cache_locked(self) -> None:
+        if not self._cache.initialized:
+            self._rebuild_cache_locked()
+            return
+        try:
+            stat = self._path.stat()
+        except FileNotFoundError:
+            self._cache = _EventCache(initialized=True)
+            return
+        if stat.st_size < self._cache.file_offset:
+            self._rebuild_cache_locked()
+            return
+        if (
+            stat.st_size == self._cache.file_offset
+            and stat.st_mtime_ns == self._cache.file_mtime_ns
+        ):
+            return
+        with open(self._path, "rb") as handle:
+            handle.seek(self._cache.file_offset)
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
+                self._parse_and_cache_line_locked(line)
+            self._cache.file_offset = handle.tell()
+        # Evict oldest events when the incremental read pushes cache over the limit.
+        while len(self._cache.events) > _MAX_CACHE_EVENTS:
+            evicted = self._cache.events.popleft()
+            self._cache.event_by_id.pop(evicted.event_id, None)
+        try:
+            stat = self._path.stat()
+            self._cache.file_mtime_ns = stat.st_mtime_ns
+        except FileNotFoundError:
+            self._cache.file_mtime_ns = 0
+
+    def _rebuild_cache_locked(self) -> None:
+        # Build with a temp list so we can sort then trim before creating the deque.
+        temp_events: list[SystemEvent] = []
+        temp_by_id: dict[str, SystemEvent] = {}
+        file_offset = 0
+        mtime_ns = 0
+        if self._path.exists():
+            with open(self._path, "rb") as handle:
+                while True:
+                    line = handle.readline()
+                    if not line:
+                        break
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw.decode("utf-8"))
+                        event = SystemEvent.from_dict(payload)
+                    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
+                        continue
+                    if event.event_id not in temp_by_id:
+                        temp_events.append(event)
+                        temp_by_id[event.event_id] = event
+                file_offset = handle.tell()
+            try:
+                mtime_ns = self._path.stat().st_mtime_ns
+            except FileNotFoundError:
+                mtime_ns = 0
+            temp_events.sort(key=lambda item: item.event_index)
+            if len(temp_events) > _MAX_CACHE_EVENTS:
+                temp_events = temp_events[-_MAX_CACHE_EVENTS:]
+        cache = _EventCache(initialized=True)
+        cache.events = deque(temp_events)
+        cache.event_by_id = {e.event_id: e for e in temp_events}
+        cache.file_offset = file_offset
+        cache.file_mtime_ns = mtime_ns
+        self._cache = cache
+
+    def _parse_and_cache_line_locked(self, line: bytes) -> None:
+        raw = line.strip()
+        if not raw:
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            event = SystemEvent.from_dict(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
+            return
+        if self._cache.event_by_id.get(event.event_id) is not None:
+            return
+        self._cache.events.append(event)
+        self._cache.event_by_id[event.event_id] = event
+
+    def _append_persisted_event_locked(self, event: SystemEvent) -> None:
+        line = (_canonical_json(event.to_dict()) + "\n").encode("utf-8")
+        with open(self._path, "ab") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+            self._cache.file_offset = handle.tell()
+        try:
+            self._cache.file_mtime_ns = self._path.stat().st_mtime_ns
+        except FileNotFoundError:
+            self._cache.file_mtime_ns = 0
+
+    def _cache_append_locked(self, event: SystemEvent) -> None:
+        self._cache.events.append(event)
+        self._cache.event_by_id[event.event_id] = event
+        if len(self._cache.events) > _MAX_CACHE_EVENTS:
+            evicted = self._cache.events.popleft()
+            self._cache.event_by_id.pop(evicted.event_id, None)
+        self._cache.initialized = True
 
     @staticmethod
     def _block_key(event: SystemEvent) -> Optional[str]:

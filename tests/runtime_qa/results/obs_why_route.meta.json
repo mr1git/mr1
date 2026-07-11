@@ -1,7 +1,7 @@
 {
   "category": "observability",
   "description": "Turn artifact should contain route_advice.reason for explainability",
-  "elapsed_s": 0.05,
+  "elapsed_s": 0.06,
   "findings": [],
   "scenario": "obs_why_route",
   "session_error": null,

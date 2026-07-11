@@ -1,0 +1,9 @@
+{
+  "category": "identity",
+  "description": "Agent titled 'all' must be rejected because it collides with the global kill-all selector",
+  "elapsed_s": 0.02,
+  "findings": [],
+  "scenario": "identity_reserved_word_title_all",
+  "session_error": null,
+  "turn_count": 2
+}

@@ -1,7 +1,7 @@
 {
   "category": "workflow",
   "description": "Create workflow draft then cancel it",
-  "elapsed_s": 37.96,
+  "elapsed_s": 29.01,
   "findings": [],
   "scenario": "wf_create_cancel",
   "session_error": null,

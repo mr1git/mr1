@@ -17,6 +17,7 @@ from mr1.doctor import (
     filter_doctor_report,
     inspect_snapshot,
     list_snapshots,
+    repair_state_file,
     run_doctor,
 )
 from mr1.memory_curator import (
@@ -1014,6 +1015,29 @@ def _cmd_snapshot_inspect(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_format_snapshot_manifest(payload, json_output=bool(args.json)))
+    return 0
+
+
+def _cmd_repair_state(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: PersistentAgentStore,
+) -> int:
+    """Quarantine a corrupt MR1 state file so that MR1 can restart cleanly."""
+    del caller_agent_id, scoped_agents
+    runtime_root = _runtime_root_for(store)
+    state_path = Path(getattr(args, "state_path", None) or "") or (
+        runtime_root / "active" / "mr1_state.json"
+    )
+    try:
+        result = repair_state_file(state_path)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(result["message"])
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 def _cmd_memory_maintenance_spec(

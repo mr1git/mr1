@@ -200,8 +200,8 @@ def test_denied_request_remains_blocked_on_retry(tmp_path, agent_store):
 
     second = runner.run_capability("read_file", {"path": str(target)}, child.agent_id, step_id="step-6")
 
-    assert second.status == "requires_approval"
-    assert second.approval_request_id == approval_id
+    assert second.status == "denied"
+    assert second.output["reason"] == "approval_previously_denied"
     assert len(runner._message_store.list_inbox(root.agent_id)) == 1
 
 
@@ -227,11 +227,11 @@ def test_scope_grant_adds_access_and_revoke_removes_it(tmp_path, agent_store):
 
 def test_mrn_cannot_grant_scope_it_does_not_have(tmp_path, agent_store):
     root = agent_store.ensure_root_agent()
-    child = agent_store.create_child_agent(root.agent_id, "child", security_clearance=1.0)
+    child = agent_store.create_child_agent(root.agent_id, "child", security_clearance=0.99)
     target = tmp_path / "secret.txt"
     target.write_text("secret", encoding="utf-8")
 
-    with pytest.raises(AgentScopeError, match="granting agent lacks access"):
+    with pytest.raises(AgentScopeError, match="insufficient security clearance"):
         agent_store.grant_scope(child.agent_id, child.agent_id, target, reason="self")
 
 

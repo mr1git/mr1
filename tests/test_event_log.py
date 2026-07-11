@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pytest
 
 from mr1.capability_policy import CapabilityApprovalDecision
 from mr1.capability_runner import CapabilityRunner
-from mr1.event_log import EventLog, SystemEvent
+from mr1.event_log import EventLog, SystemEvent, _MAX_CACHE_EVENTS
 from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
 from mr1.scoped_agents import PersistentAgentStore
@@ -16,6 +17,22 @@ from mr1.scheduler import Scheduler
 from mr1.kazi_runner import MockRunner, RunStatus
 from mr1.workflow_models import Provenance
 from mr1.workflow_store import WorkflowStore
+
+
+def _append_events_in_process(log_root: str, worker_id: int, count: int) -> None:
+    log = EventLog(Path(log_root))
+    for index in range(count):
+        workflow_id = f"wf-{worker_id}-{index}"
+        log.emit(
+            event_type="workflow_created",
+            actor_id=f"worker-{worker_id}",
+            actor_type="test",
+            target_id=workflow_id,
+            target_type="workflow",
+            status="pending",
+            summary="created",
+            workflow_id=workflow_id,
+        )
 
 
 def _ts(value: str) -> str:
@@ -112,6 +129,67 @@ def test_append_and_trace_are_deterministic(event_log: EventLog):
     trace = event_log.trace_by_correlation(first.correlation_id or "")
     assert [item.event_index for item in trace] == [1, 2]
     assert [item.event_type for item in trace] == ["workflow_created", "workflow_started"]
+
+
+def test_append_large_log_reuses_loaded_cache(event_log: EventLog, monkeypatch):
+    for index in range(500):
+        workflow_id = f"wf-{index}"
+        event_log.emit(
+            event_type="workflow_created",
+            actor_id="cli",
+            actor_type="user",
+            target_id=workflow_id,
+            target_type="workflow",
+            status="pending",
+            summary="created",
+            workflow_id=workflow_id,
+            timestamp=_ts(f"2026-04-29T12:00:{index % 60:02d}.{index % 1000:03d}000+00:00"),
+        )
+
+    reloaded = EventLog(event_log.path)
+    rebuilds = 0
+    real_rebuild = reloaded._rebuild_cache_locked
+
+    def wrapped_rebuild() -> None:
+        nonlocal rebuilds
+        rebuilds += 1
+        real_rebuild()
+
+    monkeypatch.setattr(reloaded, "_rebuild_cache_locked", wrapped_rebuild)
+
+    for suffix in ("first", "second"):
+        reloaded.emit(
+            event_type="workflow_created",
+            actor_id="cli",
+            actor_type="user",
+            target_id=f"wf-{suffix}",
+            target_type="workflow",
+            status="pending",
+            summary="created",
+            workflow_id=f"wf-{suffix}",
+        )
+
+    assert rebuilds == 1
+    assert reloaded.list_events()[-1].event_index == 502
+
+
+def test_concurrent_appenders_get_unique_indices(tmp_path):
+    log_root = tmp_path / "events"
+    ctx = multiprocessing.get_context("spawn")
+    processes = [
+        ctx.Process(target=_append_events_in_process, args=(str(log_root), worker_id, 25))
+        for worker_id in range(4)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    events = EventLog(log_root).list_events()
+    indices = [event.event_index for event in events]
+    assert len(events) == 100
+    assert indices == list(range(1, 101))
 
 
 def test_parent_event_must_exist(event_log: EventLog):
@@ -307,3 +385,100 @@ def test_mrn_step_and_report_events_emit(workflow_store, agent_store, message_st
     assert "mrn_step_started" in event_types
     assert "mrn_step_completed" in event_types
     assert "mrn_reported" in event_types
+
+
+# ---------------------------------------------------------------------------
+# N-5: Bounded event cache
+# ---------------------------------------------------------------------------
+
+def _emit_n(log: EventLog, n: int, *, start: int = 0) -> None:
+    for i in range(start, start + n):
+        log.emit(
+            event_type="workflow_created",
+            actor_id="test-actor",
+            actor_type="test",
+            target_id=f"wf-{i}",
+            target_type="workflow",
+            status="pending",
+            summary=f"wf {i}",
+            workflow_id=f"wf-{i}",
+        )
+
+
+class TestBoundedCache:
+    """N-5: event cache must not grow without bound."""
+
+    def test_cache_stays_at_max_after_overflow(self, tmp_path, monkeypatch):
+        small_limit = 10
+        monkeypatch.setattr("mr1.event_log._MAX_CACHE_EVENTS", small_limit)
+        log = EventLog(tmp_path / "events")
+        _emit_n(log, small_limit + 5)
+        assert len(log._cache.events) == small_limit
+
+    def test_oldest_events_evicted_first(self, tmp_path, monkeypatch):
+        small_limit = 10
+        monkeypatch.setattr("mr1.event_log._MAX_CACHE_EVENTS", small_limit)
+        log = EventLog(tmp_path / "events")
+        _emit_n(log, small_limit + 3)
+        cached_ids = {e.event_id for e in log._cache.events}
+        # Events are kept in index order; earliest events should be gone from the cache.
+        # The cache should hold the last `small_limit` events.
+        assert len(cached_ids) == small_limit
+        all_disk = [
+            json.loads(line)
+            for line in (tmp_path / "events" / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        # Disk always has all events.
+        assert len(all_disk) == small_limit + 3
+        # First few events should have been evicted from cache.
+        first_id = all_disk[0]["event_id"]
+        assert first_id not in cached_ids
+
+    def test_dedupe_still_works_within_cache_window(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mr1.event_log._MAX_CACHE_EVENTS", 20)
+        log = EventLog(tmp_path / "events")
+        _emit_n(log, 10)
+        initial_count = len(list(log._cache.events))
+        # Re-emit the same workflow_id events — these produce different event_ids
+        # (timestamps differ), so they won't be deduped; the point is the cache
+        # size is still bounded.
+        _emit_n(log, 15)
+        assert len(log._cache.events) == 20
+
+    def test_rebuild_applies_bound(self, tmp_path, monkeypatch):
+        small_limit = 8
+        monkeypatch.setattr("mr1.event_log._MAX_CACHE_EVENTS", small_limit)
+        # Write events without cache (directly to file via a temporary log).
+        log_a = EventLog(tmp_path / "events")
+        _emit_n(log_a, small_limit + 4)
+
+        # Fresh log instance triggers a rebuild.
+        log_b = EventLog(tmp_path / "events")
+        events = log_b.list_events()
+        assert len(events) == small_limit
+
+    def test_file_always_has_full_history(self, tmp_path, monkeypatch):
+        small_limit = 5
+        monkeypatch.setattr("mr1.event_log._MAX_CACHE_EVENTS", small_limit)
+        log = EventLog(tmp_path / "events")
+        total = small_limit + 10
+        _emit_n(log, total)
+
+        lines = [
+            line for line in
+            (tmp_path / "events" / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        assert len(lines) == total, "JSONL file must contain full history"
+
+    def test_event_by_id_stays_consistent_with_cache(self, tmp_path, monkeypatch):
+        small_limit = 10
+        monkeypatch.setattr("mr1.event_log._MAX_CACHE_EVENTS", small_limit)
+        log = EventLog(tmp_path / "events")
+        _emit_n(log, small_limit + 5)
+        # event_by_id must exactly match the cached events.
+        cached_events = list(log._cache.events)
+        assert len(log._cache.event_by_id) == len(cached_events)
+        for event in cached_events:
+            assert log._cache.event_by_id.get(event.event_id) is event

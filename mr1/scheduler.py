@@ -138,7 +138,7 @@ from mr1.workflow_models import (
     new_task_id,
     new_workflow_id,
 )
-from mr1.workflow_store import WorkflowStore
+from mr1.workflow_store import WorkflowStore, sync_task_view, sync_workflow_view
 
 
 def _now_iso() -> str:
@@ -1442,6 +1442,7 @@ class Scheduler:
         request: CapabilityRequest,
         decision: dict[str, Any],
         *,
+        target_status: TaskStatus,
         approval_request_id: Optional[str] = None,
         audit_path: Optional[Path] = None,
     ) -> dict[str, Any]:
@@ -1450,6 +1451,7 @@ class Scheduler:
             task,
             request,
             decision,
+            target_status=target_status,
             approval_request_id=approval_request_id,
             audit_path=audit_path,
         )
@@ -1478,10 +1480,16 @@ class Scheduler:
             result_payload,
         ))
         extra_event_type = ev.TOOL_FAILED if task.task_kind == "tool" else ev.WATCHER_FAILED
+        target_status = (
+            TaskStatus.BLOCKED
+            if decision["status"] == "requires_approval" else
+            TaskStatus.FAILED
+        )
+        error_type = "approval_required" if target_status is TaskStatus.BLOCKED else "policy_block"
         extra_metadata: dict[str, Any] = {
             "policy_status": decision["status"],
             "reason": decision["reason"],
-            "failure_type": "policy_block",
+            "failure_type": error_type,
             "retryable": False,
         }
         if approval_request_id is not None:
@@ -1489,11 +1497,14 @@ class Scheduler:
         self._finish_attempt(
             wf,
             task,
-            TaskStatus.FAILED,
-            event=ev.TASK_FAILED,
+            target_status,
+            event=ev.TASK_BLOCKED if target_status is TaskStatus.BLOCKED else ev.TASK_FAILED,
             message=message,
             error=message,
-            error_type="policy_block",
+            error_type=error_type,
+            blocked_by=[] if target_status is TaskStatus.BLOCKED else None,
+            blocked_reason=message if target_status is TaskStatus.BLOCKED else _UNSET,
+            blocked_at=_now_iso() if target_status is TaskStatus.BLOCKED else _UNSET,
             result_path=result_path,
             result_summary=message,
             extra_events=[(
@@ -1709,6 +1720,11 @@ class Scheduler:
                 TaskStatus.CANCELLED,
             }:
                 continue
+            if (
+                task.status is TaskStatus.BLOCKED
+                and task.last_error_type == "approval_required"
+            ):
+                continue
             gate = _evaluate_dependency_gate(wf, task)
             if task.status is TaskStatus.SKIPPED:
                 if gate.state == "skip":
@@ -1875,37 +1891,47 @@ class Scheduler:
 
     def _transition_workflow_status(self, wf: Workflow) -> bool:
         """Flip `pending → running → succeeded/failed` based on tasks."""
-        all_terminal = all(t.is_terminal() for t in wf.tasks.values())
-        any_running_or_live = any(
-            t.status in (TaskStatus.RUNNING, TaskStatus.READY, TaskStatus.WAITING)
-            for t in wf.tasks.values()
-        )
-
-        target: Optional[WorkflowStatus] = None
-        event_type: Optional[str] = None
-        message = ""
-
-        if wf.status is WorkflowStatus.PENDING and any_running_or_live:
-            target = WorkflowStatus.RUNNING
-
-        if all_terminal:
-            any_failed = any(
-                t.status in FAILED_TASK_STATUSES
+        original_wf = wf
+        with self._store.locked():
+            wf = self._store.load_workflow(wf.workflow_id)
+            if wf is None:
+                return False
+            all_terminal = all(t.is_terminal() for t in wf.tasks.values())
+            any_running_or_live = any(
+                t.status in (TaskStatus.RUNNING, TaskStatus.READY, TaskStatus.WAITING)
                 for t in wf.tasks.values()
             )
-            if any_failed:
-                target = WorkflowStatus.FAILED
-                event_type = ev.WORKFLOW_FAILED
-                message = "one or more tasks did not succeed"
-            else:
-                target = WorkflowStatus.SUCCEEDED
-                event_type = ev.WORKFLOW_SUCCEEDED
-                message = "all tasks completed without failure"
+            pending_approval_blocks = self._pending_approval_block_task_ids(wf)
 
-        if target is None or target is wf.status:
-            return False
+            target: Optional[WorkflowStatus] = None
+            event_type: Optional[str] = None
+            message = ""
 
-        with self._store.locked():
+            if wf.status is WorkflowStatus.PENDING and any_running_or_live:
+                target = WorkflowStatus.RUNNING
+            elif wf.status is WorkflowStatus.PENDING and pending_approval_blocks:
+                target = WorkflowStatus.RUNNING
+
+            if all_terminal:
+                if pending_approval_blocks:
+                    if target is None:
+                        return False
+                any_failed = any(
+                    t.status in FAILED_TASK_STATUSES
+                    for t in wf.tasks.values()
+                )
+                if any_failed:
+                    target = WorkflowStatus.FAILED
+                    event_type = ev.WORKFLOW_FAILED
+                    message = "one or more tasks did not succeed"
+                else:
+                    target = WorkflowStatus.SUCCEEDED
+                    event_type = ev.WORKFLOW_SUCCEEDED
+                    message = "all tasks completed without failure"
+
+            if target is None or target is wf.status:
+                return False
+
             wf.status = target
             if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
                 wf.finished_at = _now_iso()
@@ -1945,11 +1971,28 @@ class Scheduler:
                     record_path=str(self._store.workflow_json_path(wf.workflow_id)),
                     metadata={"title": wf.title},
                 )
+            sync_workflow_view(original_wf, wf)
         if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
             report_path = self._scoped_agents.write_workflow_report(wf, self._store)
             if report_path is not None:
                 self._send_workflow_report_message(wf, report_path)
         return True
+
+    def _pending_approval_block_task_ids(self, wf: Workflow) -> set[str]:
+        pending = {
+            (approval.workflow_id, approval.task_id)
+            for approval in self._approval_store.list_requests()
+            if approval.status == "pending"
+            and approval.workflow_id == wf.workflow_id
+            and approval.task_id
+        }
+        return {
+            task.task_id
+            for task in wf.tasks.values()
+            if task.status is TaskStatus.BLOCKED
+            and task.last_error_type == "approval_required"
+            and (wf.workflow_id, task.task_id) in pending
+        }
 
     def _send_workflow_report_message(self, wf: Workflow, report_path: Path) -> None:
         self._reporter.send_workflow_report_message(wf, report_path)
@@ -2223,20 +2266,30 @@ class Scheduler:
                 )],
             )
             return True
+        original_wf = wf
+        original_task = task
         with self._store.locked():
-            task.inputs_path = str(inputs_path)
-            task.materialized_prompt_path = str(prompt_path)
-            task.dataflow_error = None
-            self._store.save_workflow(wf)
+            live_wf = self._store.load_workflow(wf.workflow_id)
+            if live_wf is None:
+                raise RuntimeError(f"workflow not found during input materialization: {wf.workflow_id}")
+            live_task = live_wf.tasks.get(task.task_id)
+            if live_task is None:
+                raise RuntimeError(f"task not found during input materialization: {task.task_id}")
+            live_task.inputs_path = str(inputs_path)
+            live_task.materialized_prompt_path = str(prompt_path)
+            live_task.dataflow_error = None
+            self._store.save_workflow(live_wf)
             for event_type, event_message, event_metadata in extra_events:
                 self._events.emit(
                     event_type,
-                    wf.workflow_id,
-                    task_id=task.task_id,
+                    live_wf.workflow_id,
+                    task_id=live_task.task_id,
                     agent_id=self._agent_id,
                     message=event_message,
                     metadata=dict(event_metadata),
                 )
+            sync_workflow_view(original_wf, live_wf)
+            sync_task_view(original_task, live_task)
         return False
 
     def _run_tool_task(
@@ -2299,7 +2352,16 @@ class Scheduler:
         Mutate the task, persist the workflow, and append the event —
         all under the store lock so the trio is atomic.
         """
+        original_wf = wf
+        original_task = task
         with self._store.locked():
+            task_id = task.task_id
+            wf = self._store.load_workflow(wf.workflow_id)
+            if wf is None:
+                raise RuntimeError(f"workflow not found during commit: {task.workflow_id}")
+            task = wf.tasks.get(task_id)
+            if task is None:
+                raise RuntimeError(f"task not found during commit: {task_id}")
             active_attempt_id = attempt_id
             if active_attempt_id is None and task.current_attempt > 0:
                 active_attempt_id = task.current_attempt
@@ -2414,6 +2476,8 @@ class Scheduler:
                     message=event_message,
                     metadata=dict(event_metadata),
                 )
+            sync_workflow_view(original_wf, wf)
+            sync_task_view(original_task, task)
 
     # ------------------------------------------------------------------
     # Cancellation
@@ -2421,12 +2485,22 @@ class Scheduler:
 
     def cancel_workflow(self, workflow_id: str) -> bool:
         wf = self._store.load_workflow(workflow_id)
-        if wf is None or wf.is_terminal():
+        if wf is None:
             return False
+        if wf.status is WorkflowStatus.CANCELLED:
+            raise WorkflowSpecError(f"workflow already cancelled: {workflow_id}")
+        if wf.is_terminal():
+            raise WorkflowSpecError(
+                f"workflow already terminal: {workflow_id} ({wf.status.value})"
+            )
         cancel_workflow_on_disk(
             self._store,
             workflow_id,
             agent_id=self._agent_id,
+        )
+        self._approval_store.expire_requests_for_workflow(
+            workflow_id,
+            reason="workflow_cancelled",
         )
         for task in wf.tasks.values():
             handle = self._handles.pop(task.task_id, None)

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from mr1 import workflow_cli
+from mr1.capability_policy import CapabilityApprovalDecision
 from mr1.kazi_runner import MockRunner
 from mr1.mr1 import MR1, StateManager
 from mr1.scheduler import Scheduler, WorkflowSpecError, validate_spec
@@ -41,6 +42,24 @@ def _tool_workflow(task: dict, downstream: dict | None = None) -> dict:
     if downstream is not None:
         tasks.append(downstream)
     return {"title": "Tool workflow", "tasks": tasks}
+
+
+def _approve_latest_workflow_request(scheduler: Scheduler) -> str:
+    root = scheduler._scoped_agents.ensure_root_agent()
+    approval = scheduler._approval_store.list_requests()[-1]
+    scheduler._approval_store.apply_decision(
+        approval.approval_request_id,
+        decision=CapabilityApprovalDecision(
+            approval_request_id=approval.approval_request_id,
+            decision="approved",
+            decided_by=root.agent_id,
+            reason="test approval",
+            timestamp=1.0,
+            approval_scope="single_use",
+        ),
+        scoped_agent_store=scheduler._scoped_agents,
+    )
+    return approval.approval_request_id
 
 
 class TestToolValidation:
@@ -251,6 +270,14 @@ class TestShellCommandTool:
         scheduler.tick()
         wf = store.load_workflow(wf_id)
         task = _task_by_label(wf, "python_version")
+        assert task.status is TaskStatus.BLOCKED
+        assert task.last_error_type == "approval_required"
+        assert store.load_task_output(wf_id, task.task_id) is None
+
+        _approve_latest_workflow_request(scheduler)
+        scheduler.tick()
+        wf = store.load_workflow(wf_id)
+        task = _task_by_label(wf, "python_version")
         output = store.load_task_output(wf_id, task.task_id)
         assert task.status is TaskStatus.SUCCEEDED
         assert output is not None
@@ -278,6 +305,8 @@ class TestShellCommandTool:
             }),
             PROV,
         )
+        scheduler.tick()
+        _approve_latest_workflow_request(scheduler)
         scheduler.tick()
         wf = store.load_workflow(wf_id)
         task = _task_by_label(wf, "bad_cmd")
@@ -309,6 +338,8 @@ class TestShellCommandTool:
             PROV,
         )
         scheduler.tick()
+        _approve_latest_workflow_request(scheduler)
+        scheduler.tick()
         wf = store.load_workflow(wf_id)
         task = _task_by_label(wf, "slow_cmd")
         output = store.load_task_output(wf_id, task.task_id)
@@ -337,6 +368,8 @@ class TestShellCommandTool:
             }),
             PROV,
         )
+        scheduler.tick()
+        _approve_latest_workflow_request(scheduler)
         scheduler.tick()
         wf = store.load_workflow(wf_id)
         task = _task_by_label(wf, "noisy")
@@ -461,6 +494,8 @@ class TestToolDataflowIntegration:
                 PROV,
             )
             scheduler.tick()
+            _approve_latest_workflow_request(scheduler)
+            scheduler.tick()
             scheduler.tick()
             wf = store.load_workflow(wf_id)
             assert _task_by_label(wf, "consume").status is TaskStatus.RUNNING
@@ -495,6 +530,8 @@ class TestToolDataflowIntegration:
                 PROV,
             )
             scheduler.tick()
+            _approve_latest_workflow_request(scheduler)
+            scheduler.tick()
             scheduler.tick()
             wf = store.load_workflow(wf_id)
             assert _task_by_label(wf, "consume").status is TaskStatus.RUNNING
@@ -527,6 +564,8 @@ class TestToolDataflowIntegration:
                 ),
                 PROV,
             )
+            scheduler.tick()
+            _approve_latest_workflow_request(scheduler)
             scheduler.tick()
             scheduler.tick()
             wf = store.load_workflow(wf_id)

@@ -1,0 +1,9 @@
+{
+  "category": "workflow",
+  "description": "Rerun a non-existent workflow/task \u2014 must return clear error, not crash",
+  "elapsed_s": 0.01,
+  "findings": [],
+  "scenario": "wf_rerun_nonexistent",
+  "session_error": null,
+  "turn_count": 2
+}

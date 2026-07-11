@@ -1,0 +1,9 @@
+{
+  "category": "approval",
+  "description": "/approvals bare and /approvals list with no pending \u2014 must both return table, not usage string",
+  "elapsed_s": 0.01,
+  "findings": [],
+  "scenario": "approval_list_empty",
+  "session_error": null,
+  "turn_count": 2
+}

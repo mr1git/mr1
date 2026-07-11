@@ -671,6 +671,7 @@ class TestApprovalAndAuditCli:
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
             actor_type="mrn",
+            actor_clearance=child.security_clearance,
             invocation_mode="workflow",
             capability_name="read_file",
             args={"path": "README.md"},
@@ -709,7 +710,8 @@ class TestApprovalAndAuditCli:
         assert rc == 0
         out = capsys.readouterr().out
         assert "Approved." in out
-        assert "/workflow rerun wf-1 tk-1" in out
+        assert "Blocked workflow task reopened automatically." in out
+        assert "The scheduler will resume it on the next tick." in out
         assert "Use --grant-scope to persist scope access if intended." in out
 
     def test_capability_audit_cli_lists_direct_and_workflow_audits(self, tmp_path, store, capsys):

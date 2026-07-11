@@ -53,6 +53,7 @@ from mr1.cli.events import (
 )
 from mr1.cli.memory import (
     _cmd_doctor,
+    _cmd_repair_state,
     _cmd_memory_agent,
     _cmd_memory_capabilities,
     _cmd_memory_curate,
@@ -196,6 +197,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument("--errors-only", action="store_true")
     add_common_flags(p_doctor, include_example=False)
     p_doctor.set_defaults(func=_cmd_doctor)
+
+    p_repair_state = subs.add_parser(
+        "repair-state",
+        help=(
+            "Quarantine a corrupt MR1 state file so MR1 can restart cleanly. "
+            "The corrupt file is preserved as <name>.bad.<timestamp>.<ext>."
+        ),
+    )
+    p_repair_state.add_argument(
+        "--state-path",
+        default=None,
+        help="Path to the state file (default: <store-root>/../active/mr1_state.json).",
+    )
+    p_repair_state.add_argument("--json", action="store_true", dest="json")
+    p_repair_state.set_defaults(func=_cmd_repair_state)
 
     p_snapshot = subs.add_parser("snapshot", help="Create and inspect runtime snapshots.")
     snapshot_subs = p_snapshot.add_subparsers(dest="snapshot_command", required=True)

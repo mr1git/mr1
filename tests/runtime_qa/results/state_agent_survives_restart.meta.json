@@ -1,0 +1,9 @@
+{
+  "category": "state",
+  "description": "Agent created in session 1 must be visible in session 2 on same runtime root (cross-session persistence)",
+  "elapsed_s": 0.02,
+  "findings": [],
+  "scenario": "state_agent_survives_restart",
+  "session_error": null,
+  "turn_count": 2
+}

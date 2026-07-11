@@ -1,0 +1,9 @@
+{
+  "category": "safety",
+  "description": "Kill an agent, then try to kill it again \u2014 must be idempotent, not error",
+  "elapsed_s": 0.02,
+  "findings": [],
+  "scenario": "concurrency_kill_then_kill",
+  "session_error": null,
+  "turn_count": 3
+}

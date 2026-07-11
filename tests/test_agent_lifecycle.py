@@ -15,6 +15,7 @@ from mr1.scoped_agents import (
     build_assignment_packet,
     is_agent_live,
     is_agent_terminal,
+    new_agent_id,
     render_assignment_mission,
 )
 from mr1.scheduler import Scheduler, WorkflowSpecError, submit_spec_to_disk
@@ -56,7 +57,7 @@ class TestRootBootstrap:
         assert root.mode == "manual"
         assert root.run_status == "idle"
         assert root.current_iteration == 0
-        assert root.security_clearance == 1.0
+        assert root.security_clearance == 0.99
         assert agent_store.root_agent_id_path.exists()
         assert agent_store.agent_path(root.agent_id).exists()
         assert agent_store.memory_path(root.agent_id).exists()
@@ -100,6 +101,49 @@ class TestHierarchy:
         child = agent_store.create_child_agent(parent.agent_id, "research", security_clearance=0.5)
 
         assert child.security_clearance == 0.5
+
+    def test_child_title_rejects_reserved_all(self, agent_store):
+        root = agent_store.ensure_root_agent()
+
+        with pytest.raises(ValueError, match="agent title 'all' is reserved"):
+            agent_store.create_child_agent(root.agent_id, "ALL")
+
+    @pytest.mark.parametrize("duplicate_title", ["Alpha", "alpha"])
+    def test_child_title_rejects_duplicate_case_insensitively(self, agent_store, duplicate_title):
+        root = agent_store.ensure_root_agent()
+        agent_store.create_child_agent(root.agent_id, "Alpha")
+
+        with pytest.raises(ValueError, match="agent title already exists: Alpha"):
+            agent_store.create_child_agent(root.agent_id, duplicate_title)
+
+    def test_save_agent_rejects_new_duplicate_title_case_insensitively(self, agent_store):
+        root = agent_store.ensure_root_agent()
+        agent_store.create_child_agent(root.agent_id, "Alpha")
+        duplicate = PersistentAgent(
+            agent_id=new_agent_id(),
+            agent_type="mrn",
+            title="alpha",
+            tree_level=root.tree_level + 1,
+            parent_agent_id=root.agent_id,
+        )
+
+        with pytest.raises(ValueError, match="agent title already exists: Alpha"):
+            agent_store.save_agent(duplicate)
+
+    def test_child_title_allows_distinct_titles(self, agent_store):
+        root = agent_store.ensure_root_agent()
+        first = agent_store.create_child_agent(root.agent_id, "RepoResearcher")
+        second = agent_store.create_child_agent(root.agent_id, "PaperResearcher")
+
+        assert first.title == "RepoResearcher"
+        assert second.title == "PaperResearcher"
+
+    @pytest.mark.parametrize("title", ["Title\x00Null", "Title\nNull", "Title\tNull", "Title\x7fNull"])
+    def test_child_title_rejects_control_characters(self, agent_store, title):
+        root = agent_store.ensure_root_agent()
+
+        with pytest.raises(ValueError, match="agent title must not contain control characters"):
+            agent_store.create_child_agent(root.agent_id, title)
 
     def test_structured_assignment_packet_has_required_fields_and_nested_recursion(self, agent_store):
         root = agent_store.ensure_root_agent()
@@ -337,3 +381,108 @@ class TestLifecycleHelpers:
         assert revived.status == "active"
         assert revived.run_status == "idle"
         assert is_agent_live(revived) is True
+
+
+class TestTitleIndex:
+    """N-4: agent-title uniqueness should use an O(1) index, not an O(n) full scan."""
+
+    def test_index_file_created_on_first_save(self, agent_store):
+        agent_store.ensure_root_agent()
+        assert agent_store._title_index_path.exists()
+
+    def test_index_contains_all_active_titles(self, agent_store):
+        root = agent_store.ensure_root_agent()
+        agent_store.create_child_agent(root.agent_id, "Alpha")
+        agent_store.create_child_agent(root.agent_id, "Beta")
+
+        index_path = agent_store._title_index_path
+        import json
+        index = json.loads(index_path.read_text())
+        assert "mr1" in index            # root agent title
+        assert "alpha" in index
+        assert "beta" in index
+
+    def test_conflict_check_does_not_scan_all_files(self, agent_store, monkeypatch):
+        """After the index is built, creating an agent should not glob/read all ag-*.json."""
+        root = agent_store.ensure_root_agent()
+        for i in range(20):
+            agent_store.create_child_agent(root.agent_id, f"agent-{i}")
+
+        read_paths: list = []
+        original_read = agent_store._read_agent_file
+        def tracking_read(path):
+            if path.name.startswith("ag-") and path.suffix == ".json":
+                read_paths.append(path)
+            return original_read(path)
+        monkeypatch.setattr(agent_store, "_read_agent_file", tracking_read)
+
+        read_paths.clear()
+        agent_store.create_child_agent(root.agent_id, "UniqueNewTitle")
+
+        # Index path read is not tracked (only ag-*.json are). At most one
+        # agent file should be read (conflict verification), never all 21+.
+        assert len(read_paths) <= 1, (
+            f"Full scan detected: {len(read_paths)} ag-*.json reads for 1 create"
+        )
+
+    def test_index_persists_across_store_instances(self, tmp_path):
+        store_a = PersistentAgentStore(root=tmp_path / "agents")
+        root = store_a.ensure_root_agent()
+        store_a.create_child_agent(root.agent_id, "Persistent")
+
+        # Fresh store instance — should load existing index.
+        store_b = PersistentAgentStore(root=tmp_path / "agents")
+        root_b = store_b.ensure_root_agent()
+        with pytest.raises(ValueError, match="agent title already exists"):
+            store_b.create_child_agent(root_b.agent_id, "persistent")
+
+    def test_terminated_agent_permanently_reserves_title(self, agent_store):
+        """Terminated agents remain in the index; their title cannot be reused."""
+        root = agent_store.ensure_root_agent()
+        child = agent_store.create_child_agent(root.agent_id, "Doomed")
+        agent_store.terminate_agent(root.agent_id, child.agent_id)
+
+        with pytest.raises(ValueError, match="agent title already exists"):
+            agent_store.create_child_agent(root.agent_id, "Doomed")
+
+    def test_index_rebuilds_from_agent_files_if_missing(self, agent_store):
+        """If the index file is deleted, the next operation rebuilds it from ag-*.json."""
+        root = agent_store.ensure_root_agent()
+        agent_store.create_child_agent(root.agent_id, "Rebuild")
+
+        agent_store._title_index_path.unlink()
+
+        # Conflict check should trigger rebuild and still block duplicate.
+        with pytest.raises(ValueError, match="agent title already exists"):
+            agent_store.create_child_agent(root.agent_id, "rebuild")
+
+        # Index should exist again after rebuild.
+        assert agent_store._title_index_path.exists()
+
+    def test_large_agent_count_stays_bounded(self, agent_store):
+        """Creating N agents should only ever read O(1) ag-*.json files per creation."""
+        n = 50
+        root = agent_store.ensure_root_agent()
+        for i in range(n):
+            agent_store.create_child_agent(root.agent_id, f"worker-{i}")
+
+        read_counts: list[int] = []
+        original_read = agent_store._read_agent_file
+        for i in range(5):
+            reads: list = []
+            original_read_local = agent_store._read_agent_file
+            def tracking(path, _reads=reads, _orig=original_read_local):
+                if path.name.startswith("ag-") and path.suffix == ".json":
+                    _reads.append(1)
+                return _orig(path)
+            agent_store._read_agent_file = tracking
+            try:
+                agent_store.create_child_agent(root.agent_id, f"extra-{i}")
+            finally:
+                agent_store._read_agent_file = original_read
+            read_counts.append(len(reads))
+
+        # Each creation should read at most 1 agent file (conflict verification), not n.
+        assert max(read_counts) <= 1, (
+            f"O(n) scan detected: max reads = {max(read_counts)}, n = {n}"
+        )

@@ -1,7 +1,7 @@
 {
   "category": "agent_lifecycle",
   "description": "Create agent via slash, inspect, then kill",
-  "elapsed_s": 0.06,
+  "elapsed_s": 0.03,
   "findings": [],
   "scenario": "agent_create_inspect_kill",
   "session_error": null,

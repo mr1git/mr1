@@ -19,6 +19,7 @@ import yaml
 from mr1.agents import AgentRuntimeError, parse_agent_json_envelope
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
 from mr1.capability_runner import CapabilityResult, CapabilityRunner
+from mr1.brain_tools import governed_brain_tools
 from mr1.core import Dispatcher, PermissionDenied
 from mr1.event_log import EventLog, bind_correlation_id, mrn_step_correlation_id
 from mr1.kazi_runner import MockRunner
@@ -134,7 +135,7 @@ def _model_for_level(config: dict[str, Any], level: int) -> str:
 def run_mrn_step_agent(agent: PersistentAgent, system_prompt: str, prompt: str) -> str:
     config = _load_mrn_config()
     model = _model_for_level(config, agent.tree_level)
-    allowed_tools = list(config.get("allowed_tools", []))
+    allowed_tools = governed_brain_tools(config.get("allowed_tools", []))
     cmd = ["claude", "-p", f"{system_prompt}\n\n{prompt}", "--model", model, "--output-format", "json"]
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])

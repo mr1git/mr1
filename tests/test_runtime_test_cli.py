@@ -65,6 +65,8 @@ def test_natural_language_input_uses_real_step_path(tmp_path, monkeypatch):
     assert calls == [("create a test agent", True)]
     assert payload["dispatch"]["step_called"] is True
     assert payload["response_text"] == "Clarify the exact action you want me to take."
+    assert payload["timeline"]["events"][-1]["event_type"] == "runtime_turn_decided"
+    assert payload["turn_artifacts"][-1]["routing_decision"]["final_action"] == "ask_clarification"
 
 
 def test_slash_command_uses_builtin_path(tmp_path, monkeypatch):
@@ -119,6 +121,41 @@ def test_unknown_slash_command_stays_on_builtin_path(tmp_path, monkeypatch):
     assert payload["dispatch"]["builtin_handled"] is True
     assert payload["dispatch"]["step_called"] is False
     assert payload["response_text"].startswith("Unknown slash command: /notacommand.")
+
+
+def test_workflow_bare_slash_stays_on_builtin_path_and_returns_usage(tmp_path, monkeypatch):
+    builtin_calls: list[str] = []
+    step_calls: list[str] = []
+    original_builtin = MR1._handle_builtin
+    original_step = MR1.step
+
+    def builtin_spy(self, cmd: str):
+        builtin_calls.append(cmd)
+        return original_builtin(self, cmd)
+
+    def step_spy(self, user_input: str, announce: bool = False) -> str:
+        step_calls.append(user_input)
+        return original_step(self, user_input, announce=announce)
+
+    monkeypatch.setattr(MR1, "start", lambda self: None)
+    monkeypatch.setattr(MR1, "_handle_builtin", builtin_spy)
+    monkeypatch.setattr(MR1, "step", step_spy)
+
+    stdout = StringIO()
+    rc = runtime_test_cli.main(
+        ["--isolated", "--runtime-root", str(tmp_path / "runtime"), "/workflow"],
+        stdout=stdout,
+        stderr=StringIO(),
+    )
+
+    payload = json.loads(stdout.getvalue())
+    assert rc == 0
+    assert builtin_calls == ["/workflow"]
+    assert step_calls == []
+    assert payload["dispatch"]["builtin_attempted"] is True
+    assert payload["dispatch"]["builtin_handled"] is True
+    assert payload["dispatch"]["step_called"] is False
+    assert payload["response_text"].startswith("Usage: /workflow <workflow_id>")
 
 
 def test_jsonl_mode_emits_parseable_json(tmp_path, monkeypatch):

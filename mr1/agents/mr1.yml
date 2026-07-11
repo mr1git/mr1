@@ -5,11 +5,7 @@ name: mr1
 model: haiku
 allowed_tools:
   - Read
-  - Write
-  - Edit
-  - Bash
   - Glob
   - Grep
-  - Agent
 lifetime: persistent    # Always running while the system is active.
 memory_access: full     # Full read/write access to all memory stores.

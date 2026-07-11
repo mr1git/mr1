@@ -33,7 +33,7 @@ from mr1.scheduler_core.attempts import UNSET as _UNSET
 from mr1.scheduler_core.events import SchedulerEventAdapter
 from mr1.watchers import WatchEvaluation, WatcherRegistry
 from mr1.workflow_models import Task, TaskStatus, Workflow
-from mr1.workflow_store import WorkflowStore
+from mr1.workflow_store import WorkflowStore, sync_task_view, sync_workflow_view
 
 
 def _now_iso() -> str:
@@ -111,17 +111,27 @@ class WatcherPollService:
         checked_at: str,
         check_payload: dict[str, Any],
     ) -> None:
+        original_wf = wf
+        original_task = task
         with self._store.locked():
-            task.last_checked_at = checked_at
-            task.last_check_result = dict(check_payload)
-            self._store.save_workflow(wf)
+            live_wf = self._store.load_workflow(wf.workflow_id)
+            if live_wf is None:
+                raise RuntimeError(f"workflow not found during watcher check: {wf.workflow_id}")
+            live_task = live_wf.tasks.get(task.task_id)
+            if live_task is None:
+                raise RuntimeError(f"task not found during watcher check: {task.task_id}")
+            live_task.last_checked_at = checked_at
+            live_task.last_check_result = dict(check_payload)
+            self._store.save_workflow(live_wf)
             self._event_adapter.emit_watcher_check(
-                wf.workflow_id,
-                task.task_id,
-                attempt_id=task.current_attempt or None,
+                live_wf.workflow_id,
+                live_task.task_id,
+                attempt_id=live_task.current_attempt or None,
                 message=check_payload.get("message", ""),
                 metadata=dict(check_payload),
             )
+            sync_workflow_view(original_wf, live_wf)
+            sync_task_view(original_task, live_task)
 
     # ------------------------------------------------------------------
     # Public entry point.

@@ -1,0 +1,9 @@
+{
+  "category": "workflow",
+  "description": "Append tasks to a CANCELLED workflow \u2014 must be refused, not silently reopen",
+  "elapsed_s": 463.45,
+  "findings": [],
+  "scenario": "wf_append_after_cancel",
+  "session_error": null,
+  "turn_count": 3
+}

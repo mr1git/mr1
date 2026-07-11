@@ -50,7 +50,7 @@ class WorkflowQueryService:
 
     def active_workflows(self, handle_task_ids: set[str]) -> list[Workflow]:
         active: list[Workflow] = []
-        for workflow in self._store.list_workflows():
+        for workflow in self._store.list_active_workflows():
             if workflow.is_terminal() and not workflow_has_live_handles(workflow, handle_task_ids):
                 continue
             active.append(workflow)

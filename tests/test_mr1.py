@@ -2,6 +2,8 @@
 
 import json
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch, MagicMock, PropertyMock
 
@@ -13,17 +15,20 @@ from mr1.capability_policy import (
 )
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
 from mr1.kazi_runner import RunStatus
+from mr1.scoped_agents import PersistentAgent, new_agent_id
 from mr1.workflow_models import TaskStatus, WorkflowStatus
 from mr1.mr1 import (
     MR1,
     MR1Process,
     StateManager,
+    StateCorruptionError,
     _ORCHESTRATOR_PROMPT,
     _load_agent_config,
     _generate_task_id,
 )
 from mr1.kazi_runner import MockRunner
 from mr1.mrn_run import MRnRunResult
+from mr1.orchestrator import state as orchestrator_state
 from mr1.workflow_store import WorkflowStore
 
 
@@ -37,6 +42,30 @@ class FakeCompiler:
         if not self.responses:
             raise AssertionError("no compiler responses configured")
         return self.responses.pop(0)
+
+
+def _seed_legacy_agent(
+    mr1_instance: MR1,
+    *,
+    parent_agent_id: str,
+    title: str,
+    status: str = "active",
+    run_status: str = "idle",
+) -> PersistentAgent:
+    parent = mr1_instance._scoped_agents.require_agent(parent_agent_id)
+    agent = PersistentAgent(
+        agent_id=new_agent_id(),
+        agent_type="mrn",
+        title=title,
+        tree_level=parent.tree_level + 1,
+        parent_agent_id=parent_agent_id,
+        status=status,
+        run_status=run_status,
+    )
+    path = mr1_instance._scoped_agents.agent_path(agent.agent_id)
+    path.write_text(json.dumps(agent.to_dict(), indent=2), encoding="utf-8")
+    mr1_instance._scoped_agents.ensure_agent_files(agent.agent_id)
+    return agent
 
 
 class TestStateManager:
@@ -76,6 +105,30 @@ class TestStateManager:
         mgr2 = StateManager(state_path=state_path)
         assert "t1" in mgr2.active_tasks
 
+    def test_save_fsyncs_file_and_directory(self, tmp_path, monkeypatch):
+        state_path = tmp_path / "mr1_state.json"
+        manager = StateManager(state_path=state_path)
+        fsync_calls: list[int] = []
+
+        def fake_fsync(fd: int) -> None:
+            fsync_calls.append(fd)
+
+        monkeypatch.setattr(orchestrator_state.os, "fsync", fake_fsync)
+
+        manager.save()
+
+        assert state_path.exists()
+        assert len(fsync_calls) >= 2
+
+    def test_corrupted_state_raises_without_discarding_file(self, tmp_path):
+        state_path = tmp_path / "mr1_state.json"
+        state_path.write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(StateCorruptionError, match="runtime state is corrupted"):
+            StateManager(state_path=state_path)
+
+        assert state_path.read_text(encoding="utf-8") == "{not json"
+
     def test_format_tasks(self, state_mgr):
         assert state_mgr.format_tasks() == "No tasks."
         state_mgr.add_task("t1", "kazi", "test", 100)
@@ -100,6 +153,108 @@ class TestStateManager:
 
         state_mgr.remove_agent_pid(100)
         assert state_mgr._state["agent_pids"] == [200]
+
+    def test_active_tasks_returns_detached_snapshot(self, state_mgr):
+        state_mgr.add_task("t1", "kazi", "test task", 123)
+
+        active = state_mgr.active_tasks
+        active["t1"]["status"] = "completed"
+
+        assert state_mgr.get_task("t1")["status"] == "running"
+        assert "t1" in state_mgr.active_tasks
+
+    def test_pending_workflow_returns_detached_snapshot(self, state_mgr):
+        state_mgr.set_pending_workflow({
+            "spec": {
+                "title": "draft",
+                "tasks": [{"label": "a"}],
+            }
+        })
+
+        pending = state_mgr.pending_workflow
+        assert pending is not None
+        pending["spec"]["tasks"].append({"label": "b"})
+
+        assert state_mgr.pending_workflow == {
+            "spec": {
+                "title": "draft",
+                "tasks": [{"label": "a"}],
+            }
+        }
+
+    def test_concurrent_decision_logging_preserves_all_entries(self, state_mgr, monkeypatch):
+        monkeypatch.setattr(orchestrator_state, "_MAX_DECISIONS", 200)
+        worker_count = 40
+        barrier = threading.Barrier(worker_count)
+
+        def worker(index: int) -> None:
+            barrier.wait()
+            state_mgr.add_decision(f"user input {index}", f"action_{index}")
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(worker, range(worker_count)))
+
+        actions = {entry["action"] for entry in state_mgr._state["decisions"]}
+        assert len(state_mgr._state["decisions"]) == worker_count
+        assert actions == {f"action_{index}" for index in range(worker_count)}
+
+    def test_concurrent_conversation_updates_preserve_all_entries(self, state_mgr, monkeypatch):
+        monkeypatch.setattr(orchestrator_state, "_MAX_CONVERSATION", 200)
+        worker_count = 40
+        barrier = threading.Barrier(worker_count)
+
+        def worker(index: int) -> None:
+            barrier.wait()
+            state_mgr.add_conversation("user", f"message {index}", task_id=f"task-{index}")
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(worker, range(worker_count)))
+
+        conversation = state_mgr.conversation
+        assert len(conversation) == worker_count
+        assert {entry["text"] for entry in conversation} == {
+            f"message {index}" for index in range(worker_count)
+        }
+
+    def test_pending_workflow_snapshot_is_stable_while_source_mutates(self, state_mgr):
+        draft = {
+            "spec": {
+                "title": "draft",
+                "tasks": [],
+            }
+        }
+        ready = threading.Event()
+        mutate = threading.Event()
+        mutated = threading.Event()
+        writer_done = threading.Event()
+        observed_lengths: list[int] = []
+
+        def writer() -> None:
+            state_mgr.set_pending_workflow(draft)
+            ready.set()
+            for index in range(5):
+                mutate.wait(timeout=1.0)
+                mutate.clear()
+                draft["spec"]["tasks"].append({"label": f"task-{index}"})
+                mutated.set()
+            writer_done.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        assert ready.wait(timeout=1.0)
+
+        for _ in range(5):
+            mutate.set()
+            assert mutated.wait(timeout=1.0)
+            mutated.clear()
+            pending = state_mgr.pending_workflow
+            assert pending is not None
+            observed_lengths.append(len(pending["spec"]["tasks"]))
+
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert writer_done.is_set()
+        assert observed_lengths == [0, 0, 0, 0, 0]
 
 
 class TestParseResponse:
@@ -158,9 +313,12 @@ class TestHelpers:
 class TestBuiltinCommands:
     @pytest.fixture
     def mr1_instance(self, tmp_path):
-        instance = MR1()
-        # Replace the state manager with one using a fresh tmp path
-        # so tests aren't polluted by real state.
+        instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            inbox_auto_triage=False,
+        )
         instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
         return instance
 
@@ -182,7 +340,10 @@ class TestBuiltinCommands:
         assert result is None
 
     def test_agent_builtin_shows_mission_and_iteration(self, mr1_instance):
-        child = mr1_instance._scoped_agents.create_child_agent(mr1_instance._root_agent_id, "research")
+        child = mr1_instance._scoped_agents.create_child_agent(
+            mr1_instance._root_agent_id,
+            "builtin-mission-test",
+        )
         child.mission = "Investigate the repo"
         child.run_status = "working"
         child.current_iteration = 2
@@ -195,7 +356,10 @@ class TestBuiltinCommands:
         assert "iteration:    2" in result
 
     def test_agent_builtin_shows_runtime_activity_clarity(self, mr1_instance, tmp_path):
-        child = mr1_instance._scoped_agents.create_child_agent(mr1_instance._root_agent_id, "research")
+        child = mr1_instance._scoped_agents.create_child_agent(
+            mr1_instance._root_agent_id,
+            "builtin-runtime-test",
+        )
         child.run_status = "working"
         mr1_instance._scoped_agents.save_agent(child)
 
@@ -308,6 +472,11 @@ class TestWorkflowBuiltinCommands:
         )
         return path
 
+    def _write_fragment(self, tmp_path: Path, name: str, tasks: list[dict]) -> Path:
+        path = tmp_path / name
+        path.write_text(json.dumps({"tasks": tasks}), encoding="utf-8")
+        return path
+
     def test_workflow_submit_and_listing_commands(self, mr1_instance, tmp_path):
         path = self._write_spec(tmp_path)
 
@@ -337,6 +506,30 @@ class TestWorkflowBuiltinCommands:
         assert task_result is not None
         assert f"task:       {task_id}" in task_result
         assert "label:      a" in task_result
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected_prefix"),
+        [
+            ("/workflow", "Usage: /workflow <workflow_id>"),
+            ("/workflow rerun", "Usage: /workflow rerun <workflow_id> <task>"),
+            ("/workflow cancel", "Usage: /workflow cancel <workflow_id>"),
+            ("/workflow append", "Usage: /workflow append <workflow_id> <path>"),
+            ("/workflow insert", "Usage: /workflow insert <workflow_id> <after_task> <path>"),
+            ("/workflow replace", "Usage: /workflow replace [-r] <workflow_id> <task> <path>"),
+            ("/workflow replace -r", "Usage: /workflow replace [-r] <workflow_id> <task> <path>"),
+            ("/workflow trigger", "Usage: /workflow trigger <workflow_id> <label-or-task-id> [event_name]"),
+        ],
+    )
+    def test_workflow_builtin_returns_usage_for_bare_and_incomplete_commands(
+        self,
+        mr1_instance,
+        cmd,
+        expected_prefix,
+    ):
+        result = mr1_instance._handle_builtin(cmd)
+
+        assert result is not None
+        assert result.startswith(expected_prefix)
 
     def test_jobs_events_and_scheduler_tick_commands(self, mr1_instance, tmp_path):
         path = self._write_spec(tmp_path)
@@ -458,6 +651,138 @@ class TestWorkflowBuiltinCommands:
         wf = mr1_instance._workflow_store.load_workflow(wf_id2)
         assert wf.task_by_label("a").status is TaskStatus.RUNNING
 
+    def test_workflow_rerun_rejects_cancelled_workflow(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+
+        assert mr1_instance._handle_builtin(f"/workflow cancel {wf_id}") == f"workflow cancelled: {wf_id}"
+
+        result = mr1_instance._handle_builtin(f"/workflow rerun {wf_id} a")
+
+        assert result == f"workflow cancelled and cannot be mutated: {wf_id}"
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        assert wf.status is WorkflowStatus.CANCELLED
+        assert wf.task_by_label("a").status is TaskStatus.CANCELLED
+
+    def test_workflow_append_rejects_cancelled_workflow(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+        append_path = self._write_fragment(
+            tmp_path,
+            "append.json",
+            [{
+                "label": "c",
+                "title": "Task C",
+                "task_kind": "agent",
+                "agent_type": "kazi",
+                "prompt": "Do C",
+            }],
+        )
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+
+        assert mr1_instance._handle_builtin(f"/workflow cancel {wf_id}") == f"workflow cancelled: {wf_id}"
+
+        result = mr1_instance._handle_builtin(f"/workflow append {wf_id} {append_path}")
+
+        assert result == f"workflow cancelled and cannot be mutated: {wf_id}"
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        assert wf.status is WorkflowStatus.CANCELLED
+        assert "c" not in wf.label_to_task_id
+
+    def test_workflow_insert_rejects_cancelled_workflow(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+        insert_path = self._write_fragment(
+            tmp_path,
+            "insert.json",
+            [{
+                "label": "x",
+                "title": "Task X",
+                "task_kind": "agent",
+                "agent_type": "kazi",
+                "prompt": "Do X",
+            }],
+        )
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+
+        assert mr1_instance._handle_builtin(f"/workflow cancel {wf_id}") == f"workflow cancelled: {wf_id}"
+
+        result = mr1_instance._handle_builtin(f"/workflow insert {wf_id} a {insert_path}")
+
+        assert result == f"workflow cancelled and cannot be mutated: {wf_id}"
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        assert wf.status is WorkflowStatus.CANCELLED
+        assert "x" not in wf.label_to_task_id
+
+    def test_workflow_replace_rejects_cancelled_workflow(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+        replace_path = self._write_fragment(
+            tmp_path,
+            "replace_cancelled.json",
+            [{
+                "label": "a",
+                "title": "Task A Replacement",
+                "task_kind": "agent",
+                "agent_type": "kazi",
+                "prompt": "Replacement",
+            }],
+        )
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+
+        assert mr1_instance._handle_builtin(f"/workflow cancel {wf_id}") == f"workflow cancelled: {wf_id}"
+
+        result = mr1_instance._handle_builtin(f"/workflow replace {wf_id} a {replace_path}")
+
+        assert result == f"workflow cancelled and cannot be mutated: {wf_id}"
+        wf = mr1_instance._workflow_store.load_workflow(wf_id)
+        assert wf.status is WorkflowStatus.CANCELLED
+        assert wf.task_by_label("a").prompt == "Do A"
+
+    def test_workflow_cancel_reports_already_cancelled(self, mr1_instance, tmp_path):
+        path = self._write_spec(tmp_path)
+        submit_result = mr1_instance._handle_builtin(f"/workflow submit {path}")
+        wf_id = submit_result.split(": ", 1)[1]
+
+        assert mr1_instance._handle_builtin(f"/workflow cancel {wf_id}") == f"workflow cancelled: {wf_id}"
+
+        result = mr1_instance._handle_builtin(f"/workflow cancel {wf_id}")
+
+        assert result == f"workflow already cancelled: {wf_id}"
+
+    def test_agent_create_rejects_reserved_all_title(self, mr1_instance):
+        result = mr1_instance._handle_builtin("/agent create all")
+
+        assert result == "agent title 'all' is reserved"
+
+    def test_agent_create_rejects_null_byte_in_title(self, mr1_instance):
+        result = mr1_instance._handle_builtin("/agent create Title\x00Null")
+
+        assert result == "agent title must not contain control characters"
+
+    def test_agent_create_rejects_duplicate_exact_title(self, mr1_instance):
+        first = mr1_instance._handle_builtin("/agent create Alpha")
+        second = mr1_instance._handle_builtin("/agent create Alpha")
+
+        assert first.startswith("ag-")
+        assert second == "agent title already exists: Alpha"
+
+    def test_agent_create_rejects_duplicate_case_insensitive_title(self, mr1_instance):
+        first = mr1_instance._handle_builtin("/agent create Alpha")
+        second = mr1_instance._handle_builtin("/agent create alpha")
+
+        assert first.startswith("ag-")
+        assert second == "agent title already exists: Alpha"
+
+    def test_agent_create_allows_distinct_titles(self, mr1_instance):
+        first = mr1_instance._handle_builtin("/agent create RepoResearcher")
+        second = mr1_instance._handle_builtin("/agent create PaperResearcher")
+
+        assert first.startswith("ag-")
+        assert second.startswith("ag-")
+        assert first != second
+
     def test_shutdown_stops_scheduler(self, mr1_instance):
         mr1_instance._process = MagicMock(spec=MR1Process)
 
@@ -503,7 +828,7 @@ class TestMR1Process:
         mock_invoke.assert_called_once_with("hello", resume=True)
         assert proc.session_id == "sess-1"
 
-    def test_send_retries_without_resume_on_error(self):
+    def test_send_does_not_retry_without_explicit_retry_policy(self):
         proc = MR1Process("prompt", "haiku", ["Read"], session_id="sess-1")
         proc._available = True
 
@@ -514,10 +839,43 @@ class TestMR1Process:
         ) as mock_invoke:
             result = proc.send("hello")
 
+        assert "resume failed" in result
+        assert mock_invoke.call_count == 1
+        assert mock_invoke.call_args.kwargs == {"resume": True}
+        assert proc.session_id is None
+
+    def test_send_retries_when_explicitly_retriable(self):
+        proc = MR1Process("prompt", "haiku", ["Read"], session_id="sess-1")
+        proc._available = True
+
+        with patch.object(
+            proc,
+            "_invoke",
+            side_effect=[("", "resume failed"), ("fresh answer", None)],
+        ) as mock_invoke:
+            result = proc.send("hello", retriable=True)
+
         assert result == "fresh answer"
         assert mock_invoke.call_args_list[0].kwargs == {"resume": True}
         assert mock_invoke.call_args_list[1].kwargs == {"resume": False}
         assert proc.session_id is None
+
+    def test_start_uses_governed_read_only_brain_tools(self, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+            inbox_auto_triage=False,
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+
+        with patch("mr1.orchestrator.root.MR1Process") as mock_process_cls:
+            mock_process = mock_process_cls.return_value
+            mock_process.session_id = None
+            mr1_instance.start()
+
+        assert mock_process_cls.call_args.kwargs["tools"] == ["Read", "Glob", "Grep"]
 
 
 class TestStep:
@@ -712,8 +1070,14 @@ class TestStep:
         result = mr1_instance.step("kill the archivist permanently")
 
         updated = mr1_instance._scoped_agents.require_agent(child.agent_id)
+        artifact = json.loads(sorted((tmp_path := mr1_instance._state._path.parent / "mr1_turns").glob("turn-*.json"))[-1].read_text(encoding="utf-8"))
+        decision_event = mr1_instance._event_log.list_events()[-1]
         assert result == f"terminated agent: {child.agent_id}"
         assert updated.status == "terminated"
+        assert artifact["routing_decision"]["final_action"] == "run_commands"
+        assert artifact["routing_decision"]["matched_signals"]["matched_operational_verbs"] == ["kill"]
+        assert decision_event.event_type == "runtime_turn_decided"
+        assert decision_event.metadata["final_action"] == "run_commands"
         mock_process.send.assert_not_called()
 
     def test_direct_answer_observation_loop_reads_full_message_body(self, tmp_path):
@@ -820,7 +1184,7 @@ class TestStep:
         mr1_instance, mock_process = mr1_with_mock_process
         root = mr1_instance._scoped_agents.ensure_root_agent()
         mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
-        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
+        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "archive")
         mock_process.send.return_value = "Slack guidance."
 
         result = mr1_instance.step(user_text)
@@ -868,6 +1232,7 @@ class TestStep:
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
             actor_type="mrn",
+            actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
             args={"path": "README.md"},
@@ -911,14 +1276,51 @@ class TestStep:
         artifacts = sorted(turn_dir.glob("turn-*.json"))
         assert len(artifacts) == 1
         artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        decision_event = mr1_instance._event_log.list_events()[-1]
         assert artifact["route"] == "direct_answer"
         assert artifact["route_advice"]["route"] == "direct_response"
+        assert artifact["routing_decision"]["advisor_route"] == "direct_response"
+        assert artifact["routing_decision"]["final_action"] == "direct_response"
+        assert artifact["routing_decision"]["override_applied"] is False
         assert artifact["runtime_grounding"]["agents"]
         assert artifact["runtime_grounding"]["workflows"]
         assert artifact["runtime_grounding"]["messages"]
         assert artifact["runtime_grounding"]["approvals"]
         assert artifact["runtime_grounding"]["events"]
         assert artifact["brain_prompt"] == sent
+        assert decision_event.event_type == "runtime_turn_decided"
+        assert decision_event.target_id == artifact["turn_id"]
+        assert decision_event.metadata["advisor_route"] == "direct_response"
+        assert decision_event.metadata["final_action"] == "direct_response"
+        assert decision_event.record_path == str(artifacts[0])
+
+    def test_pause_agent_command_records_informative_override_reason(self, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        mr1_instance._state.set_reference_state("last_referenced_agent_id", child.agent_id)
+
+        result = mr1_instance.step("pause that agent")
+
+        artifacts = sorted((tmp_path / "mr1_turns").glob("turn-*.json"))
+        artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        decision = artifact["routing_decision"]
+        assert "exact execute-now command details" in result
+        assert artifact["route"] == "ask_clarification"
+        assert artifact["route_advice"]["route"] == "run_commands"
+        assert decision["override_applied"] is True
+        assert "did not have enough concrete target or command detail" in artifact["route_advice_override_reason"]
+        assert "did not have enough concrete target or command detail" in decision["override_cause"]
+        assert "safe execute-now command details" in decision["missing_signals"]
 
     def test_runtime_grounding_includes_referenced_pending_parent_message_ids(self, tmp_path):
         mr1_instance = MR1(
@@ -1019,6 +1421,24 @@ class TestStep:
         assert mr1_instance._extract_requested_child_title(
             "Create a persistent agent named Sage to own README inspection",
         ) == "Sage"
+
+    @pytest.mark.parametrize(
+        ("user_input", "expected_title"),
+        [
+            ("create an agent called archivist that owns screenshots", "archivist"),
+            ('create a persistent agent "researcher" to own literature review', "researcher"),
+            ("create a persistent agent named librarian to own notes", "librarian"),
+        ],
+    )
+    def test_explicit_persistent_child_names_are_preserved(
+        self,
+        mr1_with_mock_process,
+        user_input,
+        expected_title,
+    ):
+        mr1_instance, _mock_process = mr1_with_mock_process
+
+        assert mr1_instance._extract_requested_child_title(user_input) == expected_title
 
     def test_special_name_request_uses_memorable_default_title(self, mr1_with_mock_process):
         mr1_instance, _mock_process = mr1_with_mock_process
@@ -1129,6 +1549,43 @@ class TestStep:
         assert child.assignment_packet["child_level"] == 2
 
     @patch("mr1.mr1.MRnRunRunner.run")
+    def test_persistent_delegation_prefers_explicit_user_title_over_brain_title(self, mock_run, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+        mr1_instance._process.send.return_value = (
+            "AGENT_TITLE: Sentinel\nOwn research synthesis and note indexing."
+        )
+        mock_run.return_value = MRnRunResult(
+            run_id="run-1",
+            agent_id="ag-test",
+            caller_agent_id=mr1_instance._root_agent_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00",
+            policy={},
+            steps=[],
+            workflows_created=0,
+            messages_created=0,
+            stopped_reason="waiting",
+            status="stopped",
+            final_run_status="waiting",
+        )
+
+        response = mr1_instance.step(
+            "Create a persistent agent called archivist to own my research notes.",
+        )
+
+        assert response.startswith("delegated to persistent agent: ag-")
+        child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
+        assert child.title == "archivist"
+
+    @patch("mr1.mr1.MRnRunRunner.run")
     def test_persistent_delegation_named_agent_routes_without_workflow_authoring(self, mock_run, tmp_path):
         compiler = MagicMock()
         mr1_instance = MR1(
@@ -1167,6 +1624,31 @@ class TestStep:
         assert child.title == "Sage"
         assert "self-evolution" in (child.mission or "")
         assert compiler.call_count == 0
+        assert mr1_instance._process.send.call_count == 1
+
+    @patch("mr1.mr1.MRnRunRunner.run")
+    def test_persistent_delegation_rejects_duplicate_existing_title(self, mock_run, tmp_path):
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+        mr1_instance._process.send.return_value = (
+            "AGENT_TITLE: Builder\nOwn literature review and synthesis."
+        )
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "Alpha")
+
+        response = mr1_instance.step(
+            "Create a persistent agent named alpha to own literature review.",
+        )
+
+        assert response == "agent title already exists: Alpha"
+        assert mock_run.call_count == 0
         assert mr1_instance._process.send.call_count == 1
 
     def test_existing_workflow_finish_question_routes_to_inspection(self, mr1_with_mock_process, tmp_path):
@@ -1356,6 +1838,7 @@ class TestStep:
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
             actor_type="mrn",
+            actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
             args={"path": "README.md"},
@@ -1441,7 +1924,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         older = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
-        newer = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        newer = _seed_legacy_agent(mr1_instance, parent_agent_id=root.agent_id, title="MR2")
         mr1_instance._state.set_reference_state("last_created_agent_id", newer.agent_id)
 
         resolution = mr1_instance.resolve_runtime_references(
@@ -1482,7 +1965,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
-        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        _seed_legacy_agent(mr1_instance, parent_agent_id=root.agent_id, title="MR2")
         mr1_instance._state.set_reference_state("last_created_agent_id", None)
         mr1_instance._state.set_reference_state("last_referenced_agent_id", None)
 
@@ -1498,7 +1981,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
-        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
+        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "archive")
 
         resolution = mr1_instance.resolve_runtime_references(
             "I use Slack because I'm part of a research group.",
@@ -1512,7 +1995,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         older = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
-        newer = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
+        newer = _seed_legacy_agent(mr1_instance, parent_agent_id=root.agent_id, title="research")
 
         resolution = mr1_instance.resolve_runtime_references(
             "kill all research agents",
@@ -1545,7 +2028,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
-        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
+        _seed_legacy_agent(mr1_instance, parent_agent_id=root.agent_id, title="research")
 
         resolution = mr1_instance.resolve_runtime_references(
             "what is research doing?",
@@ -1559,7 +2042,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         older = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
-        newer = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "research")
+        newer = _seed_legacy_agent(mr1_instance, parent_agent_id=root.agent_id, title="research")
 
         response = mr1_instance.step("kill all research agents")
 
@@ -1622,6 +2105,7 @@ class TestRuntimeReferenceResolution:
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
             actor_type="mrn",
+            actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
             args={"path": "README.md"},
@@ -1649,16 +2133,18 @@ class TestRuntimeReferenceResolution:
         )
         mr1_instance._approval_store.save(approval)
 
+        bare_output = mr1_instance._handle_builtin("/approvals")
         list_output = mr1_instance._handle_builtin("/approvals list")
         show_output = mr1_instance._handle_builtin("/approvals show cap_approval_test")
         approve_output = mr1_instance._handle_builtin(
             "/approvals approve cap_approval_test --reason approved",
         )
 
+        assert bare_output == list_output
         assert "cap_approval_test" in list_output
         assert "capability_name:      read_file" in show_output
         assert "Approved." in approve_output
-        assert "/workflow rerun wf-1 tk-1" in approve_output
+        assert "Blocked workflow task reopened automatically." in approve_output
         assert "Use --grant-scope to persist scope access if intended." in approve_output
         updated = mr1_instance._approval_store.require("cap_approval_test")
         assert updated.status == "approved"
@@ -2087,7 +2573,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         agent_a = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
-        agent_b = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        agent_b = _seed_legacy_agent(mr1_instance, parent_agent_id=root.agent_id, title="MR2")
 
         resolution = mr1_instance.resolve_runtime_references(
             f"message {agent_a.agent_id} to report status",
@@ -2101,9 +2587,14 @@ class TestRuntimeReferenceResolution:
     def test_single_active_with_terminated_duplicate_resolves_directly(self, tmp_path):
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
-        dead = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
         alive = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
-        mr1_instance._scoped_agents.terminate_agent(root.agent_id, dead.agent_id)
+        dead = _seed_legacy_agent(
+            mr1_instance,
+            parent_agent_id=root.agent_id,
+            title="MR2",
+            status="terminated",
+            run_status="terminated",
+        )
 
         resolution = mr1_instance.resolve_runtime_references(
             "what is MR2 doing?",
@@ -2116,10 +2607,13 @@ class TestRuntimeReferenceResolution:
     def test_single_active_with_legacy_active_terminated_duplicate_resolves_directly(self, tmp_path):
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
-        legacy_dead = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
         alive = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
-        legacy_dead.run_status = "terminated"
-        mr1_instance._scoped_agents.save_agent(legacy_dead)
+        legacy_dead = _seed_legacy_agent(
+            mr1_instance,
+            parent_agent_id=root.agent_id,
+            title="MR2",
+            run_status="terminated",
+        )
 
         resolution = mr1_instance.resolve_runtime_references(
             "what is MR2 doing?",
@@ -2133,7 +2627,7 @@ class TestRuntimeReferenceResolution:
         mr1_instance = self._mr1_instance(tmp_path)
         root = mr1_instance._scoped_agents.ensure_root_agent()
         mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
-        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        _seed_legacy_agent(mr1_instance, parent_agent_id=root.agent_id, title="MR2")
         mr1_instance._state.set_reference_state("last_created_agent_id", None)
         mr1_instance._state.set_reference_state("last_referenced_agent_id", None)
 

@@ -18,10 +18,11 @@ Layout::
     <root>/<wf_id>/tasks/<task_id>/attempts/<attempt_id>/stderr.log
     <root>/<wf_id>/tasks/<task_id>/attempts/<attempt_id>/result.json
 
-All state mutation uses an atomic tmp → rename. A single store-level
-`RLock` serialises mutation across the workflow.json and events.jsonl
-files so "state persisted but event missing" and "event logged but state
-not persisted" failure modes cannot occur mid-write.
+All state mutation uses an atomic tmp → rename. A store-level `RLock`
+plus a cross-process file lock serialise mutation across the
+workflow.json and events.jsonl files so "state persisted but event
+missing" and "event logged but state not persisted" failure modes
+cannot occur mid-write.
 
 Callers that must bundle a state change and its event atomically use the
 `locked()` context manager, which holds the lock across an arbitrary
@@ -30,6 +31,7 @@ sequence of `save_workflow` + `append_event` calls.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import threading
 from contextlib import contextmanager
@@ -38,10 +40,24 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
-from mr1.workflow_models import Workflow, WorkflowEvent
+from mr1.workflow_models import Task, Workflow, WorkflowEvent
 
 
 _DEFAULT_ROOT = Path(__file__).resolve().parent / "memory" / "workflows"
+_ACTIVE_INDEX_NAME = ".active_workflows.json"
+_ACTIVE_INDEX_VERSION = 1
+
+
+def sync_workflow_view(target: Workflow, source: Workflow) -> None:
+    snapshot = Workflow.from_dict(source.to_dict())
+    target.__dict__.clear()
+    target.__dict__.update(snapshot.__dict__)
+
+
+def sync_task_view(target: Task, source: Task) -> None:
+    snapshot = Task.from_dict(source.to_dict())
+    target.__dict__.clear()
+    target.__dict__.update(snapshot.__dict__)
 
 
 class WorkflowStore:
@@ -56,6 +72,11 @@ class WorkflowStore:
         self._root = Path(root) if root else _DEFAULT_ROOT
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._mutation_lock_path = self._root / ".workflow_store.lock"
+        self._lock_state = threading.local()
+        self._active_index_cache: set[str] = set()
+        self._active_index_loaded = False
+        self._active_index_mtime_ns = -1
 
     # ------------------------------------------------------------------
     # Paths
@@ -73,6 +94,9 @@ class WorkflowStore:
 
     def events_jsonl_path(self, workflow_id: str) -> Path:
         return self.workflow_dir(workflow_id) / "events.jsonl"
+
+    def active_index_path(self) -> Path:
+        return self._root / _ACTIVE_INDEX_NAME
 
     def task_log_paths(self, workflow_id: str, task_id: str) -> tuple[Path, Path]:
         base = self.workflow_dir(workflow_id) / "tasks" / task_id
@@ -132,8 +156,34 @@ class WorkflowStore:
         Hold the store lock across a multi-step mutation (e.g. update a
         task, save the workflow, append the event).
         """
-        with self._lock:
+        self._lock.acquire()
+        depth = getattr(self._lock_state, "depth", 0)
+        if depth == 0:
+            self._mutation_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self._mutation_lock_path, "a+b")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except BaseException:
+                handle.close()
+                self._lock.release()
+                raise
+            self._lock_state.handle = handle
+        self._lock_state.depth = depth + 1
+        try:
             yield
+        finally:
+            remaining_depth = self._lock_state.depth - 1
+            if remaining_depth == 0:
+                handle = self._lock_state.handle
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+                    del self._lock_state.handle
+                    del self._lock_state.depth
+            else:
+                self._lock_state.depth = remaining_depth
+            self._lock.release()
 
     # ------------------------------------------------------------------
     # Workflow persistence
@@ -141,24 +191,17 @@ class WorkflowStore:
 
     def save_workflow(self, workflow: Workflow) -> None:
         """Atomic write of the full workflow.json."""
-        with self._lock:
-            wf_dir = self.workflow_dir(workflow.workflow_id)
-            wf_dir.mkdir(parents=True, exist_ok=True)
-            target = self.workflow_json_path(workflow.workflow_id)
-            tmp = target.with_suffix(".json.tmp")
-            payload = json.dumps(workflow.to_dict(), indent=2, sort_keys=False)
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(payload)
-            tmp.replace(target)
+        with self.locked():
+            if workflow.is_terminal():
+                self._save_workflow_json_locked(workflow)
+                self._set_workflow_active_locked(workflow.workflow_id, is_active=False)
+            else:
+                self._set_workflow_active_locked(workflow.workflow_id, is_active=True)
+                self._save_workflow_json_locked(workflow)
 
     def load_workflow(self, workflow_id: str) -> Optional[Workflow]:
         with self._lock:
-            path = self.workflow_json_path(workflow_id)
-            if not path.exists():
-                return None
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return Workflow.from_dict(data)
+            return self._load_workflow_locked(workflow_id)
 
     def list_workflows(self) -> list[Workflow]:
         """
@@ -187,13 +230,27 @@ class WorkflowStore:
                     continue
             return workflows
 
+    def list_active_workflows(self) -> list[Workflow]:
+        with self._lock:
+            active_ids = sorted(self._load_active_index_locked())
+            workflows: list[Workflow] = []
+            for workflow_id in active_ids:
+                try:
+                    workflow = self._load_workflow_locked(workflow_id)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                if workflow is None or workflow.is_terminal():
+                    continue
+                workflows.append(workflow)
+            return workflows
+
     # ------------------------------------------------------------------
     # Event log
     # ------------------------------------------------------------------
 
     def append_event(self, event: WorkflowEvent) -> None:
         """Append one JSON line to the workflow's events.jsonl."""
-        with self._lock:
+        with self.locked():
             wf_dir = self.workflow_dir(event.workflow_id)
             wf_dir.mkdir(parents=True, exist_ok=True)
             path = self.events_jsonl_path(event.workflow_id)
@@ -306,7 +363,7 @@ class WorkflowStore:
         return [ResolvedTaskInput.from_dict(item) for item in payload]
 
     def write_materialized_prompt(self, workflow_id: str, task_id: str, prompt: str) -> Path:
-        with self._lock:
+        with self.locked():
             target = self.materialized_prompt_path(workflow_id, task_id)
             tmp = target.with_suffix(".txt.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
@@ -336,8 +393,92 @@ class WorkflowStore:
             return None
         return self._read_json_file(Path(task.result_path))
 
+    def _save_workflow_json_locked(self, workflow: Workflow) -> None:
+        wf_dir = self.workflow_dir(workflow.workflow_id)
+        wf_dir.mkdir(parents=True, exist_ok=True)
+        target = self.workflow_json_path(workflow.workflow_id)
+        tmp = target.with_suffix(".json.tmp")
+        payload = json.dumps(workflow.to_dict(), indent=2, sort_keys=False)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        tmp.replace(target)
+
+    def _load_workflow_locked(self, workflow_id: str) -> Optional[Workflow]:
+        path = self.workflow_json_path(workflow_id)
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return Workflow.from_dict(data)
+
+    def _set_workflow_active_locked(self, workflow_id: str, *, is_active: bool) -> None:
+        active_ids = self._load_active_index_locked()
+        if is_active:
+            active_ids.add(workflow_id)
+        else:
+            active_ids.discard(workflow_id)
+        self._write_active_index_locked(active_ids)
+
+    def _load_active_index_locked(self) -> set[str]:
+        path = self.active_index_path()
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return self._rebuild_active_index_locked()
+        if self._active_index_loaded and stat.st_mtime_ns == self._active_index_mtime_ns:
+            return set(self._active_index_cache)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return self._rebuild_active_index_locked()
+        workflow_ids = payload.get("workflow_ids")
+        if payload.get("version") != _ACTIVE_INDEX_VERSION or not isinstance(workflow_ids, list):
+            return self._rebuild_active_index_locked()
+        normalized = {
+            workflow_id
+            for workflow_id in workflow_ids
+            if isinstance(workflow_id, str) and workflow_id
+        }
+        self._active_index_cache = normalized
+        self._active_index_loaded = True
+        self._active_index_mtime_ns = stat.st_mtime_ns
+        return set(normalized)
+
+    def _write_active_index_locked(self, workflow_ids: set[str]) -> None:
+        path = self.active_index_path()
+        tmp = path.with_suffix(".json.tmp")
+        payload = {
+            "version": _ACTIVE_INDEX_VERSION,
+            "workflow_ids": sorted(workflow_ids),
+        }
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        tmp.replace(path)
+        try:
+            self._active_index_mtime_ns = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            self._active_index_mtime_ns = -1
+        self._active_index_cache = set(workflow_ids)
+        self._active_index_loaded = True
+
+    def _rebuild_active_index_locked(self) -> set[str]:
+        active_ids: set[str] = set()
+        if self._root.exists():
+            for entry in sorted(self._root.iterdir()):
+                if not entry.is_dir():
+                    continue
+                try:
+                    workflow = self._load_workflow_locked(entry.name)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                if workflow is not None and not workflow.is_terminal():
+                    active_ids.add(workflow.workflow_id)
+        self._write_active_index_locked(active_ids)
+        return set(active_ids)
+
     def _write_json_file(self, target: Path, payload: Any) -> Path:
-        with self._lock:
+        with self.locked():
             tmp = target.with_suffix(f"{target.suffix}.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
