@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 
 from mr1 import workflow_events as ev
 from mr1.capability_policy import CapabilityApprovalStore, CapabilityAuditRecord
+from mr1.clock import Clock, default_clock
 from mr1.dataflow import build_watcher_task_output
 from mr1.scheduler_core.attempts import UNSET as _UNSET
 from mr1.scheduler_core.events import SchedulerEventAdapter
@@ -54,7 +55,9 @@ class WatcherPollService:
         finalize_policy_audit: Callable[..., None],
         append_policy_audit_index_from_path: Callable[..., None],
         finish_attempt: Callable[..., None],
+        clock: Optional[Clock] = None,
     ) -> None:
+        self._clock = clock or default_clock()
         self._store = store
         self._watchers = watchers
         self._approval_store = approval_store
@@ -75,7 +78,7 @@ class WatcherPollService:
         if not isinstance(interval_s, (int, float)) or interval_s < 0:
             interval_s = 1
         last_checked = datetime.fromisoformat(task.last_checked_at)
-        return (datetime.now(timezone.utc) - last_checked).total_seconds() >= interval_s
+        return (self._clock.now() - last_checked).total_seconds() >= interval_s
 
     def _watcher_timeout_message(self, task: Task) -> Optional[str]:
         max_wait_s = task.watch_config.get("max_wait_s")
@@ -85,7 +88,7 @@ class WatcherPollService:
         if not started_at:
             return None
         started_dt = datetime.fromisoformat(started_at)
-        elapsed_s = (datetime.now(timezone.utc) - started_dt).total_seconds()
+        elapsed_s = (self._clock.now() - started_dt).total_seconds()
         if elapsed_s < max_wait_s:
             return None
         return f"watcher exceeded max_wait_s={int(max_wait_s)}"
@@ -141,7 +144,7 @@ class WatcherPollService:
         audit_path = self._current_attempt_policy_audit_path(task)
         timeout_message = self._watcher_timeout_message(task)
         if timeout_message is not None:
-            checked_at = _now_iso()
+            checked_at = self._clock.now_iso()
             payload = {
                 "state": "timed_out",
                 "message": timeout_message,
@@ -187,7 +190,7 @@ class WatcherPollService:
         if not self._should_evaluate_watcher(task):
             return False
 
-        now = datetime.now(timezone.utc)
+        now = self._clock.now()
         try:
             evaluation = self._watchers.evaluate(task, now)
         except Exception as exc:
@@ -212,7 +215,7 @@ class WatcherPollService:
             task.status = TaskStatus.SUCCEEDED
             task.last_checked_at = checked_at
             task.last_check_result = check_payload
-            task.watch_satisfied_at = _now_iso()
+            task.watch_satisfied_at = self._clock.now_iso()
             output = build_watcher_task_output(task)
             output_path = str(self._store.write_task_output(
                 wf.workflow_id,
@@ -253,7 +256,7 @@ class WatcherPollService:
                 TaskStatus.SUCCEEDED,
                 event=ev.TASK_SUCCEEDED,
                 message=evaluation.message,
-                watch_satisfied_at=_now_iso(),
+                watch_satisfied_at=self._clock.now_iso(),
                 last_checked_at=checked_at,
                 last_check_result=check_payload,
                 extra_events=[(

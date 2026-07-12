@@ -1,7 +1,7 @@
 {
   "category": "workflow",
   "description": "Cancel a workflow twice \u2014 second cancel must return clear status, not crash",
-  "elapsed_s": 475.59,
+  "elapsed_s": 6.91,
   "findings": [],
   "scenario": "concurrency_double_cancel_workflow",
   "session_error": null,

@@ -1,7 +1,7 @@
 {
   "category": "observability",
   "description": "A persistent_delegation turn should emit a runtime decision event",
-  "elapsed_s": 31.77,
+  "elapsed_s": 26.26,
   "findings": [],
   "scenario": "obs_timeline_on_delegation",
   "session_error": null,

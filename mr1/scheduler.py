@@ -34,7 +34,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mr1.agents import AgentRegistry, default_agent_registry
+from mr1.autonomy.consent import ConsentGrantStore
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
+from mr1.clock import Clock, default_clock
 from mr1.capability_policy import (
     CapabilityApprovalStore,
     CapabilityAuditRecord,
@@ -320,6 +322,7 @@ def build_workflow_from_spec(
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
     agent_registry: Optional[AgentRegistry] = None,
+    clock: Optional[Clock] = None,
 ) -> Workflow:
     """
     Convert a validated spec into a `Workflow` with generated IDs and
@@ -349,6 +352,9 @@ def build_workflow_from_spec(
         owner_agent_title=owner_agent.title,
         parent_agent_id=owner_agent.parent_agent_id,
         metadata=dict(workflow_metadata or {}),
+        # `created_at` is what the stuck-workflow sweep measures against, so it
+        # has to come from the same clock the supervisor reads.
+        created_at=(clock or default_clock()).now_iso(),
     )
 
     # First pass: create tasks and the label→id map.
@@ -416,6 +422,7 @@ def submit_spec_to_disk(
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
     agent_registry: Optional[AgentRegistry] = None,
+    clock: Optional[Clock] = None,
 ) -> str:
     """
     Persist a submitted workflow so the MR1-owned scheduler will pick
@@ -446,6 +453,7 @@ def submit_spec_to_disk(
         watcher_registry=watcher_registry,
         tool_registry=tool_registry,
         agent_registry=agent_registry,
+        clock=clock,
     )
     log = WorkflowEventLog(store, default_agent_id=created_by.id)
     timeline = EventLog(store.root.parent / "events")
@@ -826,9 +834,21 @@ class Scheduler:
         message_store: Optional[MessageStore] = None,
         workspace_root: Optional[Path] = None,
         logger: Optional[Logger] = None,
+        clock: Optional[Clock] = None,
+        runtime_error_sink: Optional[Any] = None,
+        consent_store: Optional[Any] = None,
     ):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
+        self._clock = clock or default_clock()
+        self._runtime_error_sink = runtime_error_sink
+        self._tick_errors = 0
+        self._consecutive_tick_errors = 0
+        self._tick_count = 0
+        self._last_tick_duration_ms = 0.0
+        self._last_tick_at: Optional[str] = None
+        self._last_tick_error: Optional[str] = None
+        self._last_tick_error_at: Optional[str] = None
         self._store = store
         self._runner = runner or MockRunner()
         self._events = event_log or WorkflowEventLog(store, default_agent_id=agent_id)
@@ -848,7 +868,8 @@ class Scheduler:
         self._agent_id = agent_id
         self._policy_engine = PolicyEngine()
         self._approval_store = CapabilityApprovalStore(
-            self._store.root.parent / "capability_approvals"
+            self._store.root.parent / "capability_approvals",
+            clock=self._clock,
         )
         self._audit_writer = CapabilityAuditWriter()
         self._timeline = EventLog(self._store.root.parent / "events")
@@ -873,7 +894,12 @@ class Scheduler:
             store=self._store,
             events=self._event_adapter,
             handle_registry=self._handles,
-            now_fn=_now_iso,
+            now_fn=self._clock.now_iso,
+        )
+        self._consent_store = consent_store or ConsentGrantStore(
+            self._store.root.parent,
+            clock=self._clock,
+            scoped_agent_store=self._scoped_agents,
         )
         self._capability_gate = CapabilityGate(
             store=self._store,
@@ -885,7 +911,9 @@ class Scheduler:
             audit_writer=self._audit_writer,
             timeline=self._timeline,
             workspace_root=self._workspace_root,
-            now_fn=_now_iso,
+            now_fn=self._clock.now_iso,
+            consent_store=self._consent_store,
+            clock=self._clock,
         )
         self._reporter = WorkflowReporter(
             scoped_agents=self._scoped_agents,
@@ -911,6 +939,7 @@ class Scheduler:
             finalize_policy_audit=self._finalize_policy_audit,
             append_policy_audit_index_from_path=self._append_policy_audit_index_from_path,
             finish_attempt=self._finish_attempt,
+            clock=self._clock,
         )
         self._tick_lock = threading.Lock()
         self._stop = threading.Event()
@@ -945,11 +974,85 @@ class Scheduler:
         while not self._stop.is_set():
             try:
                 self.tick()
-            except Exception:
-                # A crashing tick must not kill the daemon thread; the
-                # scheduler is a fail-soft control surface in Phase 1.
-                pass
+            except Exception as exc:
+                # A crashing tick must not kill the daemon thread, but it must
+                # never be invisible either: a wedged scheduler and an idle one
+                # have to be distinguishable from outside the process.
+                self._record_tick_failure(exc)
             self._stop.wait(self._tick_interval_s)
+
+    def _record_tick_failure(self, exc: BaseException) -> None:
+        """Persist, publish, and count a failed tick. Must never raise."""
+        detail = f"{type(exc).__name__}: {exc}"
+        self._tick_errors += 1
+        self._consecutive_tick_errors += 1
+        self._last_tick_error = detail
+        self._last_tick_error_at = self._safe_now_iso()
+        trace = traceback.format_exc()
+        if self._runtime_error_sink is not None:
+            try:
+                self._runtime_error_sink(
+                    "scheduler_tick",
+                    detail,
+                    details={
+                        "tick_errors": self._tick_errors,
+                        "consecutive_tick_errors": self._consecutive_tick_errors,
+                        "traceback": trace[-2000:],
+                    },
+                )
+            except Exception:
+                pass
+        try:
+            self._timeline.emit(
+                event_type="scheduler_tick_failed",
+                actor_id=self._agent_id,
+                actor_type="mr1",
+                target_id="scheduler",
+                target_type="scheduler",
+                status="error",
+                summary=f"scheduler tick failed: {detail}"[:300],
+                metadata={
+                    "error": detail,
+                    "error_type": type(exc).__name__,
+                    "tick_errors": self._tick_errors,
+                    "consecutive_tick_errors": self._consecutive_tick_errors,
+                },
+            )
+        except Exception:
+            pass
+        try:
+            self._logger.log(
+                "scheduler",
+                "scheduler",
+                "tick_failed",
+                "error",
+                metadata={"error": detail, "tick_errors": self._tick_errors},
+            )
+        except Exception:
+            pass
+
+    def _safe_now_iso(self) -> str:
+        try:
+            return self._clock.now_iso()
+        except Exception:
+            return ""
+
+    @property
+    def consent_store(self) -> Any:
+        return self._consent_store
+
+    def metrics(self) -> dict[str, Any]:
+        """Loop health, for the supervisor's gauge set and `mr1 status`."""
+        return {
+            "tick_count": self._tick_count,
+            "tick_errors": self._tick_errors,
+            "consecutive_tick_errors": self._consecutive_tick_errors,
+            "last_tick_at": self._last_tick_at,
+            "last_tick_duration_ms": round(self._last_tick_duration_ms, 3),
+            "last_tick_error": self._last_tick_error,
+            "last_tick_error_at": self._last_tick_error_at,
+            "live_handles": len(self._handles),
+        }
 
     # ------------------------------------------------------------------
     # Submission
@@ -977,6 +1080,7 @@ class Scheduler:
             scoped_agent_store=self._scoped_agents,
             watcher_registry=self._watchers,
             tool_registry=self._tools,
+            clock=self._clock,
         )
 
     # ------------------------------------------------------------------
@@ -1077,10 +1181,17 @@ class Scheduler:
           4. Finalise the workflow when every task is terminal.
           5. Launch ready tasks up to the concurrency cap.
         """
+        started = self._clock.monotonic()
         with self._tick_lock:
-            for wf in self._workflow_queries.active_workflows(set(self._handles)):
-                self._reconcile_external_control(wf)
-                self._tick_workflow(wf)
+            try:
+                for wf in self._workflow_queries.active_workflows(set(self._handles)):
+                    self._reconcile_external_control(wf)
+                    self._tick_workflow(wf)
+            finally:
+                self._tick_count += 1
+                self._last_tick_duration_ms = (self._clock.monotonic() - started) * 1000.0
+                self._last_tick_at = self._safe_now_iso()
+        self._consecutive_tick_errors = 0
 
     def _workflow_has_live_handles(self, wf: Workflow) -> bool:
         return workflow_has_live_handles(wf, set(self._handles))
@@ -1504,7 +1615,7 @@ class Scheduler:
             error_type=error_type,
             blocked_by=[] if target_status is TaskStatus.BLOCKED else None,
             blocked_reason=message if target_status is TaskStatus.BLOCKED else _UNSET,
-            blocked_at=_now_iso() if target_status is TaskStatus.BLOCKED else _UNSET,
+            blocked_at=self._clock.now_iso() if target_status is TaskStatus.BLOCKED else _UNSET,
             result_path=result_path,
             result_summary=message,
             extra_events=[(
@@ -1859,7 +1970,7 @@ class Scheduler:
             pid=None,
             blocked_by=gate.blocked_by,
             blocked_reason=gate.reason,
-            blocked_at=_now_iso(),
+            blocked_at=self._clock.now_iso(),
             skip_reason=None,
             condition_result=None,
         )
@@ -1934,7 +2045,7 @@ class Scheduler:
 
             wf.status = target
             if target in (WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED):
-                wf.finished_at = _now_iso()
+                wf.finished_at = self._clock.now_iso()
             self._scoped_agents.normalize_workflow_ownership(wf)
             self._store.save_workflow(wf)
             if target is WorkflowStatus.RUNNING:
@@ -2367,11 +2478,11 @@ class Scheduler:
                 active_attempt_id = task.current_attempt
             task.status = new_status
             if started:
-                task.started_at = _now_iso()
+                task.started_at = self._clock.now_iso()
             elif started_at is not _UNSET:
                 task.started_at = started_at
             if finished:
-                task.finished_at = _now_iso()
+                task.finished_at = self._clock.now_iso()
             elif finished_at is not _UNSET:
                 task.finished_at = finished_at
             if pid is not _UNSET:
@@ -2414,7 +2525,7 @@ class Scheduler:
                     if condition_result is not None else None
                 )
             if watch_started and task.watch_started_at is None:
-                task.watch_started_at = _now_iso()
+                task.watch_started_at = self._clock.now_iso()
             if watch_satisfied_at is not _UNSET:
                 task.watch_satisfied_at = watch_satisfied_at
             if last_checked_at is not _UNSET:
@@ -2427,7 +2538,7 @@ class Scheduler:
             if condition is not _UNSET:
                 task.condition = dict(condition) if condition is not None else None
             if tool_started and task.tool_started_at is None:
-                task.tool_started_at = _now_iso()
+                task.tool_started_at = self._clock.now_iso()
             if tool_finished_at is not _UNSET:
                 task.tool_finished_at = tool_finished_at
             if tool_error is not _UNSET:

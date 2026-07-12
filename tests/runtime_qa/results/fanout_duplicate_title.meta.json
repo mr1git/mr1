@@ -1,7 +1,7 @@
 {
   "category": "identity",
   "description": "Duplicate persistent agent titles must be rejected case-insensitively at creation time",
-  "elapsed_s": 0.03,
+  "elapsed_s": 0.02,
   "findings": [],
   "scenario": "fanout_duplicate_title",
   "session_error": null,

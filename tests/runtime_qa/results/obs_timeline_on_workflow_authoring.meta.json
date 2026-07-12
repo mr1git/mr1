@@ -1,7 +1,7 @@
 {
   "category": "observability",
   "description": "A workflow authoring turn should emit a runtime decision event",
-  "elapsed_s": 28.17,
+  "elapsed_s": 39.95,
   "findings": [],
   "scenario": "obs_timeline_on_workflow_authoring",
   "session_error": null,

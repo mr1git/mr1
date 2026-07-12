@@ -18,6 +18,7 @@ from mr1.capability_policy import (
     capability_audit_index_entry,
     maybe_route_approval_request,
 )
+from mr1.clock import default_clock
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
@@ -39,6 +40,8 @@ class CapabilityGate:
         timeline: EventLog,
         workspace_root: Path,
         now_fn: Any,
+        consent_store: Optional[Any] = None,
+        clock: Optional[Any] = None,
     ) -> None:
         self._store = store
         self._capabilities = capabilities
@@ -50,6 +53,30 @@ class CapabilityGate:
         self._timeline = timeline
         self._workspace_root = workspace_root
         self._now = now_fn
+        self._consent_store = consent_store
+        self._clock = clock or default_clock()
+
+    @staticmethod
+    def objective_id_for_workflow(workflow: Workflow) -> Optional[str]:
+        """
+        The mission a workflow belongs to, stamped at submission.
+
+        `submit_workflow(workflow_metadata={"objective_id": ...})` is the only
+        way this gets set, which is what makes autonomous side effects
+        attributable without new plumbing through CapabilityRequest.
+        """
+        value = (workflow.metadata or {}).get("objective_id")
+        return value if isinstance(value, str) and value else None
+
+    def _consent_grants_for(self, workflow: Workflow) -> list[Any]:
+        objective_id = self.objective_id_for_workflow(workflow)
+        if not objective_id or self._consent_store is None:
+            return []
+        try:
+            return self._consent_store.list_active(objective_id=objective_id)
+        except Exception:
+            # A consent store that cannot be read authorizes nothing.
+            return []
 
     def workflow_actor_type(self, workflow: Workflow) -> str:
         owner = self._scoped_agents.load_agent(workflow.owner_agent_id or "")
@@ -211,12 +238,15 @@ class CapabilityGate:
             ),
             workflow_id=workflow.workflow_id,
             task_id=task.task_id,
+            objective_id=self.objective_id_for_workflow(workflow),
         )
         decision = self._policy_engine.evaluate(
             request,
             metadata,
             config_schema=capability.get("config_schema", {}),
             approval_request=self._approval_store.approval_for_request(request, metadata),
+            consent_grants=self._consent_grants_for(workflow),
+            now=self._clock.now(),
         ).to_dict()
         audit_path = self.policy_audit_path(workflow, task, attempt_id)
         self.write_policy_audit(
@@ -242,6 +272,7 @@ class CapabilityGate:
             metadata={"mode": request.invocation_mode},
         )
         if decision["allowed"]:
+            grant_id = decision.get("metadata", {}).get("consent_grant_id")
             self._timeline.emit(
                 event_type="capability_allowed",
                 actor_id=request.actor_id,
@@ -254,8 +285,22 @@ class CapabilityGate:
                 task_id=task.task_id,
                 audit_id=audit_id,
                 record_path=str(audit_path),
-                metadata={"reason": decision["reason"]},
+                metadata={
+                    "reason": decision["reason"],
+                    "consent_grant_id": grant_id,
+                    "objective_id": request.objective_id,
+                },
             )
+            if grant_id and self._consent_store is not None:
+                # Count the unattended execution against the grant that allowed
+                # it. This is the accountability metric: what MR1 did without
+                # asking, and under whose authority.
+                self._consent_store.record_use(
+                    grant_id,
+                    workflow_id=workflow.workflow_id,
+                    task_id=task.task_id,
+                    audit_id=audit_id,
+                )
         return request, metadata, decision, audit_path
 
     def policy_block_result_payload(

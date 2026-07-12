@@ -1,7 +1,7 @@
 {
   "category": "observability",
   "description": "An unsupported operational command should record an informative override cause",
-  "elapsed_s": 702.3,
+  "elapsed_s": 36.77,
   "findings": [],
   "scenario": "obs_override_on_pause_agent_command",
   "session_error": null,

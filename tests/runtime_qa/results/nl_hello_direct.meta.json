@@ -1,7 +1,7 @@
 {
   "category": "routing",
   "description": "Trivial conversation should route to direct_answer",
-  "elapsed_s": 4.4,
+  "elapsed_s": 4.03,
   "findings": [],
   "scenario": "nl_hello_direct",
   "session_error": null,

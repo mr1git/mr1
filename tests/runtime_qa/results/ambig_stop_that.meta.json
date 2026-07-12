@@ -1,7 +1,7 @@
 {
   "category": "ambiguity",
   "description": "'stop that' with nothing running must not cascade kills",
-  "elapsed_s": 0.07,
+  "elapsed_s": 0.06,
   "findings": [],
   "scenario": "ambig_stop_that",
   "session_error": null,

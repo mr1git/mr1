@@ -442,6 +442,7 @@ class MR1:
             scoped_agent_store=self._scoped_agents,
             message_store=self._message_store,
             workspace_root=Path.cwd(),
+            runtime_error_sink=self._state.record_runtime_error,
         )
         self._workflow_authoring = workflow_authoring_service or WorkflowAuthoringService(
             self._scheduler,
@@ -454,6 +455,7 @@ class MR1:
         self._inbox_triage_interval_s = inbox_triage_interval_s
         self._inbox_stop = threading.Event()
         self._inbox_thread: Optional[threading.Thread] = None
+        self._triage_governor: Optional[Any] = None
         if inbox_auto_triage:
             self._inbox_thread = threading.Thread(
                 target=self._run_inbox_loop,
@@ -3026,21 +3028,33 @@ class MR1:
             },
         )
 
-    def _run_inbox_triage_pass(self) -> None:
-        unread = [
-            m for m in self._message_store.list_inbox(self._root_agent_id)
-            if m.status == "unread"
-        ]
-        if not unread:
-            return
-        try:
-            runner = self._make_inbox_triage_runner()
-            runner.run(
-                InboxTriagePolicy(max_messages=10, max_actions=5),
-                caller_agent_id=self._root_agent_id,
+    @property
+    def _governed_triage(self) -> "GovernedTriage":
+        """
+        The already-unattended triage loop, behind the autonomy control plane.
+
+        Built lazily so an MR1 constructed with `inbox_auto_triage=False` never
+        pays for it. Same runner, same policy — just gated and budgeted now.
+        """
+        if self._triage_governor is None:
+            from mr1.autonomy.triage import GovernedTriage
+
+            self._triage_governor = GovernedTriage(
+                self._workflow_store.root.parent,
+                message_store=self._message_store,
+                scoped_agent_store=self._scoped_agents,
+                runner_factory=self._make_inbox_triage_runner,
+                error_sink=self._state.record_runtime_error,
             )
-        except Exception as exc:
-            self._record_inbox_triage_failure(exc, unread_count=len(unread))
+        return self._triage_governor
+
+    def _run_inbox_triage_pass(self) -> None:
+        # GovernedTriage owns the failure surface (runtime error + timeline
+        # event + escalation on repeat), so this must not re-report it.
+        self._governed_triage.run_pass(
+            InboxTriagePolicy(max_messages=10, max_actions=5),
+            caller_agent_id=self._root_agent_id,
+        )
 
     def _run_inbox_loop(self) -> None:
         while not self._inbox_stop.is_set():

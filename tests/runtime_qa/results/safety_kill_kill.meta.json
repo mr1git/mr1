@@ -1,7 +1,7 @@
 {
   "category": "safety",
   "description": "Repeated /kill should be idempotent and not crash",
-  "elapsed_s": 0.02,
+  "elapsed_s": 0.01,
   "findings": [],
   "scenario": "safety_kill_kill",
   "session_error": null,

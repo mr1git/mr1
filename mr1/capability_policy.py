@@ -7,10 +7,11 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.clock import Clock, default_clock, parse_iso
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.scoped_agents import MAX_AUTONOMOUS_CLEARANCE, PersistentAgentStore
@@ -19,6 +20,10 @@ from mr1.workflow_store import WorkflowStore
 
 POLICY_ID = "capability-policy-v1"
 POLICY_VERSION = 1
+
+# A pending approval nobody answers must not park forever: unattended work that
+# waits on a human needs a deadline at which it escalates instead of stalling.
+DEFAULT_APPROVAL_TTL_S = 86_400.0
 
 _ALLOWED_DECISION_STATUSES = frozenset({"allowed", "denied", "requires_approval"})
 _ALLOWED_FINAL_EFFECTS = frozenset({"executed", "blocked", "skipped"})
@@ -189,6 +194,10 @@ class CapabilityRequest:
     step_id: Optional[str] = None
     workflow_id: Optional[str] = None
     task_id: Optional[str] = None
+    # The mission this invocation belongs to, when it belongs to one. Carried
+    # into the audit record so every autonomous side effect is attributable,
+    # and used to decide which consent grants may even be considered.
+    objective_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.actor_type not in _ALLOWED_ACTOR_TYPES:
@@ -212,6 +221,7 @@ class CapabilityRequest:
             "step_id": self.step_id,
             "workflow_id": self.workflow_id,
             "task_id": self.task_id,
+            "objective_id": self.objective_id,
         }
 
     @classmethod
@@ -227,6 +237,7 @@ class CapabilityRequest:
             step_id=data.get("step_id"),
             workflow_id=data.get("workflow_id"),
             task_id=data.get("task_id"),
+            objective_id=data.get("objective_id"),
         )
 
 
@@ -285,13 +296,30 @@ class CapabilityApprovalRequest:
     used_by_audit_id: Optional[str] = None
     requested_scope_path: Optional[str] = None
     created_at: str = field(default_factory=_now_iso)
+    expires_at: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.status not in _ALLOWED_APPROVAL_STATUSES:
             raise ValueError(f"invalid approval request status '{self.status}'")
 
+    def is_expired(self, now: datetime) -> bool:
+        """
+        Has this request outlived its wall-clock TTL?
+
+        Only meaningful while `pending` — a decided approval is not subject to
+        expiry, and an approval with no `expires_at` never expires on its own
+        (it is still expired eagerly when its workflow is cancelled).
+        """
+        if self.status != "pending":
+            return False
+        deadline = parse_iso(self.expires_at)
+        if deadline is None:
+            return False
+        return now >= deadline
+
     def to_dict(self) -> dict[str, Any]:
         return {
+            "expires_at": self.expires_at,
             "approval_request_id": self.approval_request_id,
             "requesting_actor_id": self.requesting_actor_id,
             "capability_name": self.capability_name,
@@ -343,6 +371,7 @@ class CapabilityApprovalRequest:
             used_by_audit_id=data.get("used_by_audit_id"),
             requested_scope_path=data.get("requested_scope_path"),
             created_at=data.get("created_at", _now_iso()),
+            expires_at=data.get("expires_at"),
         )
 
 
@@ -913,10 +942,77 @@ def approval_request_id_for(
 
 
 class CapabilityApprovalStore:
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        clock: Optional[Clock] = None,
+        default_ttl_s: Optional[float] = DEFAULT_APPROVAL_TTL_S,
+    ):
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._event_log = EventLog(self._root.parent / "events")
+        self._clock = clock or default_clock()
+        self._default_ttl_s = default_ttl_s
+
+    @property
+    def clock(self) -> Clock:
+        return self._clock
+
+    @property
+    def default_ttl_s(self) -> Optional[float]:
+        return self._default_ttl_s
+
+    def expiry_for_now(self) -> Optional[str]:
+        """The `expires_at` a request routed right now would carry."""
+        if self._default_ttl_s is None:
+            return None
+        return (self._clock.now() + timedelta(seconds=self._default_ttl_s)).isoformat()
+
+    def expire_stale_requests(self) -> list[str]:
+        """
+        Expire every pending request past its wall-clock TTL.
+
+        Fail-closed by construction: expiry only ever *removes* authority. The
+        blocked task stays BLOCKED — nothing here retries or unblocks anything.
+        The supervisor's SWEEP calls this, then escalates the owning objective.
+        """
+        now = self._clock.now()
+        expired_ids: list[str] = []
+        for approval in self.list_requests():
+            if not approval.is_expired(now):
+                continue
+            self._mark_expired(approval, reason="ttl_expired")
+            expired_ids.append(approval.approval_request_id)
+        return expired_ids
+
+    def _mark_expired(self, approval: CapabilityApprovalRequest, *, reason: str) -> Path:
+        updated = CapabilityApprovalRequest.from_dict({
+            **approval.to_dict(),
+            "status": "expired",
+        })
+        path = self.save(updated)
+        self._event_log.emit(
+            event_type="approval_expired",
+            actor_id=approval.requesting_actor_id,
+            actor_type=approval.original_request.actor_type,
+            target_id=approval.approval_request_id,
+            target_type="approval_request",
+            status="expired",
+            summary=f"approval expired: {approval.capability_name}",
+            workflow_id=approval.workflow_id,
+            task_id=approval.task_id,
+            step_id=approval.original_step_id,
+            approval_request_id=approval.approval_request_id,
+            record_path=str(path),
+            metadata={
+                "capability_name": approval.capability_name,
+                "reason": reason,
+                "expires_at": approval.expires_at,
+                "created_at": approval.created_at,
+            },
+        )
+        return path
 
     def approval_path(self, approval_request_id: str) -> Path:
         return self._root / f"{approval_request_id}.json"
@@ -1094,29 +1190,7 @@ class CapabilityApprovalStore:
         for approval in self.list_requests():
             if approval.workflow_id != workflow_id or approval.status != "pending":
                 continue
-            updated = CapabilityApprovalRequest.from_dict({
-                **approval.to_dict(),
-                "status": "expired",
-            })
-            path = self.save(updated)
-            self._event_log.emit(
-                event_type="approval_expired",
-                actor_id=approval.requesting_actor_id,
-                actor_type=approval.original_request.actor_type,
-                target_id=approval.approval_request_id,
-                target_type="approval_request",
-                status="expired",
-                summary=f"approval expired: {approval.capability_name}",
-                workflow_id=approval.workflow_id,
-                task_id=approval.task_id,
-                step_id=approval.original_step_id,
-                approval_request_id=approval.approval_request_id,
-                record_path=str(path),
-                metadata={
-                    "capability_name": approval.capability_name,
-                    "reason": reason,
-                },
-            )
+            self._mark_expired(approval, reason=reason)
             expired_ids.append(approval.approval_request_id)
         return expired_ids
 
@@ -1176,12 +1250,20 @@ class PolicyEngine:
         *,
         config_schema: Optional[dict[str, Any]] = None,
         approval_request: Optional[CapabilityApprovalRequest] = None,
+        consent_grants: Optional[list[Any]] = None,
+        now: Optional[datetime] = None,
     ) -> CapabilityDecision:
         schema = dict(config_schema or {})
         approved_override = self._approved_override_matches(
             approval_request,
             request=request,
             metadata=metadata,
+        )
+        consent_grant = self._consent_grant_match(
+            consent_grants,
+            request=request,
+            metadata=metadata,
+            now=now,
         )
         missing_field = self._missing_required_arg(request.args, schema)
         if missing_field is not None:
@@ -1225,7 +1307,11 @@ class PolicyEngine:
             thresholds[request.invocation_mode],
             float(request.actor_clearance),
         )
-        if metadata.risk_score > max_risk and not approved_override:
+        if (
+            metadata.risk_score > max_risk
+            and not approved_override
+            and consent_grant is None
+        ):
             return self._decision(
                 allowed=False,
                 status="requires_approval",
@@ -1243,7 +1329,18 @@ class PolicyEngine:
                     risk_score=metadata.risk_score,
                     metadata_payload={"approval_request_id": approval_request.approval_request_id},
                 )
+            if (
+                consent_grant is not None
+                and scope_decision.status == "requires_approval"
+                and scope_decision.reason == "outside_actor_scope"
+            ):
+                # Sound only because the grant already proved every path
+                # argument lies inside the roots the human granted; a grant can
+                # never widen its own scope.
+                return self._consent_decision(consent_grant, metadata)
             return scope_decision
+        if consent_grant is not None:
+            return self._consent_decision(consent_grant, metadata)
         return self._decision(
             allowed=True,
             status="allowed",
@@ -1255,6 +1352,57 @@ class PolicyEngine:
                 None
             ),
         )
+
+    def _consent_decision(
+        self,
+        grant: Any,
+        metadata: CapabilityMetadata,
+    ) -> CapabilityDecision:
+        return self._decision(
+            allowed=True,
+            status="allowed",
+            reason="consent_grant",
+            risk_score=metadata.risk_score,
+            metadata_payload={
+                "consent_grant_id": grant.grant_id,
+                "grantee_id": grant.grantee_id,
+                "grant_max_risk": float(grant.max_risk),
+                "grant_expires_at": grant.expires_at,
+            },
+        )
+
+    def _consent_grant_match(
+        self,
+        consent_grants: Optional[list[Any]],
+        *,
+        request: CapabilityRequest,
+        metadata: CapabilityMetadata,
+        now: Optional[datetime] = None,
+    ) -> Optional[Any]:
+        """
+        The second override path.
+
+        Deliberately *not* folded into `_approved_override_matches`: a one-off
+        approval keyed to a single invocation is the right semantic for a human
+        saying "yes, this once", and it stays exactly as it was. A grant is a
+        different thing — standing, predicate-matched, revocable — and it
+        carries its own matching rules (see `autonomy/consent.py`).
+        """
+        if not consent_grants:
+            return None
+        if request.invocation_mode != "workflow":
+            # Standing consent authorizes governed workflow execution only.
+            # A direct, unattributable invocation never rides an objective grant.
+            return None
+        evaluated_at = now or datetime.now(timezone.utc)
+        for grant in consent_grants:
+            try:
+                if grant.matches(request, metadata, now=evaluated_at):
+                    return grant
+            except Exception:
+                # A grant that cannot evaluate itself authorizes nothing.
+                continue
+        return None
 
     def _approved_override_matches(
         self,
@@ -1488,6 +1636,15 @@ def maybe_route_approval_request(
                 scoped_agent_store=scoped_agent_store,
             ),
         })
+    # Every routing — first request or re-open after a supersede/expiry — starts
+    # a fresh wall-clock deadline. Without one, unattended blocked work parks a
+    # pending approval forever with nobody watching. Both timestamps come from
+    # the store's clock so the TTL comparison is against a single time source.
+    approval = CapabilityApprovalRequest.from_dict({
+        **approval.to_dict(),
+        "created_at": approval_store.clock.now_iso(),
+        "expires_at": approval_store.expiry_for_now(),
+    })
     path = approval_store.save(approval)
     approval_store._event_log.emit(
         event_type="approval_requested",

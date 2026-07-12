@@ -1,7 +1,7 @@
 {
   "category": "workflow",
   "description": "Submit a workflow spec with valid JSON but missing 'tasks' \u2014 must return spec validation error",
-  "elapsed_s": 469.29,
+  "elapsed_s": 28.66,
   "findings": [],
   "scenario": "wf_submit_invalid_spec",
   "session_error": null,

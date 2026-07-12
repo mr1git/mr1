@@ -1,7 +1,7 @@
 {
   "category": "state",
   "description": "Empty inbox/outbox should report consistently",
-  "elapsed_s": 0.01,
+  "elapsed_s": 0.02,
   "findings": [],
   "scenario": "state_inbox_outbox_consistency",
   "session_error": null,

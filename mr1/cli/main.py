@@ -11,6 +11,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Optional
 
+from mr1.autonomy.objectives import KIND_ONCE, KIND_RECURRING, KIND_STANDING
 from mr1.event_log import bind_correlation_id, cli_correlation_id
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
@@ -87,6 +88,29 @@ from mr1.cli.memory import (
     _cmd_snapshot_create,
     _cmd_snapshot_inspect,
     _cmd_snapshot_list,
+)
+from mr1.cli.consent import (
+    _cmd_grant_create,
+    _cmd_grant_list,
+    _cmd_grant_revoke,
+    _cmd_grant_show,
+)
+from mr1.cli.objectives import (
+    _cmd_objective_abandon,
+    _cmd_objective_create,
+    _cmd_objective_list,
+    _cmd_objective_pause,
+    _cmd_objective_resume,
+    _cmd_objective_run,
+    _cmd_objective_show,
+)
+from mr1.cli.service import (
+    _cmd_halt,
+    _cmd_pause,
+    _cmd_resume,
+    _cmd_serve,
+    _cmd_status,
+    _cmd_stop,
 )
 from mr1.cli.messages import (
     _cmd_inbox,
@@ -626,6 +650,185 @@ def _build_parser() -> argparse.ArgumentParser:
     p_insert_workflow.add_argument("path")
     p_insert_workflow.set_defaults(func=_cmd_insert_workflow)
 
+    # -- Autonomy: service + control plane ---------------------------------
+
+    p_serve = subs.add_parser(
+        "serve",
+        help="Run the headless supervisor: keeps the scheduler alive without a REPL.",
+    )
+    p_serve.add_argument("--tick-interval-s", type=float, default=None, dest="tick_interval_s")
+    p_serve.add_argument("--workspace-root", type=Path, default=None, dest="workspace_root")
+    p_serve.add_argument(
+        "--max-concurrent-workflows",
+        type=int,
+        default=None,
+        dest="max_concurrent_workflows",
+    )
+    p_serve.add_argument("--max-plans-per-hour", type=int, default=None, dest="max_plans_per_hour")
+    p_serve.add_argument(
+        "--max-workflows-per-objective-per-day",
+        type=int,
+        default=None,
+        dest="max_workflows_per_objective_per_day",
+    )
+    p_serve.add_argument(
+        "--no-planner",
+        action="store_true",
+        dest="no_planner",
+        help="Drain workflows only; do not plan objectives (no brain calls at all).",
+    )
+    p_serve.add_argument(
+        "--triage",
+        action="store_true",
+        dest="triage",
+        help="Also run governed inbox triage while serving headless.",
+    )
+    p_serve.set_defaults(func=_cmd_serve)
+
+    p_pause = subs.add_parser("pause", help="Stop creating new autonomous work; keep draining.")
+    p_pause.add_argument("--reason", default=None)
+    p_pause.add_argument("--json", action="store_true", dest="json")
+    p_pause.set_defaults(func=_cmd_pause)
+
+    p_resume = subs.add_parser("resume", help="Allow planning again.")
+    p_resume.add_argument("--reason", default=None)
+    p_resume.add_argument("--json", action="store_true", dest="json")
+    p_resume.set_defaults(func=_cmd_resume)
+
+    p_stop = subs.add_parser("stop", help="Graceful stop: drain in-flight work, then exit.")
+    p_stop.add_argument("--reason", default=None)
+    p_stop.add_argument("--json", action="store_true", dest="json")
+    p_stop.set_defaults(func=_cmd_stop)
+
+    p_halt = subs.add_parser(
+        "halt",
+        help="Emergency stop: cancel running work, revoke every consent grant, pause objectives, exit.",
+    )
+    p_halt.add_argument("--reason", default=None)
+    p_halt.add_argument("--json", action="store_true", dest="json")
+    p_halt.set_defaults(func=_cmd_halt)
+
+    p_status = subs.add_parser("status", help="Show supervisor mode, heartbeat, health, and budgets.")
+    p_status.add_argument("--json", action="store_true", dest="json")
+    p_status.set_defaults(func=_cmd_status)
+
+    # -- Autonomy: objective-scoped consent grants -------------------------
+
+    p_grant = subs.add_parser("grant", help="Manage objective-scoped consent grants.")
+    grant_subs = p_grant.add_subparsers(dest="grant_command", required=True)
+
+    p_grant_create = grant_subs.add_parser(
+        "create",
+        help="Grant one objective standing authority to use one capability.",
+    )
+    p_grant_create.add_argument("--objective", required=True, help="Objective the grant authorizes.")
+    p_grant_create.add_argument("--capability", required=True, help="Capability name, e.g. shell_command.")
+    p_grant_create.add_argument(
+        "--scope",
+        action="append",
+        required=True,
+        help="Scope root the grant is bound to (repeatable).",
+    )
+    p_grant_create.add_argument(
+        "--allow",
+        default=None,
+        help="Regex the primary argument must match (argv for shell_command, else path).",
+    )
+    p_grant_create.add_argument(
+        "--predicate",
+        default=None,
+        help='Full JSON arg predicate, e.g. \'{"argv": {"prefix": "pytest"}}\'.',
+    )
+    p_grant_create.add_argument("--max-risk", type=float, default=1.0, dest="max_risk")
+    p_grant_create.add_argument("--ttl", required=True, help="Required TTL: 7d, 12h, 90m, 3600.")
+    p_grant_create.add_argument("--reason", default=None)
+    p_grant_create.add_argument("--json", action="store_true", dest="json")
+    p_grant_create.set_defaults(func=_cmd_grant_create)
+
+    p_grant_list = grant_subs.add_parser("list", help="List consent grants.")
+    p_grant_list.add_argument("--objective", default=None)
+    p_grant_list.add_argument("--active", action="store_true", help="Only unexpired, unrevoked grants.")
+    p_grant_list.add_argument("--json", action="store_true", dest="json")
+    p_grant_list.set_defaults(func=_cmd_grant_list)
+
+    p_grant_show = grant_subs.add_parser("show", help="Show one consent grant.")
+    p_grant_show.add_argument("grant_id")
+    p_grant_show.add_argument("--json", action="store_true", dest="json")
+    p_grant_show.set_defaults(func=_cmd_grant_show)
+
+    p_grant_revoke = grant_subs.add_parser("revoke", help="Revoke one grant, or all of them.")
+    p_grant_revoke.add_argument("grant_id", nargs="?", default=None)
+    p_grant_revoke.add_argument("--all", action="store_true")
+    p_grant_revoke.add_argument("--objective", default=None, help="With --all: limit to one objective.")
+    p_grant_revoke.add_argument("--reason", default=None)
+    p_grant_revoke.add_argument("--json", action="store_true", dest="json")
+    p_grant_revoke.set_defaults(func=_cmd_grant_revoke)
+
+    # -- Autonomy: objectives ----------------------------------------------
+
+    p_objective = subs.add_parser("objective", help="Manage long-lived autonomous objectives.")
+    objective_subs = p_objective.add_subparsers(dest="objective_command", required=True)
+
+    p_objective_create = objective_subs.add_parser("create", help="Create an objective.")
+    p_objective_create.add_argument("statement", help="What MR1 should achieve, in plain language.")
+    p_objective_create.add_argument("--title", default=None)
+    p_objective_create.add_argument(
+        "--kind",
+        choices=[KIND_ONCE, KIND_RECURRING, KIND_STANDING],
+        default=KIND_ONCE,
+    )
+    p_objective_create.add_argument("--every", default=None, help="Recurring interval: 7d, 12h, 30m.")
+    p_objective_create.add_argument("--trigger", default=None, help="Full JSON trigger spec.")
+    p_objective_create.add_argument("--owner", default=None, help="Owner agent id (default: root).")
+    p_objective_create.add_argument("--fallback", default=None, help="Fallback statement if the plan keeps failing.")
+    p_objective_create.add_argument(
+        "--idempotent",
+        action="store_true",
+        help="This mission's work is safe to re-run (required for safe transient retries).",
+    )
+    p_objective_create.add_argument("--max-retries", type=int, default=None, dest="max_retries")
+    p_objective_create.add_argument("--max-replans", type=int, default=None, dest="max_replans")
+    p_objective_create.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=None,
+        dest="max_consecutive_failures",
+    )
+    p_objective_create.add_argument("--json", action="store_true", dest="json")
+    p_objective_create.set_defaults(func=_cmd_objective_create)
+
+    p_objective_list = objective_subs.add_parser("list", help="List objectives.")
+    p_objective_list.add_argument("--status", default=None)
+    p_objective_list.add_argument("--json", action="store_true", dest="json")
+    p_objective_list.set_defaults(func=_cmd_objective_list)
+
+    p_objective_show = objective_subs.add_parser("show", help="Show one objective and its history.")
+    p_objective_show.add_argument("objective_id")
+    p_objective_show.add_argument("--json", action="store_true", dest="json")
+    p_objective_show.set_defaults(func=_cmd_objective_show)
+
+    p_objective_pause = objective_subs.add_parser("pause", help="Pause one objective.")
+    p_objective_pause.add_argument("objective_id")
+    p_objective_pause.add_argument("--reason", default=None)
+    p_objective_pause.set_defaults(func=_cmd_objective_pause)
+
+    p_objective_resume = objective_subs.add_parser(
+        "resume",
+        help="Resume one objective and reset its failure counters.",
+    )
+    p_objective_resume.add_argument("objective_id")
+    p_objective_resume.add_argument("--reason", default=None)
+    p_objective_resume.set_defaults(func=_cmd_objective_resume)
+
+    p_objective_abandon = objective_subs.add_parser("abandon", help="Abandon one objective for good.")
+    p_objective_abandon.add_argument("objective_id")
+    p_objective_abandon.add_argument("--reason", default=None)
+    p_objective_abandon.set_defaults(func=_cmd_objective_abandon)
+
+    p_objective_run = objective_subs.add_parser("run", help="Queue one objective for the next tick.")
+    p_objective_run.add_argument("objective_id")
+    p_objective_run.set_defaults(func=_cmd_objective_run)
+
     p_replace_workflow = subs.add_parser("replace-workflow", help="Replace one task in a workflow.")
     p_replace_workflow.add_argument("-r", "--rerun", action="store_true")
     p_replace_workflow.add_argument("workflow_id")
@@ -664,6 +867,8 @@ def main(
             getattr(args, "snapshot_command", None),
             getattr(args, "timeline_command", None),
             getattr(args, "approvals_command", None),
+            getattr(args, "grant_command", None),
+            getattr(args, "objective_command", None),
             getattr(args, "capability_audit_command", None),
             getattr(args, "memory_command", None),
             getattr(args, "memory_feedback_command", None),

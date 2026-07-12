@@ -1,7 +1,7 @@
 {
   "category": "safety",
   "description": "Very long NL input \u2014 does runtime truncate / refuse / crash?",
-  "elapsed_s": 20.78,
+  "elapsed_s": 23.13,
   "findings": [],
   "scenario": "safety_giant_input",
   "session_error": null,
