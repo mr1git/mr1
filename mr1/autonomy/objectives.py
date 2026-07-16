@@ -32,6 +32,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mr1.autonomy.recovery import FailurePolicy, RecoveryState
+from mr1.autonomy.triggers import (
+    TriggerDecision,
+    TriggerError,
+    evaluate_recurrence,
+    validate_trigger,
+)
 from mr1.clock import Clock, default_clock, parse_iso
 
 
@@ -147,6 +153,13 @@ class Objective:
     last_completed_at: Optional[str] = None
     next_attempt_at: Optional[str] = None
     use_fallback_next: bool = False
+    # B2. Recurrence state, persisted so it survives restart. `next_due_at` is
+    # when this objective is next scheduled to fire; `catch_up_remaining` is the
+    # bounded backlog of missed runs still owed after downtime — the counter
+    # that stops a week-long outage from firing a week of workflows at once.
+    next_due_at: Optional[str] = None
+    catch_up_remaining: int = 0
+    last_fired_at: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.kind not in OBJECTIVE_KINDS:
@@ -235,6 +248,9 @@ class Objective:
             "last_completed_at": self.last_completed_at,
             "next_attempt_at": self.next_attempt_at,
             "use_fallback_next": bool(self.use_fallback_next),
+            "next_due_at": self.next_due_at,
+            "catch_up_remaining": int(self.catch_up_remaining),
+            "last_fired_at": self.last_fired_at,
         }
 
     @classmethod
@@ -272,6 +288,9 @@ class Objective:
             last_completed_at=data.get("last_completed_at"),
             next_attempt_at=data.get("next_attempt_at"),
             use_fallback_next=bool(data.get("use_fallback_next", False)),
+            next_due_at=data.get("next_due_at"),
+            catch_up_remaining=int(data.get("catch_up_remaining", 0)),
+            last_fired_at=data.get("last_fired_at"),
         )
 
 
@@ -320,13 +339,16 @@ class ObjectiveStore:
         objective_id: Optional[str] = None,
     ) -> Objective:
         now = self._clock.now_iso()
+        # Reject an unschedulable trigger here, where a human is watching, rather
+        # than on the first tick of an unattended supervisor at 3am.
+        resolved_trigger = validate_trigger(dict(trigger or _default_trigger(kind)))
         objective = Objective(
             objective_id=objective_id or new_objective_id(),
             title=title or statement[:60],
             statement=statement,
             owner_agent_id=owner_agent_id,
             kind=kind,
-            trigger=dict(trigger or _default_trigger(kind)),
+            trigger=resolved_trigger,
             failure_policy=(failure_policy or FailurePolicy()).validate(),
             consent_grant_ids=list(consent_grant_ids or []),
             fallback_statement=fallback_statement,
@@ -450,45 +472,72 @@ def _default_trigger(kind: str) -> dict[str, Any]:
     return {"type": "immediate"}
 
 
-def trigger_is_ready(
+def recurrence_anchor(objective: Objective) -> Optional[datetime]:
+    """
+    When this objective's recurrence last fired.
+
+    `last_fired_at` is written the moment the supervisor decides to plan, which
+    is what makes a recurrence idempotent across a restart: an objective that
+    fired at 09:00 and crashed at 09:01 does not fire again at 09:02, because
+    the fire is recorded when it happens, not when it finishes.
+
+    Objectives created before B2 have no `last_fired_at`, so fall back to the
+    Phase-A anchors. Completion is preferred over planning: an interval means
+    "this long after the last run finished".
+    """
+    return (
+        parse_iso(objective.last_fired_at)
+        or parse_iso(objective.last_completed_at)
+        or parse_iso(objective.last_planned_at)
+    )
+
+
+def evaluate_trigger(
     objective: Objective,
     *,
     now: datetime,
     watcher_registry: Any = None,
-) -> tuple[bool, str]:
+) -> TriggerDecision:
     """
-    Should this objective produce work right now?
+    Should this objective produce work right now, and what carries forward?
 
     Deterministic and brain-free — this runs on every tick, so it may never
     cost a token. Watcher-backed triggers reuse `WatcherRegistry` rather than
-    inventing a second trigger engine.
+    inventing a second trigger engine; recurrence (interval, cron, and the
+    missed-run policy) lives in `mr1.autonomy.triggers`.
     """
     trigger = dict(objective.trigger or {})
     kind = trigger.get("type")
 
     if kind == "manual":
-        return False, "manual trigger: waiting for `mr1 objective run`"
+        return TriggerDecision(
+            ready=False,
+            reason="manual trigger: waiting for `mr1 objective run`",
+        )
 
     if kind == "immediate":
         if objective.last_completed_at and objective.kind == KIND_ONCE:
-            return False, "already completed"
-        return True, "immediate"
+            return TriggerDecision(ready=False, reason="already completed")
+        return TriggerDecision(ready=True, reason="immediate")
 
-    if kind == "interval":
-        interval_s = float(trigger.get("interval_s") or 0)
-        if interval_s <= 0:
-            return False, "interval trigger has no positive interval_s"
-        anchor = parse_iso(objective.last_completed_at) or parse_iso(objective.last_planned_at)
-        if anchor is None:
-            return True, "interval: never run"
-        due_at = anchor + timedelta(seconds=interval_s)
-        if now >= due_at:
-            return True, f"interval: due at {due_at.isoformat()}"
-        return False, f"interval: next run at {due_at.isoformat()}"
+    if kind in {"interval", "cron"}:
+        try:
+            return evaluate_recurrence(
+                trigger,
+                anchor=recurrence_anchor(objective),
+                now=now,
+                catch_up_remaining=objective.catch_up_remaining,
+            )
+        except TriggerError as exc:
+            # Fail closed: an unschedulable trigger creates no work.
+            return TriggerDecision(ready=False, reason=f"invalid trigger: {exc}")
 
     if kind == "watcher":
         if watcher_registry is None:
-            return False, "watcher trigger requires a watcher registry"
+            return TriggerDecision(
+                ready=False,
+                reason="watcher trigger requires a watcher registry",
+            )
         from mr1.workflow_models import Task, TaskStatus
 
         probe = Task(
@@ -506,12 +555,30 @@ def trigger_is_ready(
         try:
             evaluation = watcher_registry.evaluate(probe, now)
         except Exception as exc:
-            return False, f"watcher trigger error: {exc}"
+            return TriggerDecision(ready=False, reason=f"watcher trigger error: {exc}")
         if evaluation.state == "satisfied":
-            return True, f"watcher satisfied: {evaluation.message}"
-        return False, f"watcher {evaluation.state}: {evaluation.message}"
+            return TriggerDecision(ready=True, reason=f"watcher satisfied: {evaluation.message}")
+        return TriggerDecision(
+            ready=False,
+            reason=f"watcher {evaluation.state}: {evaluation.message}",
+        )
 
-    return False, f"unknown trigger type '{kind}'"
+    return TriggerDecision(ready=False, reason=f"unknown trigger type '{kind}'")
+
+
+def trigger_is_ready(
+    objective: Objective,
+    *,
+    now: datetime,
+    watcher_registry: Any = None,
+) -> tuple[bool, str]:
+    """The Phase-A boolean view of `evaluate_trigger`, for callers that only ask."""
+    decision = evaluate_trigger(
+        objective,
+        now=now,
+        watcher_registry=watcher_registry,
+    )
+    return decision.ready, decision.reason
 
 
 class _FileLock:

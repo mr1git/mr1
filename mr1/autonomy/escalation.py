@@ -30,6 +30,7 @@ from mr1.autonomy.objectives import (
     Objective,
     ObjectiveStore,
 )
+from mr1.autonomy.notify import Notification
 from mr1.clock import Clock, default_clock
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
@@ -141,6 +142,7 @@ class Escalator:
         scoped_agent_store: PersistentAgentStore,
         clock: Optional[Clock] = None,
         event_log: Optional[EventLog] = None,
+        notifier: Optional[Any] = None,
     ):
         self._runtime_root = Path(runtime_root)
         self._objectives = objective_store
@@ -148,6 +150,10 @@ class Escalator:
         self._scoped_agents = scoped_agent_store
         self._clock = clock or default_clock()
         self._event_log = event_log or EventLog(self._runtime_root / "events")
+        # B6. A transport-neutral seam, and nothing more. The inbox and the
+        # timeline above are the delivery of record; this is a copy sent
+        # somewhere Marwan might actually be looking.
+        self._notifier = notifier
 
     def escalate(
         self,
@@ -214,6 +220,14 @@ class Escalator:
             status=target_status,
             at=self._clock.now_iso(),
         )
+
+        if not already_raised:
+            # Last, and separately. The inbox message, the timeline event, and
+            # the objective's parked state are all written whatever this does —
+            # a notification that cannot be delivered must cost an *alert*, never
+            # an escalation.
+            self._notify(escalation, workflow_id)
+
         self._objectives.update(
             objective.objective_id,
             status=target_status,
@@ -225,6 +239,25 @@ class Escalator:
         return escalation
 
     # -- internals -----------------------------------------------------
+
+    def _notify(self, escalation: Escalation, workflow_id: Optional[str]) -> None:
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.notify(Notification(
+                escalation_id=escalation.escalation_id,
+                objective_id=escalation.objective_id,
+                reason=escalation.reason,
+                summary=escalation.summary,
+                body=escalation.body,
+                at=escalation.at,
+                workflow_id=workflow_id,
+                message_id=escalation.message_id,
+            ))
+        except Exception:  # noqa: BLE001 - `Notifier.notify` does not raise, but a
+            # custom sink wired in by a future adapter might. The escalation is
+            # already durable; nothing here is allowed to unwind it.
+            pass
 
     def _escalation_id(self, objective_id: str, reason: str, problem: str) -> str:
         raw = f"{objective_id}|{reason}|{problem[:200]}"

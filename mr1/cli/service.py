@@ -16,7 +16,10 @@ from mr1.autonomy.control import (
     ServiceLockError,
 )
 from mr1.autonomy.health import heartbeat_age_s, read_health
+from mr1.autonomy.ownership import ROLE_SERVICE, ExecutionOwnership
 from mr1.autonomy.service import Supervisor, SupervisorConfig
+from mr1.autonomy.notify import Notifier, build_sinks
+from mr1.autonomy.status import collect_status
 from mr1.clock import default_clock
 
 
@@ -35,6 +38,11 @@ def _config_from_args(args) -> SupervisorConfig:
         "max_concurrent_workflows",
         "max_plans_per_hour",
         "max_workflows_per_objective_per_day",
+        "max_actions_per_hour",
+        "min_disk_free_bytes",
+        "max_consecutive_supervisor_errors",
+        "max_consecutive_scheduler_errors",
+        "retention_interval_s",
     ):
         value = getattr(args, attr, None)
         if value is not None:
@@ -59,6 +67,15 @@ def _build_planner(scoped_agent_store):
 
 def _cmd_serve(args, store, caller_agent_id, scoped_agent_store) -> int:
     runtime_root = _runtime_root(store)
+    holder = ExecutionOwnership(runtime_root).current_owner()
+    if holder is not None:
+        # Not fatal: the supervisor still observes, sweeps, plans, and submits.
+        # It simply will not execute while another process holds the root, and
+        # it takes over automatically the moment that process leaves.
+        print(
+            f"[mr1] warning: execution authority is held by pid {holder.pid} "
+            f"({holder.role}) — this supervisor will not launch tasks until it exits"
+        )
     supervisor = Supervisor(
         runtime_root,
         config=_config_from_args(args),
@@ -71,6 +88,11 @@ def _cmd_serve(args, store, caller_agent_id, scoped_agent_store) -> int:
             _build_planner(scoped_agent_store)
         ),
         enable_triage=bool(getattr(args, "triage", False)),
+        execution_ownership=ExecutionOwnership(runtime_root, role=ROLE_SERVICE),
+        notifier=Notifier(
+            runtime_root,
+            sinks=build_sinks(getattr(args, "notify", None) or [], runtime_root),
+        ),
     )
     print(f"[mr1] supervisor serving runtime_root={runtime_root}")
     print(
@@ -195,102 +217,115 @@ def _cmd_halt(args, store, caller_agent_id, scoped_agent_store) -> int:
     return 0
 
 
-def status_payload(runtime_root: Path) -> dict[str, Any]:
-    clock = default_clock()
-    state = ControlPlane(runtime_root).read()
-    health = read_health(runtime_root)
-    lock = ServiceLock(runtime_root)
-    age = heartbeat_age_s(health, clock=clock)
-    payload: dict[str, Any] = {
-        "mode": state.mode,
-        "reason": state.reason,
-        "supervisor_running": lock.is_held_by_live_process(),
-        "supervisor_pid": lock.read_pid(),
-        "heartbeat_at": (health or {}).get("supervisor_heartbeat_at"),
-        "heartbeat_age_s": round(age, 1) if age is not None else None,
-        "health": (health or {}).get("doctor_status", "unknown"),
-        "gauges": dict((health or {}).get("gauges") or {}),
-        "objectives": {},
-        "active_grants": 0,
-        "budget": {},
-    }
-    payload.update(_autonomy_status(runtime_root, clock))
-    return payload
-
-
-def _autonomy_status(runtime_root: Path, clock) -> dict[str, Any]:
-    """Objective/grant/budget rollups. A4/A5 surfaces."""
-    extra: dict[str, Any] = {}
-    try:
-        from mr1.autonomy.objectives import ObjectiveStore
-
-        by_status: dict[str, int] = {}
-        for objective in ObjectiveStore(runtime_root, clock=clock).list_objectives():
-            by_status[objective.status] = by_status.get(objective.status, 0) + 1
-        extra["objectives"] = by_status
-    except ImportError:  # pragma: no cover - objectives land in A5
-        pass
-    try:
-        from mr1.autonomy.consent import ConsentGrantStore
-
-        extra["active_grants"] = len(ConsentGrantStore(runtime_root, clock=clock).list_active())
-    except ImportError:  # pragma: no cover - consent lands in A4
-        pass
-    try:
-        from mr1.autonomy.budget import BudgetLedger
-
-        extra["budget"] = BudgetLedger(runtime_root, clock=clock).snapshot()
-    except ImportError:  # pragma: no cover - budgets land in A5
-        pass
-    return extra
-
-
 def _cmd_status(args, store, caller_agent_id, scoped_agent_store) -> int:
-    payload = status_payload(_runtime_root(store))
-    if getattr(args, "json", False):
-        _print_json(payload)
-        return 0
+    """
+    The operator's one command. Human-readable by default, JSON on demand, and
+    an exit code either way so automation can branch without parsing anything:
+    0 = ok, 1 = warning, 2 = error.
+    """
+    runtime_root = _runtime_root(store)
+    report = collect_status(runtime_root)
 
-    gauges = payload["gauges"]
-    print(f"mode:              {payload['mode']}" + (f"  ({payload['reason']})" if payload["reason"] else ""))
+    if getattr(args, "json", False):
+        _print_json(report.to_dict())
+        return report.exit_code
+
+    _render_status(report)
+    return report.exit_code
+
+
+_HEALTH_MARK = {"ok": "ok", "warning": "WARNING", "error": "ERROR"}
+
+
+def _render_status(report) -> None:
+    service = report.service
+    print(f"health:            {_HEALTH_MARK.get(report.health, report.health).upper()}")
+    print(
+        f"mode:              {service['mode']}"
+        + (f"  ({service['reason']})" if service.get("reason") else "")
+    )
     print(
         "supervisor:        "
         + (
-            f"running (pid {payload['supervisor_pid']})"
-            if payload["supervisor_running"] else
+            f"running (pid {service['supervisor_pid']})"
+            if service["supervisor_running"] else
             "not running"
         )
     )
-    age = payload["heartbeat_age_s"]
-    if age is None:
-        print("heartbeat:         none")
-    else:
-        stale = age > 3 * SupervisorConfig().tick_interval_s
-        print(f"heartbeat:         {age:.0f}s ago" + ("  [STALE]" if stale else ""))
-    print(f"health:            {payload['health']}")
-    print(f"active workflows:  {gauges.get('active_workflows', 0)}")
-    oldest = gauges.get("oldest_pending_approval_age_s")
+    owner = service.get("execution_owner")
     print(
-        "oldest approval:   "
-        + (f"{float(oldest):.0f}s" if oldest is not None else "none pending")
-    )
-    print(f"consent grants:    {payload['active_grants']} active")
-    objectives = payload["objectives"]
-    print(
-        "objectives:        "
+        "execution:         "
         + (
-            ", ".join(f"{name}={count}" for name, count in sorted(objectives.items()))
-            if objectives else
-            "none"
+            f"owned by pid {owner['pid']} ({owner['role']})"
+            if owner else
+            "unowned — no process is advancing workflows"
         )
     )
-    budget = payload["budget"]
-    if budget:
+    age = service.get("heartbeat_age_s")
+    print("heartbeat:         " + (f"{age:.0f}s ago" if age is not None else "none"))
+
+    objectives = report.objectives
+    if not objectives.get("error"):
         print(
-            f"budget:            plans {budget.get('plans_this_hour', 0)}/{budget.get('max_plans_per_hour', 0)}"
-            f" this hour, actions {budget.get('actions_this_hour', 0)}/{budget.get('max_actions_per_hour', 0)}"
+            "objectives:        "
+            f"{objectives.get('active', 0)} active, "
+            f"{objectives.get('executing', 0)} executing, "
+            f"{objectives.get('waiting_human', 0)} waiting-human, "
+            f"{objectives.get('quarantined', 0)} quarantined, "
+            f"{objectives.get('paused', 0)} paused"
         )
-    errors = gauges.get("scheduler_tick_errors", 0)
-    if errors:
-        print(f"scheduler errors:  {errors}  (last: {gauges.get('scheduler_last_tick_error')})")
-    return 0
+        for item in objectives.get("next_due", [])[:3]:
+            print(f"  next due:        {item['next_due_at']}  {item['title'][:40]}")
+
+    workflows = report.workflows
+    if not workflows.get("error"):
+        print(
+            f"workflows:         {workflows.get('active', 0)} active, "
+            f"{len(workflows.get('blocked_tasks', []))} blocked task(s)"
+        )
+
+    approvals = report.approvals
+    if not approvals.get("error"):
+        oldest = approvals.get("oldest_pending")
+        print(
+            f"approvals:         {approvals.get('pending', 0)} pending"
+            + (
+                f"  (oldest {approvals['oldest_pending_age_s'] / 60:.0f}m: "
+                f"{oldest['capability']}, expires {oldest['expires_at']})"
+                if oldest else ""
+            )
+        )
+
+    grants = report.grants
+    if not grants.get("error"):
+        print(
+            f"consent grants:    {grants.get('active', 0)} active, "
+            f"{grants.get('expiring_soon', 0)} expiring soon"
+        )
+
+    budgets = report.budgets
+    if not budgets.get("error"):
+        print(
+            f"budgets:           plans {budgets.get('plans_this_hour', 0)}/"
+            f"{budgets.get('max_plans_per_hour', 0)} this hour, "
+            f"actions {budgets.get('actions_this_hour', 0)}/"
+            f"{budgets.get('max_actions_per_hour', 0)}"
+        )
+
+    storage = report.storage
+    events = storage.get("events") or {}
+    print(
+        f"storage:           events {int(events.get('live_bytes', 0)) / 1024**2:.1f} MiB live, "
+        f"{int(storage.get('archive_bytes', 0)) / 1024**2:.1f} MiB archived; "
+        f"disk free {int(storage.get('disk_free_bytes', 0)) / 1024**3:.1f} GiB"
+        + ("  [rotation due]" if storage.get("rotation_due") else "")
+    )
+
+    if report.findings:
+        print()
+        for finding in report.findings:
+            print(f"[{finding.level.upper()}] {finding.detail}")
+            if finding.action:
+                print(f"         -> {finding.action}")
+    else:
+        print("\nnothing needs you.")

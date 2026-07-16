@@ -1,7 +1,7 @@
 {
   "category": "ambiguity",
   "description": "'make another' with no prior agent should clarify",
-  "elapsed_s": 5.15,
+  "elapsed_s": 4.01,
   "findings": [],
   "scenario": "ambig_make_another",
   "session_error": null,

@@ -118,7 +118,10 @@ from mr1.orchestrator.root import (
 
 
 def main():
-    mr1 = MR1()
+    # The interactive process shares its runtime root with any `mr1 serve`
+    # that happens to be running, so it must ask for execution authority
+    # rather than assume it (B8).
+    mr1 = MR1(enforce_execution_ownership=True)
     mr1.run()
 
 

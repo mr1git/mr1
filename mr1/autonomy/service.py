@@ -24,7 +24,7 @@ import json
 import signal
 import threading
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +36,13 @@ from mr1.autonomy.control import (
     ControlPlane,
     ControlState,
     ServiceLock,
+)
+from mr1.autonomy.backpressure import (
+    HEALTH_DEGRADED,
+    BackpressureLimits,
+    BackpressureReporter,
+    RuntimePressure,
+    evaluate_backpressure,
 )
 from mr1.autonomy.budget import BudgetLedger, BudgetLimits
 from mr1.autonomy.consent import ConsentGrantStore
@@ -66,8 +73,12 @@ from mr1.autonomy.objectives import (
     Attempt,
     Objective,
     ObjectiveStore,
-    trigger_is_ready,
+    evaluate_trigger,
 )
+from mr1.autonomy.triggers import TriggerDecision
+from mr1.autonomy.notify import Notifier
+from mr1.autonomy.ownership import ExecutionOwnership
+from mr1.autonomy.retention import RetentionManager, RetentionPolicy
 from mr1.autonomy.planner import (
     AmbiguousObjective,
     Planner,
@@ -112,6 +123,16 @@ class SupervisorConfig:
     stuck_workflow_after_s: float = 86_400.0
     approval_ttl_s: float = 86_400.0
     tick_event_interval: int = 60
+    # B4. Planning stops while there is still room to drain, persist, and
+    # archive — not at the point where a write would fail.
+    min_disk_free_bytes: int = 512 * 1024 * 1024
+    max_consecutive_supervisor_errors: int = 3
+    max_consecutive_scheduler_errors: int = 5
+    # B1. Retention runs on its own slow cadence inside the supervisor. It is a
+    # deterministic filesystem sweep — no brain, no network — and it archives
+    # rather than deletes, so running it unattended is safe. 0 disables it and
+    # leaves retention entirely to `mr1 maintenance run`.
+    retention_interval_s: float = 21_600.0  # 6h
 
     def validate(self) -> "SupervisorConfig":
         if self.tick_interval_s <= 0:
@@ -158,6 +179,10 @@ class Supervisor:
         triage: Optional[Any] = None,
         triage_policy: Optional[Any] = None,
         enable_triage: bool = False,
+        execution_ownership: Optional[ExecutionOwnership] = None,
+        retention: Optional[RetentionManager] = None,
+        retention_policy: Optional[RetentionPolicy] = None,
+        notifier: Optional[Notifier] = None,
     ):
         self._runtime_root = Path(runtime_root)
         self._runtime_root.mkdir(parents=True, exist_ok=True)
@@ -206,12 +231,18 @@ class Supervisor:
                 ),
             ),
         )
+        self._notifier = notifier or Notifier(
+            self._runtime_root,
+            clock=self._clock,
+            event_log=self._timeline,
+        )
         self._escalator = escalator or Escalator(
             self._runtime_root,
             objective_store=self._objectives,
             message_store=self._message_store,
             scoped_agent_store=self._scoped_agents,
             clock=self._clock,
+            notifier=self._notifier,
         )
         self._planner = planner
         self._watchers = default_watcher_registry()
@@ -224,6 +255,22 @@ class Supervisor:
             max_actions=5,
         )
 
+        self._backpressure_limits = BackpressureLimits(
+            max_concurrent_workflows=self._config.max_concurrent_workflows,
+            min_disk_free_bytes=self._config.min_disk_free_bytes,
+            max_consecutive_supervisor_errors=self._config.max_consecutive_supervisor_errors,
+            max_consecutive_scheduler_errors=self._config.max_consecutive_scheduler_errors,
+        ).validate()
+        self._backpressure = BackpressureReporter(emit=self._emit_backpressure)
+
+        self._ownership = execution_ownership
+        self._retention = retention or RetentionManager(
+            self._runtime_root,
+            policy=retention_policy,
+            clock=self._clock,
+            event_log=self._timeline,
+        )
+        self._last_retention_at: Optional[float] = None
         self._scheduler = scheduler or Scheduler(
             self._store,
             runner or KaziAsyncRunner(self._store),
@@ -237,6 +284,7 @@ class Supervisor:
             clock=self._clock,
             runtime_error_sink=self._record_runtime_error,
             consent_store=self._consent,
+            execution_ownership=self._ownership,
         )
 
         self._stop_event = threading.Event()
@@ -332,6 +380,7 @@ class Supervisor:
         """
         lock = ServiceLock(self._runtime_root)
         self._pid = lock.acquire()
+        self._claim_execution_authority()
         if install_signal_handlers:
             self._install_signal_handlers()
         state = self._control.read()
@@ -355,6 +404,41 @@ class Supervisor:
             lock.release()
         return 0
 
+    def _claim_execution_authority(self) -> None:
+        """
+        B8. The service is the execution authority for its runtime root.
+
+        `ServiceLock` already stops a second supervisor. This stops everything
+        *else* — an open REPL, a ticking CLI — from launching the same task.
+        Claiming it here rather than lazily in the scheduler means a supervisor
+        that starts while a REPL holds the root is visible at startup instead of
+        silently idling.
+        """
+        if self._ownership is None:
+            return
+        if self._ownership.acquire():
+            self._emit(
+                "execution_ownership_acquired",
+                status="ok",
+                summary=f"execution authority acquired by {self._ownership.role}",
+                metadata=self._ownership.describe(),
+            )
+            return
+        owner = self._ownership.current_owner()
+        self._emit(
+            "execution_ownership_delegated",
+            status="warning",
+            summary=(
+                "another process holds execution authority for this runtime root"
+                + (f" (pid {owner.pid}, {owner.role})" if owner else "")
+            ),
+            metadata=self._ownership.describe(),
+        )
+
+    @property
+    def execution_ownership(self) -> Optional[ExecutionOwnership]:
+        return self._ownership
+
     def request_shutdown(self, reason: str = "signal") -> None:
         """Ask the loop to leave after the current tick. Signal-handler safe."""
         self._exit_requested = True
@@ -363,6 +447,8 @@ class Supervisor:
 
     def shutdown(self, *, cancel_running: bool = False) -> None:
         self._scheduler.shutdown(cancel_running=cancel_running)
+        if self._ownership is not None:
+            self._ownership.release()
         self._emit(
             "supervisor_stopped",
             status="stopped",
@@ -406,6 +492,7 @@ class Supervisor:
             if gate == "exit":
                 return outcome
             self._sweep(state, outcome)                  # 3. SWEEP
+            self._maybe_run_retention(outcome)           # 3b. RETENTION (B1)
             self._reconcile(state, outcome)              # 4. RECONCILE (6. RECOVER)
             if gate == "planning":
                 self._plan_phase(state, outcome)         # 5. PLAN
@@ -456,6 +543,20 @@ class Supervisor:
             },
         )
 
+    def _emit_backpressure(
+        self,
+        event_type: str,
+        *,
+        status: str,
+        summary: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        self._emit(event_type, status=status, summary=summary, metadata=metadata)
+
+    @property
+    def backpressure(self) -> BackpressureReporter:
+        return self._backpressure
+
     # -- 1. OBSERVE ----------------------------------------------------
 
     def _observe(self) -> ControlState:
@@ -486,12 +587,31 @@ class Supervisor:
         if state.mode == MODE_PAUSED:
             return "draining"
 
-        if self._health.refresh_doctor() == "error":
+        # B4. Every reason to stop creating work, evaluated together, so an
+        # operator with two problems is told about two problems.
+        signals = evaluate_backpressure(
+            RuntimePressure(
+                active_workflows=self._active_workflow_count(),
+                disk_free_bytes=disk_free_bytes(self._runtime_root),
+                consecutive_supervisor_errors=self._consecutive_tick_errors,
+                consecutive_scheduler_errors=int(
+                    self._scheduler.metrics().get("consecutive_tick_errors", 0) or 0
+                ),
+                health_status=self._health.refresh_doctor(),
+            ),
+            self._backpressure_limits,
+        )
+        self._backpressure.observe(signals)
+
+        if any(signal.code == HEALTH_DEGRADED for signal in signals):
             self._on_health_error(state)
             return "draining"
         self._health_error_escalated = False
 
-        if self._active_workflow_count() >= self._config.max_concurrent_workflows:
+        if signals:
+            # Draining, not stopping: in-flight work still runs to completion,
+            # the scheduler still ticks, retention still reclaims disk. MR1 has
+            # only stopped digging.
             return "draining"
 
         return "planning"
@@ -533,6 +653,39 @@ class Supervisor:
     def sweep(self, state: ControlState) -> None:
         """Extension point for additional time-based lifecycle."""
         return None
+
+    # -- 3b. RETENTION (B1) --------------------------------------------
+
+    def _maybe_run_retention(self, outcome: dict[str, Any]) -> None:
+        """
+        Reclaim disk on a slow cadence.
+
+        Deliberately *not* behind the planning gate: retention creates no work
+        and spends no authority, so a paused or draining supervisor should still
+        keep the disk from filling. It only archives — nothing is deleted unless
+        an operator configured `purge_archives_after_days` — so an unattended run
+        is recoverable by construction. And it never calls the brain.
+        """
+        interval = self._config.retention_interval_s
+        if interval <= 0 or self._retention is None:
+            return
+        now = self._clock.monotonic()
+        if self._last_retention_at is not None and (now - self._last_retention_at) < interval:
+            return
+        self._last_retention_at = now
+        try:
+            report = self._retention.run()
+        except Exception as exc:  # noqa: BLE001 - retention must never kill the loop
+            self._record_runtime_error("supervisor_retention", f"{type(exc).__name__}: {exc}")
+            return
+        if report.changed:
+            outcome["retention"] = report.summary()
+        for error in report.errors:
+            self._record_runtime_error("supervisor_retention", error)
+
+    @property
+    def retention(self) -> RetentionManager:
+        return self._retention
 
     def _escalate_expired_approval(
         self,
@@ -848,19 +1001,64 @@ class Supervisor:
                 # No spec to replay: fall through and plan afresh.
 
             elif objective.status == STATUS_ACTIVE:
-                ready, why = trigger_is_ready(
+                decision = evaluate_trigger(
                     objective,
                     now=now,
                     watcher_registry=self._watchers,
                 )
-                if not ready:
+                if not decision.ready:
+                    # A trigger that is not ready can still have moved: `skip`
+                    # realigns past a backlog it will never run. Persist that,
+                    # or the same backlog is rediscovered on every tick.
+                    self._record_trigger_state(objective, decision, fired=False)
                     continue
-                outcome.setdefault("trigger", why)
+                outcome.setdefault("trigger", decision.reason)
+                if decision.missed:
+                    outcome["missed_runs"] = decision.missed
+                # Record the fire *before* planning. A crash between deciding to
+                # fire and finishing the plan must not fire the same occurrence
+                # again on restart — at-most-once beats at-least-once for
+                # anything holding standing consent.
+                self._record_trigger_state(objective, decision, fired=True, now=now)
+                objective = self._objectives.require(objective.objective_id)
             else:
                 continue
 
             if self._plan_objective(objective, outcome):
                 in_flight += 1
+
+    def _record_trigger_state(
+        self,
+        objective: Objective,
+        decision: TriggerDecision,
+        *,
+        fired: bool,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """
+        Persist where the recurrence stands. This is what survives a restart.
+
+        Deriving the next due time from the last *completion* — as Phase A did —
+        loses the distinction between "never ran" and "ran, and we crashed before
+        it finished". Writing `last_fired_at` at the moment of firing closes that
+        window: a restarted supervisor sees the occurrence as spent.
+        """
+        changes: dict[str, Any] = {}
+        if decision.next_due_at != objective.next_due_at:
+            changes["next_due_at"] = decision.next_due_at
+        if decision.catch_up_remaining != objective.catch_up_remaining:
+            changes["catch_up_remaining"] = decision.catch_up_remaining
+        if fired:
+            changes["last_fired_at"] = (now or self._clock.now()).isoformat()
+        if not changes:
+            return
+        try:
+            self._objectives.update(objective.objective_id, **changes)
+        except Exception as exc:  # noqa: BLE001 - never let bookkeeping kill the tick
+            self._record_runtime_error(
+                "supervisor_trigger",
+                f"could not persist trigger state for {objective.objective_id}: {exc}",
+            )
 
     def _resubmit(self, objective: Objective, outcome: dict[str, Any]) -> bool:
         """Retry: the same work, again, without asking the brain anything."""
@@ -1279,6 +1477,10 @@ class Supervisor:
             "unattended_executions": self._consent.unattended_executions(),
             "plans_this_hour": budget["plans_this_hour"],
             "actions_this_hour": budget["actions_this_hour"],
+            "execution_owned": scheduler_metrics["execution_owned"],
+            "scheduler_delegated_ticks": scheduler_metrics["delegated_ticks"],
+            "backpressure": sorted(self._backpressure.active_codes),
+            "scheduler_consecutive_tick_errors": scheduler_metrics["consecutive_tick_errors"],
             **self.metrics(),
         }
         gauges.update(self.extra_gauges())
@@ -1303,6 +1505,10 @@ class Supervisor:
     @property
     def escalator(self) -> Escalator:
         return self._escalator
+
+    @property
+    def notifier(self) -> Notifier:
+        return self._notifier
 
     @property
     def triage(self) -> Optional[GovernedTriage]:

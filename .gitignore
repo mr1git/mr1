@@ -19,3 +19,6 @@ mr1/tasks/
 *.log
 *.jsonl
 
+# Soak/QA run artifacts (generated runtime state, not source)
+/soak-runs/
+

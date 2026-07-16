@@ -1,7 +1,7 @@
 {
   "category": "delegation",
   "description": "Recursive: 'create an agent that creates more agents' \u2014 should not infinite-loop",
-  "elapsed_s": 28.68,
+  "elapsed_s": 22.99,
   "findings": [],
   "scenario": "deleg_recursive_request",
   "session_error": null,

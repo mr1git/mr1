@@ -447,6 +447,14 @@ class TestBoundedCache:
         assert len(log._cache.events) == 20
 
     def test_rebuild_applies_bound(self, tmp_path, monkeypatch):
+        """
+        The rebuild bounds *memory*. It must not bound *history*.
+
+        This test used to assert `list_events()` returned only the cached
+        window — which is the B1 defect written down as an expectation: past
+        the limit, every history query silently answered with the tail. The
+        memory bound is still real, and is now asserted where it lives.
+        """
         small_limit = 8
         monkeypatch.setattr("mr1.event_log._MAX_CACHE_EVENTS", small_limit)
         # Write events without cache (directly to file via a temporary log).
@@ -455,8 +463,17 @@ class TestBoundedCache:
 
         # Fresh log instance triggers a rebuild.
         log_b = EventLog(tmp_path / "events")
+
+        window = log_b.recent_events()
+        assert len(window) == small_limit, "the cache is still bounded"
+        assert window == list(log_b._cache.events), "recent_events() is the cached window, by name"
+        assert log_b.cache_is_complete is False, "and it knows it is not all of history"
+
         events = log_b.list_events()
-        assert len(events) == small_limit
+        assert len(events) == small_limit + 4, (
+            "list_events() is a full-history query and must never silently truncate"
+        )
+        assert [event.event_index for event in events] == list(range(1, small_limit + 5))
 
     def test_file_always_has_full_history(self, tmp_path, monkeypatch):
         small_limit = 5

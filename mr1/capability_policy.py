@@ -948,12 +948,20 @@ class CapabilityApprovalStore:
         *,
         clock: Optional[Clock] = None,
         default_ttl_s: Optional[float] = DEFAULT_APPROVAL_TTL_S,
+        workflow_store: Optional[WorkflowStore] = None,
     ):
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._event_log = EventLog(self._root.parent / "events")
         self._clock = clock or default_clock()
         self._default_ttl_s = default_ttl_s
+        # B7. The approval-resume mutation window is already correct with a
+        # fresh store — `locked()` is an fcntl.flock on a path, so a new
+        # instance still excludes every other process. Sharing the caller's
+        # instance buys reentrancy: `locked()` counts depth per instance, so a
+        # future caller that decides an approval from *inside* a store lock
+        # nests instead of deadlocking against its own flock on a second fd.
+        self._workflow_store = workflow_store
 
     @property
     def clock(self) -> Clock:
@@ -1195,6 +1203,17 @@ class CapabilityApprovalStore:
         return expired_ids
 
     def _resume_blocked_workflow_task(self, approval: CapabilityApprovalRequest) -> None:
+        """
+        Reopen the task an approval just unblocked.
+
+        The whole load → inspect → mutate → save → emit sequence runs inside
+        `store.locked()`, and the workflow is loaded *after* the lock is taken,
+        never before. That ordering is the invariant: an approval decision and
+        a scheduler tick both reload under the same cross-process flock, so
+        neither can write back a view of the workflow the other has already
+        superseded. Reading `approval` — a separate, already-persisted record —
+        outside the lock is safe; the workflow is not read outside it.
+        """
         if not approval.workflow_id or not approval.task_id:
             return
         from mr1.scheduler_core.dependencies import status_for_reset
@@ -1202,7 +1221,7 @@ class CapabilityApprovalStore:
         from mr1.workflow_events import WorkflowEventLog
         from mr1.workflow_models import TaskStatus, WorkflowStatus
 
-        store = WorkflowStore(self._root.parent / "workflows")
+        store = self._workflow_store or WorkflowStore(self._root.parent / "workflows")
         with store.locked():
             workflow = store.load_workflow(approval.workflow_id)
             if workflow is None or workflow.status is WorkflowStatus.CANCELLED:

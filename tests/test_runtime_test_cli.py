@@ -64,7 +64,9 @@ def test_natural_language_input_uses_real_step_path(tmp_path, monkeypatch):
     assert rc == 0
     assert calls == [("create a test agent", True)]
     assert payload["dispatch"]["step_called"] is True
-    assert payload["response_text"] == "Clarify the exact action you want me to take."
+    assert payload["response_text"] == (
+        "I want to make sure I do the right thing here — what exactly do you want me to act on?"
+    )
     assert payload["timeline"]["events"][-1]["event_type"] == "runtime_turn_decided"
     assert payload["turn_artifacts"][-1]["routing_decision"]["final_action"] == "ask_clarification"
 

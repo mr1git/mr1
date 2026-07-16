@@ -72,7 +72,9 @@ from mr1.runtime_observation import (
     invalid_observation_result,
     parse_observation_request,
 )
-from mr1.routing_advisor import RouteAdvice, build_route_advice
+from mr1.routing_advisor import RouteAdvice, RUNTIME_CONTROL_PATTERN, build_route_advice
+from mr1.autonomy.control import ControlPlane, MODE_PAUSED, MODE_RUNNING
+from mr1.autonomy.ownership import ROLE_REPL as OWNERSHIP_ROLE_REPL, ExecutionOwnership
 from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError, rerun_task_on_disk
 from mr1.scoped_agents import (
     AgentScopeError,
@@ -242,6 +244,71 @@ def _has_workflow_pronoun_reference(normalized: str) -> bool:
     return bool(re.search(r"\bit\b", normalized))
 
 
+def _is_runtime_status_survey_request(normalized: str) -> bool:
+    """True for a broad 'what's running right now' style survey — as
+    opposed to a question about one specific, already-referenced workflow
+    or agent, which the pronoun/alias branches above already handle."""
+    if "running" not in normalized:
+        return False
+    return bool(re.search(r"\b(?:what'?s|what\s+is|whats|anything)\b", normalized))
+
+
+_GENERIC_CHILD_TITLE_PATTERN = re.compile(r"^MR\d+$", re.IGNORECASE)
+
+
+def _is_generic_child_title(title: str) -> bool:
+    return bool(_GENERIC_CHILD_TITLE_PATTERN.fullmatch((title or "").strip()))
+
+
+# Mutation words MR1's own direct-answer text must never *claim* without a
+# preceding negation cue ("I did not delete..." is a disclaimer, not a claim).
+# Mirrors `tests.soak.hierarchical.outcomes.response_claims_mutation` so the
+# harness and the runtime agree on what counts as a false claim.
+_MUTATION_CLAIM_PATTERN = re.compile(
+    r"\b(renam(?:ed|ing)|paus(?:ed|ing)|delet(?:ed|ing)|remov(?:ed|ing)|"
+    r"creat(?:ed|ing)|spawn(?:ed|ing)|terminat(?:ed|ing))\b",
+    re.IGNORECASE,
+)
+_MUTATION_NEGATION_CUE_PATTERN = re.compile(
+    r"\b(did not|didn't|does not|doesn't|do not|don't|cannot|can't|"
+    r"was not|wasn't|were not|weren't|has not|hasn't|have not|haven't|"
+    r"will not|won't|never|no|not|without)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
+
+
+def _direct_response_makes_unverified_mutation_claim(text: str) -> bool:
+    if not text:
+        return False
+    for sentence in _SENTENCE_SPLIT_PATTERN.split(text):
+        match = _MUTATION_CLAIM_PATTERN.search(sentence)
+        if not match:
+            continue
+        preceding = sentence[: match.start()]
+        if _MUTATION_NEGATION_CUE_PATTERN.search(preceding):
+            continue  # a disclaimer ("did not ... delete"), not a claim
+        return True
+    return False
+
+
+def _looks_like_unresolved_agent_design(text: str) -> bool:
+    """
+    True when a persistent-agent design response is actually the brain asking
+    for clarification, not a design. The design prompt requires the response
+    to start with ``AGENT_TITLE: <title>``; when it doesn't, this catches the
+    common case where the brain declined because the request was ambiguous
+    (e.g. no domain specified) — so the caller can surface that clarification
+    to the human instead of creating a persistent agent with the question
+    itself standing in as its mission.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    lowered = stripped.casefold()
+    return any(marker in lowered[:200] for marker in _UNRESOLVED_AGENT_DESIGN_MARKERS)
+
+
 # ---------------------------------------------------------------------------
 # Delegation protocol
 # ---------------------------------------------------------------------------
@@ -272,6 +339,19 @@ _PERSISTENT_DELEGATION_MARKERS = (
     "let the agent",
     "child responsible for",
     "agent responsible for",
+)
+
+_UNRESOLVED_AGENT_DESIGN_MARKERS = (
+    "i need clarification",
+    "i'm not sure what",
+    "i am not sure what",
+    "could you clarify",
+    "can you clarify",
+    "please clarify",
+    "please specify",
+    "what domain do you want",
+    "which domain",
+    "what would you like",
 )
 
 _PERSISTENT_CHILD_TITLE_PATTERNS = (
@@ -387,6 +467,7 @@ class MR1:
         workflow_authoring_service: Optional[WorkflowAuthoringService] = None,
         inbox_auto_triage: bool = True,
         inbox_triage_interval_s: float = 30.0,
+        enforce_execution_ownership: bool = False,
     ):
         self._dispatcher = Dispatcher()
         self._logger = Logger()
@@ -433,6 +514,18 @@ class MR1:
             self._workflow_store,
             dispatcher=self._dispatcher,
         )
+        # B8. A REPL opened alongside a running `mr1 serve` shares this runtime
+        # root. Only one of them may drive tasks, so the interactive process
+        # asks for execution authority and defers when the service already has
+        # it — MR1 still submits, inspects, and controls; the service executes.
+        self._execution_ownership = (
+            ExecutionOwnership(
+                self._workflow_store.root.parent,
+                role=OWNERSHIP_ROLE_REPL,
+            )
+            if enforce_execution_ownership else
+            None
+        )
         self._scheduler = Scheduler(
             self._workflow_store,
             runner,
@@ -443,6 +536,7 @@ class MR1:
             message_store=self._message_store,
             workspace_root=Path.cwd(),
             runtime_error_sink=self._state.record_runtime_error,
+            execution_ownership=self._execution_ownership,
         )
         self._workflow_authoring = workflow_authoring_service or WorkflowAuthoringService(
             self._scheduler,
@@ -467,6 +561,25 @@ class MR1:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def execution_authority_banner(self) -> str:
+        """
+        Tell the operator, at startup, who is actually driving workflows.
+
+        A REPL that silently stops executing because a service holds the root
+        looks exactly like a REPL whose scheduler is broken. Say which it is.
+        """
+        ownership = self._execution_ownership
+        if ownership is None:
+            return "Execution: this process (no service running)."
+        if self._scheduler.has_execution_authority():
+            return "Execution: this process owns the runtime root."
+        owner = ownership.current_owner()
+        who = f"pid {owner.pid} ({owner.role})" if owner else "another process"
+        return (
+            f"Execution: delegated to {who}. Workflows you submit are executed "
+            "by the running service; this REPL will not launch tasks itself."
+        )
 
     def start(self) -> None:
         """Prepare MR1 for turn-by-turn Claude session use."""
@@ -1076,10 +1189,10 @@ class MR1:
             ambiguities=[],
         ).get("override_reason")
 
-    @staticmethod
-    def _clarification_message_for_route_advice(route_advice: Optional[RouteAdvice]) -> str:
+    def _clarification_message_for_route_advice(self, route_advice: Optional[RouteAdvice]) -> str:
+        default = "I want to make sure I do the right thing here — what exactly do you want me to act on?"
         if route_advice is None:
-            return "Clarify the exact action you want me to take."
+            return default
         reason = route_advice.reason or ""
         if "conflicting agent lifecycle actions" in reason:
             return (
@@ -1088,7 +1201,24 @@ class MR1:
             )
         if "no pending workflow draft exists" in reason:
             return "No pending workflow draft exists to confirm or cancel."
-        return "Clarify the exact action you want me to take."
+        if "potentially destructive" in reason:
+            agent_count = len([
+                agent
+                for agent in self._scoped_agents.list_visible_agents(self._root_agent_id)
+                if agent.agent_id != self._root_agent_id
+            ])
+            workflow_count = len(self._workflow_store.list_workflows())
+            if agent_count or workflow_count:
+                return (
+                    f"That's {agent_count} agent(s) and {workflow_count} workflow(s) — "
+                    "are you sure you want all of them gone? Tell me what's going on and "
+                    "I'll confirm before doing it."
+                )
+            return (
+                "That's everything — are you sure you want it all gone? Tell me what's "
+                "going on and I'll confirm before doing it."
+            )
+        return default
 
     def _agent_reference_payload(self, agent) -> dict[str, Any]:
         return references.agent_reference_payload(self, agent)
@@ -1185,6 +1315,37 @@ class MR1:
     def _workflow_findings_text(self, workflow_id: str) -> str:
         return inspection.workflow_findings_text(self, workflow_id)
 
+    _ACTIVE_WORKFLOW_STATUSES = {"running", "pending", "blocked"}
+    _ACTIVE_AGENT_RUN_STATUSES = {"working", "running", "waiting", "reporting"}
+
+    def _runtime_activity_summary_text(self, runtime_grounding: dict[str, Any]) -> str:
+        workflows = runtime_grounding.get("workflows") or []
+        agents = runtime_grounding.get("agents") or []
+        active_workflows = [
+            w for w in workflows if str(w.get("status")) in self._ACTIVE_WORKFLOW_STATUSES
+        ]
+        active_agents = [
+            a for a in agents if str(a.get("run_status")) in self._ACTIVE_AGENT_RUN_STATUSES
+        ]
+        if not active_workflows and not active_agents:
+            return "Nothing's running right now — no active workflows or agents."
+        lines: list[str] = []
+        if active_workflows:
+            lines.append("workflows in flight:")
+            lines.extend(
+                f"- {w.get('workflow_id')} ({w.get('title')}): {w.get('status')}"
+                for w in active_workflows
+            )
+        if active_agents:
+            if lines:
+                lines.append("")
+            lines.append("agents active:")
+            lines.extend(
+                f"- {a.get('agent_id')} ({a.get('title')}): {a.get('run_status')}"
+                for a in active_agents
+            )
+        return "\n".join(lines)
+
     def _resolve_route_local_references(
         self,
         user_input: str,
@@ -1212,6 +1373,17 @@ class MR1:
         resolved_references: dict[str, Any],
         ambiguities: list[dict[str, Any]],
     ) -> Optional[str]:
+        normalized_survey = _normalize_routing_text(user_input)
+        if _is_runtime_status_survey_request(normalized_survey):
+            return self._finalize_turn_response(
+                self._runtime_activity_summary_text(runtime_grounding),
+                turn_id=turn_id,
+                route="inspect_existing_state",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
         if not self._is_runtime_inspection_request(user_input, resolved_references):
             return None
         task_ids = self._explicit_task_ids(user_input)
@@ -1697,6 +1869,11 @@ class MR1:
                 if ref.get("kind") == "workflow":
                     workflow_id = ref.get("id")
                     break
+        if workflow_id is None and any(alias in normalized for alias in _WORKFLOW_REFERENCE_ALIASES):
+            workflow_id = (
+                self._state.last_referenced_workflow_id
+                or self._state.last_created_workflow_id
+            )
         if workflow_id is None:
             owned = runtime_grounding.get("workflows", [])
             failed = [w for w in owned if w.get("status") == "failed"]
@@ -1714,7 +1891,7 @@ class MR1:
     ) -> Optional[dict[str, Any]]:
         normalized = _normalize_routing_text(user_input)
         action = None
-        if re.search(r"\b(kill|terminate)\b", normalized):
+        if re.search(r"\b(kill|terminate|stop)\b", normalized):
             action = "terminate"
         elif re.search(r"\bresume\b", normalized):
             action = "resume"
@@ -1733,6 +1910,45 @@ class MR1:
             "action": action,
             "agent_id": agent_payloads[0]["id"],
         }
+
+    def _maybe_execute_rerun_from_state(
+        self,
+        user_input: str,
+        *,
+        turn_id: str,
+        route_advice: RouteAdvice,
+        runtime_grounding: dict[str, Any],
+    ) -> Optional[str]:
+        """The routing advisor treats a bare rerun verb ("rerun that
+        workflow") as too low-confidence to execute on its own — correctly,
+        since it has no way to consult remembered runtime state. Here, with
+        full access to `self._state`, a single credible target (the workflow
+        just created or referenced this conversation) can be resolved safely;
+        genuine ambiguity or no candidate at all still falls through to the
+        normal clarification response."""
+        normalized = _normalize_routing_text(user_input)
+        if not re.search(r"\b(rerun|re-run|retry|restart)\b", normalized):
+            return None
+        resolution = self._resolve_route_local_references(user_input, runtime_grounding)
+        resolved_references = resolution["resolved_references"]
+        ambiguities = resolution["ambiguities"]
+        if ambiguities:
+            return None
+        rerun_intent = self._parse_workflow_rerun_intent(
+            user_input,
+            resolved_references=resolved_references,
+            runtime_grounding=runtime_grounding,
+        )
+        if rerun_intent is None:
+            return None
+        return self._execute_workflow_rerun(
+            rerun_intent["workflow_id"],
+            turn_id=turn_id,
+            route_advice=route_advice,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
 
     def _route_run_commands(
         self,
@@ -1821,25 +2037,20 @@ class MR1:
             runtime_grounding=runtime_grounding,
         )
         if rerun_intent is not None:
-            workflow_id = rerun_intent["workflow_id"]
-            try:
-                wf = self._workflow_store.load_workflow(workflow_id)
-                if wf is None:
-                    raise WorkflowSpecError(f"workflow not found: {workflow_id}")
-                failed_tasks = [t for t in wf.tasks if t.status in ("failed", "blocked")]
-                if not failed_tasks:
-                    raise WorkflowSpecError(f"no failed or blocked tasks in {workflow_id}")
-                rerun_ids = []
-                for task in failed_tasks:
-                    tid = rerun_task_on_disk(self._workflow_store, workflow_id, task.task_id, agent_id=self._root_agent_id)
-                    rerun_ids.append(tid)
-                msg = f"Requeued {len(rerun_ids)} task(s) in {workflow_id}: {', '.join(rerun_ids)}"
-            except WorkflowSpecError as exc:
-                msg = f"rerun failed: {exc}"
-            return self._finalize_turn_response(
-                msg,
+            return self._execute_workflow_rerun(
+                rerun_intent["workflow_id"],
                 turn_id=turn_id,
-                route="run_commands",
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
+            )
+
+        control_action = self._parse_runtime_control_intent(user_input)
+        if control_action is not None:
+            return self._execute_runtime_control(
+                control_action,
+                turn_id=turn_id,
                 route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
@@ -1878,9 +2089,85 @@ class MR1:
                 )
 
         return self._finalize_turn_response(
-            "I need the exact execute-now command details to run this operation safely.",
+            "I'm not sure exactly what you want me to do here — tell me which "
+            "agent, workflow, or action you mean.",
             turn_id=turn_id,
             route="ask_clarification",
+            route_advice=route_advice,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+
+    def _execute_workflow_rerun(
+        self,
+        workflow_id: str,
+        *,
+        turn_id: str,
+        route_advice: RouteAdvice,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> str:
+        try:
+            wf = self._workflow_store.load_workflow(workflow_id)
+            if wf is None:
+                raise WorkflowSpecError(f"workflow not found: {workflow_id}")
+            failed_tasks = [t for t in wf.tasks.values() if t.status in ("failed", "blocked")]
+            if not failed_tasks:
+                raise WorkflowSpecError(f"no failed or blocked tasks in {workflow_id}")
+            rerun_ids = []
+            for task in failed_tasks:
+                tid = rerun_task_on_disk(self._workflow_store, workflow_id, task.task_id, agent_id=self._root_agent_id)
+                rerun_ids.append(tid)
+            msg = f"Requeued {len(rerun_ids)} task(s) in {workflow_id}: {', '.join(rerun_ids)}"
+        except WorkflowSpecError as exc:
+            msg = f"rerun failed: {exc}"
+        return self._finalize_turn_response(
+            msg,
+            turn_id=turn_id,
+            route="run_commands",
+            route_advice=route_advice,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+        )
+
+    def _parse_runtime_control_intent(self, user_input: str) -> Optional[str]:
+        normalized = _normalize_routing_text(user_input)
+        match = RUNTIME_CONTROL_PATTERN.match(normalized)
+        if not match:
+            return None
+        return "resume" if match.group(1).lower() in ("resume", "unpause") else "pause"
+
+    def _execute_runtime_control(
+        self,
+        action: str,
+        *,
+        turn_id: str,
+        route_advice: RouteAdvice,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> str:
+        control = ControlPlane(self._workflow_store.root.parent)
+        if action == "resume":
+            control.set_mode(
+                MODE_RUNNING, reason="resumed via conversation", requested_by=self._root_agent_id,
+            )
+            text = "Resuming — MR1 will pick back up creating new autonomous work."
+        else:
+            control.set_mode(
+                MODE_PAUSED, reason="paused via conversation", requested_by=self._root_agent_id,
+            )
+            text = (
+                "Pausing new autonomous work now. Anything already running will "
+                "keep draining to completion."
+            )
+        return self._finalize_turn_response(
+            text,
+            turn_id=turn_id,
+            route="run_commands",
             route_advice=route_advice,
             runtime_grounding=runtime_grounding,
             resolved_references=resolved_references,
@@ -1896,17 +2183,7 @@ class MR1:
         return response
 
     def _direct_response_claims_unverified_mutation(self, text: str) -> bool:
-        if not text:
-            return False
-        mutation_patterns = (
-            r"\brenam(?:ed|ing)\b",
-            r"\bpaus(?:ed|ing)\b",
-            r"\b(?:is|was)\s+paused\b",
-            r"\bdelet(?:ed|ing)\b",
-            r"\bremov(?:ed|ing)\b",
-            r"\b(?:created|creating|spawned|spawning)\b",
-        )
-        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in mutation_patterns)
+        return _direct_response_makes_unverified_mutation_claim(text)
 
     def _answer_directly_with_grounding(
         self,
@@ -1932,8 +2209,8 @@ class MR1:
                 text, _ = self._parse_response(raw)
                 if self._direct_response_claims_unverified_mutation(text):
                     text = (
-                        "I did not execute any runtime mutation on this turn, so I cannot claim that an agent or workflow "
-                        "was created, renamed, paused, or deleted. Use an explicit operational command instead."
+                        "I haven't actually done that — nothing was created, renamed, paused, "
+                        "or deleted this turn. Tell me exactly what you want me to execute."
                     )
                 return {
                     "text": text,
@@ -2002,6 +2279,7 @@ class MR1:
                 "Design the persistent agent requested below.",
                 "First line of your response must be exactly: AGENT_TITLE: <title>",
                 "Choose a purpose-driven title that reflects the agent's responsibility (e.g. Genesis, Sentinel, Auditor).",
+                "Do not use a generic MR2/MR3-style label as the title unless the user explicitly requested that exact name.",
                 "Then write the complete mission: what the agent owns, how it operates, its scope, escalation rules, and first actions.",
             ]),
             f"User request:\n{user_input}",
@@ -2022,9 +2300,29 @@ class MR1:
         explicit_title = self._extract_explicit_requested_child_title(user_input)
 
         first_line = (design_text or "").split("\n")[0].strip()
+        if not first_line.upper().startswith("AGENT_TITLE:") and _looks_like_unresolved_agent_design(design_text):
+            # The brain declined to design (asked a clarifying question instead
+            # of following the required AGENT_TITLE: format) — surface that to
+            # the human rather than creating a persistent agent whose mission
+            # would be the unresolved question itself.
+            return {
+                "text": (design_text or "").strip()
+                or "I need more detail before creating this agent — what should it own?",
+                "brain_prompt": design_prompt,
+                "brain_response": raw,
+            }
         if first_line.upper().startswith("AGENT_TITLE:"):
             designed_title = first_line.split(":", 1)[1].strip()
-            agent_title = explicit_title or designed_title or self._extract_requested_child_title(user_input)
+            if explicit_title:
+                agent_title = explicit_title
+            elif designed_title and not _is_generic_child_title(designed_title):
+                agent_title = designed_title
+            else:
+                # The brain fell back to a generic MR<N>-style label without
+                # being asked to — that is not "a concise title derived from
+                # the responsibility", so prefer the same non-generic default
+                # rotation used when nothing else names the agent at all.
+                agent_title = self._extract_requested_child_title(user_input)
             mission_body = (design_text[len(first_line):]).strip()
         else:
             agent_title = explicit_title or self._extract_requested_child_title(user_input)
@@ -2182,25 +2480,19 @@ class MR1:
             normalized = item.upper()
             if normalized != "MR1":
                 return normalized
-        normalized = _normalize_routing_text(user_input)
-        if any(
-            marker in normalized
-            for marker in (
-                "unique special name",
-                "special name",
-                "unique name",
-                "memorable name",
-                "easily referencable",
-                "easily referenceable",
-            )
-        ):
-            existing_titles = {
-                agent.title.lower()
-                for agent in self._scoped_agents.list_visible_agents(self._root_agent_id)
-            }
-            for candidate in _DEFAULT_PERSISTENT_CHILD_TITLES:
-                if candidate.lower() not in existing_titles:
-                    return candidate
+        # No explicit name was given anywhere in the request: prefer a
+        # concise, non-generic title over the numbered "MR2" default so an
+        # unnamed ownership request doesn't read as a command-parser artifact.
+        return self._default_child_title()
+
+    def _default_child_title(self) -> str:
+        existing_titles = {
+            agent.title.lower()
+            for agent in self._scoped_agents.list_visible_agents(self._root_agent_id)
+        }
+        for candidate in _DEFAULT_PERSISTENT_CHILD_TITLES:
+            if candidate.lower() not in existing_titles:
+                return candidate
         return "MR2"
 
     def _extract_explicit_requested_child_title(self, user_input: str) -> Optional[str]:
@@ -2545,6 +2837,14 @@ class MR1:
         ambiguities: list[dict[str, Any]] = []
 
         if route_advice.route == "ask_clarification":
+            rerun_override = self._maybe_execute_rerun_from_state(
+                user_input,
+                turn_id=turn_id,
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+            )
+            if rerun_override is not None:
+                return rerun_override
             return self._finalize_turn_response(
                 self._clarification_message_for_route_advice(route_advice),
                 turn_id=turn_id,
@@ -3117,6 +3417,7 @@ class MR1:
 
         print("MR1 Orchestrator v0.2")
         print(f"Session: {self._state.session_id}")
+        print(self.execution_authority_banner())
         print("Type /help for commands, 'exit' or Ctrl+C to quit.\n")
 
         def shutdown(killed_by: str = "user") -> None:

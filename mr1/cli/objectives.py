@@ -15,6 +15,7 @@ from mr1.autonomy.objectives import (
     ObjectiveStore,
 )
 from mr1.autonomy.recovery import FailurePolicy
+from mr1.autonomy.triggers import MISSED_RUN_POLICIES, TriggerError
 from mr1.cli.consent import parse_duration
 from mr1.clock import default_clock
 
@@ -40,6 +41,8 @@ def _cmd_objective_create(args, store, caller_agent_id, scoped_agent_store) -> i
         if not isinstance(trigger, dict) or not trigger.get("type"):
             print("error: --trigger must be a JSON object with a 'type'")
             return 1
+    elif getattr(args, "cron", None):
+        trigger = {"type": "cron", "expression": args.cron}
     elif getattr(args, "every", None):
         try:
             trigger = {"type": "interval", "interval_s": parse_duration(args.every)}
@@ -50,6 +53,18 @@ def _cmd_objective_create(args, store, caller_agent_id, scoped_agent_store) -> i
         trigger = {"type": "immediate"}
     else:
         trigger = {"type": "interval", "interval_s": 7 * 86_400.0}
+
+    # Recurrence options apply to interval and cron alike; a timezone only means
+    # anything for a calendar.
+    if trigger.get("type") in {"interval", "cron"}:
+        policy = getattr(args, "missed_run_policy", None)
+        if policy:
+            trigger["missed_run_policy"] = policy
+        catch_up = getattr(args, "max_catch_up_runs", None)
+        if catch_up is not None:
+            trigger["max_catch_up_runs"] = catch_up
+    if trigger.get("type") == "cron":
+        trigger.setdefault("timezone", getattr(args, "timezone", None) or "UTC")
 
     policy_overrides = {}
     for name in ("max_retries", "max_replans", "max_consecutive_failures"):
@@ -68,7 +83,8 @@ def _cmd_objective_create(args, store, caller_agent_id, scoped_agent_store) -> i
             fallback_statement=getattr(args, "fallback", None),
             idempotent=bool(getattr(args, "idempotent", False)),
         )
-    except ObjectiveError as exc:
+    except (ObjectiveError, TriggerError) as exc:
+        # A bad cron expression is an operator typo, not a crash.
         print(f"error: {exc}")
         return 1
 
@@ -124,6 +140,12 @@ def _cmd_objective_show(args, store, caller_agent_id, scoped_agent_store) -> int
     print(f"kind:        {objective.kind}")
     print(f"status:      {objective.status}" + (f"  ({objective.status_reason})" if objective.status_reason else ""))
     print(f"trigger:     {json.dumps(objective.trigger, sort_keys=True)}")
+    if objective.next_due_at:
+        print(f"next due:    {objective.next_due_at}")
+    if objective.last_fired_at:
+        print(f"last fired:  {objective.last_fired_at}")
+    if objective.catch_up_remaining:
+        print(f"catch-up:    {objective.catch_up_remaining} make-up run(s) still owed")
     print(f"workflow:    {objective.current_workflow_id or '-'}")
     print(f"idempotent:  {objective.idempotent}")
     print(

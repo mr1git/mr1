@@ -837,11 +837,18 @@ class Scheduler:
         clock: Optional[Clock] = None,
         runtime_error_sink: Optional[Any] = None,
         consent_store: Optional[Any] = None,
+        execution_ownership: Optional[Any] = None,
     ):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
         self._clock = clock or default_clock()
         self._runtime_error_sink = runtime_error_sink
+        # B8. None means "this scheduler is unconditionally the executor" — the
+        # embedded/library shape, and every test's shape. A process that shares
+        # a runtime root with other processes passes an ExecutionOwnership, and
+        # then only the lock holder launches, polls, or finalizes anything.
+        self._ownership = execution_ownership
+        self._delegated_ticks = 0
         self._tick_errors = 0
         self._consecutive_tick_errors = 0
         self._tick_count = 0
@@ -870,6 +877,7 @@ class Scheduler:
         self._approval_store = CapabilityApprovalStore(
             self._store.root.parent / "capability_approvals",
             clock=self._clock,
+            workflow_store=self._store,
         )
         self._audit_writer = CapabilityAuditWriter()
         self._timeline = EventLog(self._store.root.parent / "events")
@@ -969,6 +977,14 @@ class Scheduler:
                 except Exception:
                     pass
             self._handles.clear()
+        if self._ownership is not None:
+            # Hand the runtime root back before this process leaves, so a
+            # waiting REPL or a restarting service takes over immediately
+            # rather than after the kernel gets round to closing our files.
+            try:
+                self._ownership.release()
+            except Exception:
+                pass
 
     def _run_loop(self) -> None:
         while not self._stop.is_set():
@@ -1052,6 +1068,10 @@ class Scheduler:
             "last_tick_error": self._last_tick_error,
             "last_tick_error_at": self._last_tick_error_at,
             "live_handles": len(self._handles),
+            "delegated_ticks": self._delegated_ticks,
+            "execution_owned": (
+                True if self._ownership is None else bool(self._ownership.owned)
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -1170,6 +1190,24 @@ class Scheduler:
     # Tick — the deterministic advance
     # ------------------------------------------------------------------
 
+    def has_execution_authority(self) -> bool:
+        """
+        May this process advance workflows for this runtime root?
+
+        Always true without an `ExecutionOwnership`. With one, the answer is a
+        live `flock` probe, re-attempted every tick: a follower promotes itself
+        the moment the owner exits or dies, so authority is never orphaned.
+        """
+        if self._ownership is None:
+            return True
+        if self._ownership.owned:
+            return True
+        try:
+            return bool(self._ownership.acquire())
+        except Exception:
+            # Fail closed. An unreadable lock is not permission to execute.
+            return False
+
     def tick(self) -> None:
         """
         One deterministic pass over every on-disk workflow.
@@ -1180,7 +1218,14 @@ class Scheduler:
           3. Reconcile non-running tasks against dependency policies and conditions.
           4. Finalise the workflow when every task is terminal.
           5. Launch ready tasks up to the concurrency cap.
+
+        A tick without execution authority (B8) does none of this. It is not an
+        error and not a failure — another process owns the runtime root and is
+        already doing the work.
         """
+        if not self.has_execution_authority():
+            self._delegated_ticks += 1
+            return
         started = self._clock.monotonic()
         with self._tick_lock:
             try:

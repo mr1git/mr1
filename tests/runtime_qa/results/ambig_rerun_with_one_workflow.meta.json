@@ -1,7 +1,7 @@
 {
   "category": "ambiguity",
   "description": "After making one workflow, 'rerun it' should resolve unambiguously",
-  "elapsed_s": 21.98,
+  "elapsed_s": 16.12,
   "findings": [],
   "scenario": "ambig_rerun_with_one_workflow",
   "session_error": null,

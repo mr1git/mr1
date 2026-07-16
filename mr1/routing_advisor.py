@@ -159,6 +159,26 @@ _CONFLICTING_AGENT_LIFECYCLE_PATTERNS = (
 
 _LOW_CONFIDENCE_THRESHOLD = 0.70
 
+# Whole-runtime control commands ("Pause the runtime.", "Ok, resume.") are
+# deliberately matched before the general operational-verb logic below: they
+# have no agent/workflow target at all (bare "resume." has nothing following
+# the verb, so the generic agent-command-shape check never fires for it),
+# and they must never be confused with a per-agent command like "pause that
+# agent" (left to the existing agent-command path; that phrase does not
+# fullmatch this pattern because "agent" is not a recognized runtime target).
+_RUNTIME_CONTROL_TARGET = (
+    r"(?:the\s+)?(?:runtime|everything|autonomy|autonomous\s+work|operations?|"
+    r"yourself|mr1|new\s+work|all\s+work)"
+)
+RUNTIME_CONTROL_PATTERN = re.compile(
+    r"^(?:(?:ok(?:ay)?|yes)[,.]?\s+|please\s+)*"
+    r"(pause|resume|unpause)\b"
+    rf"(?:\s+{_RUNTIME_CONTROL_TARGET})?"
+    r"(?:\s+(?:for\s+now|now|please))?"
+    r"[.!]?$",
+    re.IGNORECASE,
+)
+
 
 def _normalize_text(value: str) -> str:
     return " ".join(value.strip().lower().split())
@@ -477,6 +497,17 @@ def build_route_advice(
                 reason="A pending workflow draft exists, so this turn stays in workflow-authoring handling.",
                 signals=signals,
             )
+
+    if RUNTIME_CONTROL_PATTERN.match(normalized):
+        return _advice(
+            "run_commands",
+            required_refs=required_refs,
+            side_effects_allowed=True,
+            recommended_commands=["runtime_control"],
+            confidence=0.95,
+            reason="The turn is a direct runtime-wide pause/resume control command.",
+            signals=signals,
+        )
 
     if _has_conflicting_agent_lifecycle_intent(normalized):
         return _advice(

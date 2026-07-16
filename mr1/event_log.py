@@ -26,6 +26,8 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
+from mr1.event_archive import ArchiveSegment, EventArchive, EventArchiveError
+
 
 EVENT_VERSION = 1
 EVENT_KIND_VALUES = frozenset({
@@ -92,6 +94,13 @@ EVENT_KIND_BY_TYPE = {
     "consent_grant_expired": "decision",
     "consent_grant_used": "action",
     "budget_exhausted": "decision",
+    # Retention and maintenance (Phase B).
+    "retention_run": "action",
+    "events_rotated": "action",
+    "backpressure_applied": "decision",
+    "backpressure_lifted": "decision",
+    "notification_delivered": "communication",
+    "notification_failed": "communication",
 }
 
 SEVERITY_BY_TYPE = {
@@ -145,13 +154,25 @@ SEVERITY_BY_TYPE = {
     "consent_grant_expired": "WARNING",
     "consent_grant_used": "INFO",
     "budget_exhausted": "WARNING",
+    # Retention and maintenance (Phase B).
+    "retention_run": "INFO",
+    "events_rotated": "INFO",
+    "backpressure_applied": "WARNING",
+    "backpressure_lifted": "INFO",
+    "notification_delivered": "INFO",
+    "notification_failed": "ERROR",
 }
 
 # Maximum number of events kept in the in-process cache. Older events remain on
-# disk in events.jsonl (the authoritative log) but are evicted from memory once
-# this limit is exceeded. At ~500 bytes each, 50 000 events ≈ 25 MB RAM.
-# list_events() / filter_events() return only the cached window; callers needing
-# full history should read events.jsonl directly.
+# disk — in events.jsonl and, once rotated, in sealed archive segments — but are
+# evicted from memory past this limit. At ~500 bytes each, 50 000 events ≈ 25 MB.
+#
+# The cache is a *memory* bound, and B1's job was to stop it being mistaken for a
+# *history* bound. `list_events()` and everything built on it now return complete
+# history: they read the cache when the cache provably holds all of it, and fall
+# back to disk (archive segments + live file) when it does not. A query that
+# would have silently returned a 50 000-event window now returns the whole log.
+# `recent_events()` is the explicit opt-in to the cheap cached window.
 _MAX_CACHE_EVENTS = 50_000
 _EVENT_FILE_NAME = "events.jsonl"
 _CONTEXT_CORRELATION_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
@@ -340,16 +361,24 @@ class _EventCache:
     file_offset: int = 0
     file_mtime_ns: int = 0
     initialized: bool = False
+    # True once *any* event has been dropped from the window — by eviction here
+    # or by rotation into the archive. It is the flag that tells a history query
+    # it may not answer from memory.
+    truncated: bool = False
+    # The highest index already sealed into the archive. After rotation the live
+    # file may be short or empty, and the next index must still continue from
+    # here — an index that restarts at 1 forks the log.
+    base_index: int = 0
 
     @property
     def last_index(self) -> int:
         if not self.events:
-            return 0
-        return self.events[-1].event_index
+            return self.base_index
+        return max(self.events[-1].event_index, self.base_index)
 
 
 class EventLog:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, compress_archive: bool = True):
         root_path = Path(root)
         if root_path.suffix == ".jsonl":
             self._path = root_path
@@ -361,10 +390,15 @@ class EventLog:
         self._lock_key = key
         self._append_lock_path = self._path.with_name(f"{self._path.name}{_LOCK_SUFFIX}")
         self._cache = _EventCache()
+        self._archive = EventArchive(self._path.parent, compress=compress_archive)
 
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def archive(self) -> EventArchive:
+        return self._archive
 
     def append_event(self, event: SystemEvent) -> SystemEvent:
         with self._lock:
@@ -374,10 +408,14 @@ class EventLog:
                 if existing is not None:
                     return existing
                 if event.parent_event_id is not None:
-                    parent = self._cache.event_by_id.get(event.parent_event_id)
+                    # A parent that has been archived is still a real parent.
+                    # Before rotation existed this could only be a caller error;
+                    # now it is also just old, so check the archive before
+                    # rejecting the child and breaking the causal chain.
+                    parent = self._lookup_event_anywhere_locked(event.parent_event_id)
                     if parent is None:
                         raise ValueError(f"parent event not found: {event.parent_event_id}")
-                next_index = self._cache.last_index + 1 if self._cache.events else 1
+                next_index = self._cache.last_index + 1
                 if event.event_index not in {0, next_index}:
                     raise ValueError(
                         f"invalid event_index {event.event_index}; expected 0 or {next_index}"
@@ -478,15 +516,73 @@ class EventLog:
             ))
 
     def list_events(self, *, limit: Optional[int] = None) -> list[SystemEvent]:
+        """
+        Complete history, oldest first. Never silently truncated.
+
+        Served from the in-memory cache while the cache provably holds
+        everything — which is the normal case, and costs what it always did.
+        Once history has outgrown the cache or been rotated into the archive,
+        this reads from disk instead of quietly returning the tail.
+
+        For the cheap bounded window, ask for it by name: `recent_events()`.
+        """
+        with self._lock:
+            events = self._complete_history_locked()
+        if limit is not None:
+            return events[-limit:]
+        return events
+
+    def recent_events(self, limit: Optional[int] = None) -> list[SystemEvent]:
+        """
+        The cached window — the newest events, bounded by memory, not by history.
+
+        Explicitly *not* complete. Use it where recency is the question
+        ("what just happened") and completeness is not.
+        """
         with self._lock:
             events = self._load_events_locked()
         if limit is not None:
             return events[-limit:]
         return events
 
+    @property
+    def cache_is_complete(self) -> bool:
+        """True when the cached window holds all of history."""
+        with self._lock:
+            self._refresh_cache_locked()
+            return not self._cache.truncated
+
+    def history_stats(self) -> dict[str, Any]:
+        """What history costs, and where it lives. For `mr1 status` and the doctor."""
+        with self._lock:
+            self._refresh_cache_locked()
+            live_bytes = self._live_bytes_locked()
+            segments = self._archive.segments()
+            return {
+                "total_events": self._cache.last_index,
+                "cached_events": len(self._cache.events),
+                "cache_is_complete": not self._cache.truncated,
+                "cache_limit": _MAX_CACHE_EVENTS,
+                "live_bytes": live_bytes,
+                "archive_bytes": sum(item.size_bytes for item in segments),
+                "archive_segments": len(segments),
+                "archived_events": sum(item.count for item in segments),
+                "archived_through_index": self._archive.archived_last_index(),
+            }
+
     def get_event(self, event_id: str) -> Optional[SystemEvent]:
         with self._lock:
-            return self._get_event_locked(event_id)
+            found = self._get_event_locked(event_id)
+            if found is not None:
+                return found
+            if not self._cache.truncated:
+                return None
+            # Evicted or archived — look it up in the full log rather than
+            # reporting an event that exists as though it never happened.
+            for event in self._complete_history_locked():
+                if event.event_id == event_id:
+                    return event
+            return None
 
     def filter_events(
         self,
@@ -583,15 +679,140 @@ class EventLog:
         )
 
     def recent_activity(self, limit: int = 20) -> list[SystemEvent]:
-        return sorted(self.list_events(), key=lambda item: item.event_index, reverse=True)[:limit]
+        # Recency, not completeness — the cached window is exactly the right
+        # source, and reading all of history to throw away everything but the
+        # last 20 would be the wrong trade.
+        return sorted(self.recent_events(), key=lambda item: item.event_index, reverse=True)[:limit]
+
+    # ------------------------------------------------------------------
+    # Rotation (B1)
+    # ------------------------------------------------------------------
+
+    def rotate(
+        self,
+        *,
+        keep_recent: int = 1_000,
+        now_iso: Optional[str] = None,
+    ) -> Optional[ArchiveSegment]:
+        """
+        Seal the live log into an archive segment and shrink `events.jsonl`.
+
+        `keep_recent` events stay behind in the live file. That is not just a
+        convenience: `emit()` resolves an event's `parent_event_id` and
+        `correlation_id` by searching backwards through the cache. Rotating the
+        whole file out from under an in-flight causal chain would orphan the
+        next event in it. Keeping a tail of recent history means live chains
+        stay resolvable across a rotation.
+
+        Returns the sealed segment, or None when there was nothing to seal.
+        """
+        with self._lock:
+            with self._append_guard_locked():
+                payloads = self._read_live_payloads_locked()
+                if not payloads:
+                    return None
+                cutoff = len(payloads) - max(0, keep_recent)
+                if cutoff <= 0:
+                    return None
+                to_seal = payloads[:cutoff]
+                to_keep = payloads[cutoff:]
+
+                # Durable first. Nothing leaves the live file until it is
+                # sealed on disk and named in the manifest.
+                segment = self._archive.seal(
+                    to_seal,
+                    sealed_at=now_iso or _now_iso(),
+                )
+                self._rewrite_live_locked(to_keep)
+                self._rebuild_cache_locked()
+                return segment
+
+    def _read_live_payloads_locked(self) -> list[dict[str, Any]]:
+        """Raw payloads from events.jsonl, in index order, deduped."""
+        if not self._path.exists():
+            return []
+        payloads: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        with open(self._path, "rb") as handle:
+            for line in handle:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                event_id = payload.get("event_id")
+                if not event_id or event_id in seen:
+                    continue
+                seen.add(event_id)
+                payloads.append(payload)
+        payloads.sort(key=lambda item: int(item.get("event_index", 0)))
+        return payloads
+
+    def _rewrite_live_locked(self, payloads: list[dict[str, Any]]) -> None:
+        tmp = self._path.with_name(self._path.name + ".rotate.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            for payload in payloads:
+                handle.write(_canonical_json(payload) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(self._path)
+        _fsync_dir(self._path.parent)
+
+    def _live_bytes_locked(self) -> int:
+        try:
+            return int(self._path.stat().st_size)
+        except OSError:
+            return 0
+
+    def _complete_history_locked(self) -> list[SystemEvent]:
+        """
+        Every event ever emitted, oldest first.
+
+        The cache answers when it holds everything. Otherwise this reads the
+        archive segments and the live file and merges them — the archive is
+        raised as an error if a segment named in the manifest is missing,
+        because a short answer to a full-history question is worse than none.
+        """
+        self._refresh_cache_locked()
+        if not self._cache.truncated:
+            return list(self._cache.events)
+
+        merged: dict[str, SystemEvent] = {}
+        for payload in self._archive.iter_raw_events():
+            try:
+                event = SystemEvent.from_dict(payload)
+            except (KeyError, ValueError):
+                continue
+            merged.setdefault(event.event_id, event)
+        for payload in self._read_live_payloads_locked():
+            try:
+                event = SystemEvent.from_dict(payload)
+            except (KeyError, ValueError):
+                continue
+            merged.setdefault(event.event_id, event)
+        return sorted(merged.values(), key=lambda item: item.event_index)
 
     def _next_event_index_locked(self) -> int:
         self._refresh_cache_locked()
-        return self._cache.last_index + 1 if self._cache.events else 1
+        return self._cache.last_index + 1
 
     def _get_event_locked(self, event_id: str) -> Optional[SystemEvent]:
         self._refresh_cache_locked()
         return self._cache.event_by_id.get(event_id)
+
+    def _lookup_event_anywhere_locked(self, event_id: str) -> Optional[SystemEvent]:
+        """Cache first, then the full log. Only pays for disk on a cache miss."""
+        found = self._get_event_locked(event_id)
+        if found is not None:
+            return found
+        if not self._cache.truncated:
+            return None
+        for event in self._complete_history_locked():
+            if event.event_id == event_id:
+                return event
+        return None
 
     def _load_events_locked(self) -> list[SystemEvent]:
         self._refresh_cache_locked()
@@ -648,7 +869,7 @@ class EventLog:
         audit_id: Optional[str],
     ) -> Optional[str]:
         if explicit:
-            if self._get_event_locked(explicit) is None:
+            if self._lookup_event_anywhere_locked(explicit) is None:
                 raise ValueError(f"parent event not found: {explicit}")
             return explicit
         parent_type: Optional[str] = None
@@ -720,6 +941,8 @@ class EventLog:
             self._cache = _EventCache(initialized=True)
             return
         if stat.st_size < self._cache.file_offset:
+            # The live file shrank: another process rotated it. Rebuild rather
+            # than read on from an offset that now points into different data.
             self._rebuild_cache_locked()
             return
         if (
@@ -739,6 +962,7 @@ class EventLog:
         while len(self._cache.events) > _MAX_CACHE_EVENTS:
             evicted = self._cache.events.popleft()
             self._cache.event_by_id.pop(evicted.event_id, None)
+            self._cache.truncated = True
         try:
             stat = self._path.stat()
             self._cache.file_mtime_ns = stat.st_mtime_ns
@@ -751,6 +975,7 @@ class EventLog:
         temp_by_id: dict[str, SystemEvent] = {}
         file_offset = 0
         mtime_ns = 0
+        truncated = False
         if self._path.exists():
             with open(self._path, "rb") as handle:
                 while True:
@@ -776,11 +1001,21 @@ class EventLog:
             temp_events.sort(key=lambda item: item.event_index)
             if len(temp_events) > _MAX_CACHE_EVENTS:
                 temp_events = temp_events[-_MAX_CACHE_EVENTS:]
+                truncated = True
+
+        # Anything sealed into the archive is history the cache does not hold —
+        # and the index it stopped at is where the live log must carry on from.
+        archived_last_index = self._archive.archived_last_index()
+        if archived_last_index > 0:
+            truncated = True
+
         cache = _EventCache(initialized=True)
         cache.events = deque(temp_events)
         cache.event_by_id = {e.event_id: e for e in temp_events}
         cache.file_offset = file_offset
         cache.file_mtime_ns = mtime_ns
+        cache.truncated = truncated
+        cache.base_index = archived_last_index
         self._cache = cache
 
     def _parse_and_cache_line_locked(self, line: bytes) -> None:
@@ -815,6 +1050,9 @@ class EventLog:
         if len(self._cache.events) > _MAX_CACHE_EVENTS:
             evicted = self._cache.events.popleft()
             self._cache.event_by_id.pop(evicted.event_id, None)
+            # The window no longer holds all of history. Every full-history
+            # query from here on must go to disk.
+            self._cache.truncated = True
         self._cache.initialized = True
 
     @staticmethod
@@ -826,3 +1064,14 @@ class EventLog:
         if event.workflow_id and event.task_id:
             return f"task:{event.workflow_id}:{event.task_id}"
         return None
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        dir_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)

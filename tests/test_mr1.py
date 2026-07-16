@@ -1057,10 +1057,33 @@ class TestStep:
             for agent in mr1_instance._scoped_agents.list_visible_agents(root.agent_id)
         ]
         assert result == (
-            "I did not execute any runtime mutation on this turn, so I cannot claim that an agent or workflow "
-            "was created, renamed, paused, or deleted. Use an explicit operational command instead."
+            "I haven't actually done that — nothing was created, renamed, paused, "
+            "or deleted this turn. Tell me exactly what you want me to execute."
         )
         assert before == after
+
+    @pytest.mark.parametrize(
+        "brain_reply",
+        [
+            "I did not create or delete anything this turn — nothing has changed yet.",
+            "PaperLibrarian was not paused; it's still running fine.",
+            "I haven't renamed anyone. Let me know if you'd like me to.",
+            "I am not removing the agent — it's still active.",
+        ],
+    )
+    def test_direct_answer_preserves_honest_negated_mutation_mentions(self, mr1_with_mock_process, brain_reply):
+        # Regression: the old guard matched mutation words anywhere in the
+        # text and nuked the whole response, even an honest disclaimer that
+        # correctly said nothing happened — exactly the "investigate this
+        # repository" failure, where the brain's own honest hedge got
+        # replaced by an unrelated canned line. A negation-aware check must
+        # leave real, honest text alone.
+        mr1_instance, mock_process = mr1_with_mock_process
+        mock_process.send.return_value = brain_reply
+
+        result = mr1_instance.step("Investigate this repository.")
+
+        assert result == brain_reply
 
     def test_kill_named_agent_title_routes_operationally(self, mr1_with_mock_process):
         mr1_instance, mock_process = mr1_with_mock_process
@@ -1078,6 +1101,113 @@ class TestStep:
         assert artifact["routing_decision"]["matched_signals"]["matched_operational_verbs"] == ["kill"]
         assert decision_event.event_type == "runtime_turn_decided"
         assert decision_event.metadata["final_action"] == "run_commands"
+        mock_process.send.assert_not_called()
+
+    def test_stop_that_agent_terminates_recently_created_agent(self, mr1_with_mock_process):
+        # Regression: "stop that agent" immediately after creating it used to
+        # fall through to a generic clarification because the agent-action
+        # parser only recognized "kill"/"terminate", not "stop".
+        mr1_instance, mock_process = mr1_with_mock_process
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "watchtower")
+        mr1_instance._remember_created_agent(child)
+        mr1_instance._remember_referenced_agent(child)
+
+        result = mr1_instance.step("Please stop that agent.")
+
+        updated = mr1_instance._scoped_agents.require_agent(child.agent_id)
+        assert result == f"terminated agent: {child.agent_id}"
+        assert updated.status == "terminated"
+        mock_process.send.assert_not_called()
+
+    def test_rerun_that_workflow_resolves_via_last_referenced_state(self, mr1_with_mock_process, tmp_path):
+        # Regression: a bare "rerun that workflow" (no explicit workflow_id)
+        # used to always ask for clarification, even with exactly one
+        # credible recent workflow in state.
+        mr1_instance, mock_process = mr1_with_mock_process
+        workflow_id, _task_id = self._seed_failed_task(mr1_instance, tmp_path)
+        mr1_instance._state.set_reference_state("last_referenced_workflow_id", workflow_id)
+
+        result = mr1_instance.step("Rerun that workflow.")
+
+        assert result.startswith(f"Requeued 1 task(s) in {workflow_id}")
+        mock_process.send.assert_not_called()
+
+    def test_rerun_that_workflow_without_any_known_workflow_still_clarifies(self, mr1_with_mock_process):
+        mr1_instance, mock_process = mr1_with_mock_process
+
+        result = mr1_instance.step("Rerun that workflow.")
+
+        assert "what exactly do you want me to act on" in result
+        mock_process.send.assert_not_called()
+
+    def test_pause_the_runtime_sets_control_plane_paused(self, mr1_with_mock_process):
+        mr1_instance, mock_process = mr1_with_mock_process
+
+        result = mr1_instance.step("Pause the runtime for now.")
+
+        from mr1.autonomy.control import ControlPlane, MODE_PAUSED
+        control = ControlPlane(mr1_instance._workflow_store.root.parent)
+        assert control.read().mode == MODE_PAUSED
+        assert "pausing" in result.lower()
+        mock_process.send.assert_not_called()
+
+    def test_bare_resume_sets_control_plane_running(self, mr1_with_mock_process):
+        mr1_instance, mock_process = mr1_with_mock_process
+        from mr1.autonomy.control import ControlPlane, MODE_PAUSED, MODE_RUNNING
+        control = ControlPlane(mr1_instance._workflow_store.root.parent)
+        control.set_mode(MODE_PAUSED, reason="test setup")
+
+        result = mr1_instance.step("Ok, resume.")
+
+        assert control.read().mode == MODE_RUNNING
+        assert "resuming" in result.lower()
+        mock_process.send.assert_not_called()
+
+    def test_pause_a_named_agent_is_not_treated_as_runtime_control(self, mr1_with_mock_process):
+        # "pause that agent" must stay on the per-agent path (still
+        # unsupported there today) rather than being swallowed by the
+        # whole-runtime pause/resume control command.
+        mr1_instance, mock_process = mr1_with_mock_process
+        from mr1.autonomy.control import ControlPlane, MODE_RUNNING
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        child = mr1_instance._scoped_agents.create_child_agent(root.agent_id, "MR2")
+        mr1_instance._state.set_reference_state("last_referenced_agent_id", child.agent_id)
+
+        mr1_instance.step("pause that agent")
+
+        control = ControlPlane(mr1_instance._workflow_store.root.parent)
+        assert control.read().mode == MODE_RUNNING
+
+    def test_whats_running_reports_nothing_on_idle_runtime(self, mr1_with_mock_process):
+        mr1_instance, mock_process = mr1_with_mock_process
+
+        result = mr1_instance.step("What's running right now?")
+
+        assert result == "Nothing's running right now — no active workflows or agents."
+        mock_process.send.assert_not_called()
+
+    def test_whats_running_lists_active_workflow(self, mr1_with_mock_process, tmp_path):
+        mr1_instance, mock_process = mr1_with_mock_process
+        workflow_id, workflow = self._seed_completed_workflow(mr1_instance, tmp_path)
+        workflow.status = WorkflowStatus.RUNNING
+        mr1_instance._workflow_store.save_workflow(workflow)
+
+        result = mr1_instance.step("What's running right now?")
+
+        assert "workflows in flight:" in result
+        assert workflow_id in result
+        mock_process.send.assert_not_called()
+
+    def test_destructive_bulk_action_clarifies_conversationally(self, mr1_with_mock_process):
+        mr1_instance, mock_process = mr1_with_mock_process
+        root = mr1_instance._scoped_agents.ensure_root_agent()
+        mr1_instance._scoped_agents.create_child_agent(root.agent_id, "Archivist")
+
+        result = mr1_instance.step("Delete every workflow and every agent right now.")
+
+        assert "are you sure" in result.lower()
+        assert "agent(s)" in result
         mock_process.send.assert_not_called()
 
     def test_direct_answer_observation_loop_reads_full_message_body(self, tmp_path):
@@ -1314,7 +1444,7 @@ class TestStep:
         artifacts = sorted((tmp_path / "mr1_turns").glob("turn-*.json"))
         artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
         decision = artifact["routing_decision"]
-        assert "exact execute-now command details" in result
+        assert "tell me which agent, workflow, or action you mean" in result
         assert artifact["route"] == "ask_clarification"
         assert artifact["route_advice"]["route"] == "run_commands"
         assert decision["override_applied"] is True
@@ -1478,7 +1608,7 @@ class TestStep:
 
         mock_run.side_effect = _fake_run
         mr1_instance._process.send.return_value = (
-            "AGENT_TITLE: MR2\nOwn tool creation: propose, implement, and test new capabilities."
+            "AGENT_TITLE: Forge\nOwn tool creation: propose, implement, and test new capabilities."
         )
 
         request = "create a child responsible for tool creation and let that agent propose/create/test"
@@ -1491,7 +1621,7 @@ class TestStep:
         agent_id = mock_run.call_args.args[0]
         policy = mock_run.call_args.args[1]
         child = mr1_instance._scoped_agents.require_agent(agent_id)
-        assert child.title == "MR2"
+        assert child.title == "Forge"
         assert child.assignment_packet is not None
         assert child.parent_request == request
         assert child.assignment_packet["full_parent_request"] == request
@@ -1499,7 +1629,7 @@ class TestStep:
         assert child.assignment_packet["parent_level"] == 1
         assert child.assignment_packet["child_level"] == 2
         assert child.assignment_packet["assigned_clearance"] == child.security_clearance
-        assert child.assignment_packet["child_title"] == "MR2"
+        assert child.assignment_packet["child_title"] == "Forge"
         assert child.assignment_packet["relevant_context"]["agents"][0] == mr1_instance._root_agent_id
         assert "Own tool creation" in (child.mission or "")
         assert policy.max_steps == 3
@@ -1507,6 +1637,39 @@ class TestStep:
         assert policy.require_confirmation_for_workflows is True
         assert compiler.call_count == 0
         assert mr1_instance._process.send.call_count == 1
+
+    @patch("mr1.mr1.MRnRunRunner.run")
+    def test_persistent_delegation_does_not_create_agent_when_brain_asks_for_clarification(
+        self, mock_run, tmp_path,
+    ):
+        # Observed live: an ambiguous request ("make another agent, but not for
+        # the same thing as the testing one") led the real brain to respond
+        # with a clarifying question instead of an AGENT_TITLE: design. MR1
+        # must surface that question to the human, not create a persistent
+        # agent whose mission is the unresolved question itself.
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+        mr1_instance._process.send.return_value = (
+            "I need clarification on what domain you want this new agent to cover. "
+            "We have: Auditor (testing), Sentinel (security), Reviewer (design)."
+        )
+
+        before_agents = {a.agent_id for a in mr1_instance._scoped_agents.list_agents()}
+        response = mr1_instance.step(
+            "make another agent, but not for the same thing as the testing one."
+        )
+        after_agents = {a.agent_id for a in mr1_instance._scoped_agents.list_agents()}
+
+        assert after_agents == before_agents  # no agent created
+        assert "clarification" in response.lower()
+        assert mock_run.call_count == 0  # no child run was ever launched
 
     @patch("mr1.mr1.MRnRunRunner.run")
     def test_persistent_delegation_uses_requested_child_title(self, mock_run, tmp_path):
@@ -1584,6 +1747,49 @@ class TestStep:
         assert response.startswith("delegated to persistent agent: ag-")
         child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
         assert child.title == "archivist"
+
+    @patch("mr1.mr1.MRnRunRunner.run")
+    def test_persistent_delegation_overrides_generic_brain_title_when_unnamed(self, mock_run, tmp_path):
+        # Regression: an unnamed ownership request ("own runtime testing",
+        # "keep an eye on this codebase") frequently got named "MR2" because
+        # the design brain itself defaulted to that generic label. Preserve
+        # explicit user names, but override a non-explicit "MR2"-style
+        # design title with a concise, non-generic default.
+        mr1_instance = MR1(
+            workflow_store=WorkflowStore(root=tmp_path / "workflows"),
+            workflow_runner=MockRunner(),
+            workflow_auto_tick=False,
+            workflow_compiler=lambda *_: "{}",
+        )
+        mr1_instance._state = StateManager(state_path=tmp_path / "mr1_state.json")
+        mr1_instance._process = MagicMock(spec=MR1Process)
+        mr1_instance._process.alive = True
+        mr1_instance._process.send.return_value = (
+            "AGENT_TITLE: MR2\nOwn runtime testing: examine coverage and report status."
+        )
+        mock_run.return_value = MRnRunResult(
+            run_id="run-1",
+            agent_id="ag-test",
+            caller_agent_id=mr1_instance._root_agent_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:00:01+00:00",
+            policy={},
+            steps=[],
+            workflows_created=0,
+            messages_created=0,
+            stopped_reason="waiting",
+            status="stopped",
+            final_run_status="waiting",
+        )
+
+        response = mr1_instance.step(
+            "I want somebody to own runtime testing. Make an agent for that.",
+        )
+
+        assert response.startswith("delegated to persistent agent: ag-")
+        child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
+        assert child.title != "MR2"
+        assert "Own runtime testing" in (child.mission or "")
 
     @patch("mr1.mr1.MRnRunRunner.run")
     def test_persistent_delegation_named_agent_routes_without_workflow_authoring(self, mock_run, tmp_path):
@@ -2639,15 +2845,18 @@ class TestRuntimeReferenceResolution:
         assert resolution["ambiguities"]
         assert resolution["ambiguities"][0]["reference"] == "MR2"
 
-    def test_default_child_title_matches_tree_level(self, tmp_path):
+    def test_unnamed_agent_requests_get_concise_default_titles_not_mr2(self, tmp_path):
+        # Regression: unnamed ownership requests used to fall back to the
+        # generic, tree-level "MR2" label for every request. Prefer a
+        # concise, non-generic default, and dedupe against agents already
+        # created so two unnamed requests in a row don't collide.
         mr1_instance = self._mr1_instance(tmp_path)
-        mr1_instance._scoped_agents.ensure_root_agent()
+        root = mr1_instance._scoped_agents.ensure_root_agent()
 
-        # MRn denotes tree level, not a unique sequence — all level-2 children default to "MR2"
         title_a = mr1_instance._extract_requested_child_title("create a persistent agent to own discord")
-        title_b = mr1_instance._extract_requested_child_title("create a persistent agent to own github")
-        title_c = mr1_instance._extract_requested_child_title("create a persistent agent to own reporting")
+        assert title_a != "MR2"
+        mr1_instance._scoped_agents.create_child_agent(root.agent_id, title_a)
 
-        assert title_a == "MR2"
-        assert title_b == "MR2"
-        assert title_c == "MR2"
+        title_b = mr1_instance._extract_requested_child_title("create a persistent agent to own github")
+        assert title_b != "MR2"
+        assert title_b != title_a

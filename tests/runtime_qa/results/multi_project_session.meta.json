@@ -1,7 +1,7 @@
 {
   "category": "multi_turn",
   "description": "Realistic project-management multi-turn session",
-  "elapsed_s": 55.97,
+  "elapsed_s": 56.63,
   "findings": [],
   "scenario": "multi_project_session",
   "session_error": null,

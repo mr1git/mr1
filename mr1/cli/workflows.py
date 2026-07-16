@@ -525,20 +525,43 @@ def _cmd_replace_workflow(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if args.rerun:
-        from mr1.scheduler import Scheduler
-
-        scheduler = Scheduler(
-            store,
-            auto_tick=False,
-            agent_id="cli",
-            scoped_agent_store=scoped_agents,
-        )
-        try:
-            scheduler.tick()
-        finally:
-            scheduler.shutdown()
+        _tick_once_if_unowned(store, scoped_agents)
     print(workflow_id)
     return 0
+
+
+def _tick_once_if_unowned(store: WorkflowStore, scoped_agents: PersistentAgentStore) -> None:
+    """
+    Advance the store once — but only if no other process owns execution (B8).
+
+    A one-shot CLI tick alongside a live `mr1 serve` would launch tasks the
+    service is already launching. When the service holds the root, the right
+    behaviour is to do nothing and let it pick the work up on its next tick.
+    """
+    from mr1.autonomy.ownership import ROLE_CLI, ExecutionOwnership
+    from mr1.scheduler import Scheduler
+
+    runtime_root = Path(store.root).parent
+    ownership = ExecutionOwnership(runtime_root, role=ROLE_CLI)
+    scheduler = Scheduler(
+        store,
+        auto_tick=False,
+        agent_id="cli",
+        scoped_agent_store=scoped_agents,
+        execution_ownership=ownership,
+    )
+    try:
+        scheduler.tick()
+        if not ownership.owned:
+            owner = ownership.current_owner()
+            who = f"pid {owner.pid} ({owner.role})" if owner else "another process"
+            print(
+                f"[mr1] execution delegated to {who}; "
+                "the rerun will be picked up on its next tick",
+                file=sys.stderr,
+            )
+    finally:
+        scheduler.shutdown()
 
 def _cmd_workflows(
     args: argparse.Namespace,

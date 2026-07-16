@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mr1.autonomy.objectives import KIND_ONCE, KIND_RECURRING, KIND_STANDING
+from mr1.autonomy.triggers import MISSED_RUN_POLICIES
 from mr1.event_log import bind_correlation_id, cli_correlation_id
 from mr1.messages import MessageStore
 from mr1.scoped_agents import PersistentAgentStore
@@ -103,6 +104,10 @@ from mr1.cli.objectives import (
     _cmd_objective_resume,
     _cmd_objective_run,
     _cmd_objective_show,
+)
+from mr1.cli.maintenance import (
+    _cmd_maintenance_run,
+    _cmd_maintenance_status,
 )
 from mr1.cli.service import (
     _cmd_halt,
@@ -672,6 +677,55 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="max_workflows_per_objective_per_day",
     )
     p_serve.add_argument(
+        "--max-actions-per-hour",
+        type=int,
+        default=None,
+        dest="max_actions_per_hour",
+        help="Ceiling on unattended actions (triage, agent runs) per hour.",
+    )
+    p_serve.add_argument(
+        "--min-disk-free-bytes",
+        type=int,
+        default=None,
+        dest="min_disk_free_bytes",
+        help=(
+            "Stop planning while free disk is below this. Set above the space "
+            "needed to drain, persist, and archive — not at the point a write fails."
+        ),
+    )
+    p_serve.add_argument(
+        "--max-consecutive-supervisor-errors",
+        type=int,
+        default=None,
+        dest="max_consecutive_supervisor_errors",
+        help="Consecutive failed supervisor ticks before degraded mode stops planning.",
+    )
+    p_serve.add_argument(
+        "--max-consecutive-scheduler-errors",
+        type=int,
+        default=None,
+        dest="max_consecutive_scheduler_errors",
+        help="Consecutive failed scheduler ticks before degraded mode stops planning.",
+    )
+    p_serve.add_argument(
+        "--retention-interval-s",
+        type=float,
+        default=None,
+        dest="retention_interval_s",
+        help="How often the supervisor runs the retention sweep. 0 disables it.",
+    )
+    p_serve.add_argument(
+        "--notify",
+        action="append",
+        default=None,
+        dest="notify",
+        help=(
+            "Where escalations are delivered, repeatable. "
+            "local (default; inbox + timeline only), stdout, file, or file:<path>. "
+            "The inbox and timeline are always written regardless."
+        ),
+    )
+    p_serve.add_argument(
         "--no-planner",
         action="store_true",
         dest="no_planner",
@@ -711,6 +765,87 @@ def _build_parser() -> argparse.ArgumentParser:
     p_status = subs.add_parser("status", help="Show supervisor mode, heartbeat, health, and budgets.")
     p_status.add_argument("--json", action="store_true", dest="json")
     p_status.set_defaults(func=_cmd_status)
+
+    # -- Retention and archival (B1) ---------------------------------------
+
+    p_maintenance = subs.add_parser(
+        "maintenance",
+        help="Retention and archival: rotate events, archive terminal workflows, audits, snapshots.",
+    )
+    maintenance_subs = p_maintenance.add_subparsers(dest="maintenance_command", required=True)
+
+    def _add_retention_flags(parser) -> None:
+        parser.add_argument(
+            "--events-max-live-bytes",
+            type=int,
+            default=None,
+            dest="events_max_live_bytes",
+            help="Rotate events.jsonl into an archive segment past this size.",
+        )
+        parser.add_argument(
+            "--events-keep-recent",
+            type=int,
+            default=None,
+            dest="events_keep_recent",
+            help="Events left in the live log on rotation (keeps causal chains resolvable).",
+        )
+        parser.add_argument(
+            "--workflow-archive-after-days",
+            type=float,
+            default=None,
+            dest="workflow_archive_after_days",
+            help="Archive terminal workflows older than this.",
+        )
+        parser.add_argument(
+            "--workflow-keep-recent",
+            type=int,
+            default=None,
+            dest="workflow_keep_recent",
+            help="Never archive below this many of the most recent terminal workflows.",
+        )
+        parser.add_argument(
+            "--audit-archive-after-days",
+            type=float,
+            default=None,
+            dest="audit_archive_after_days",
+        )
+        parser.add_argument(
+            "--snapshot-archive-after-days",
+            type=float,
+            default=None,
+            dest="snapshot_archive_after_days",
+        )
+        parser.add_argument(
+            "--purge-archives-after-days",
+            type=float,
+            default=None,
+            dest="purge_archives_after_days",
+            help=(
+                "DESTRUCTIVE, and off unless set: permanently delete material "
+                "already archived and older than this. Never touches live state."
+            ),
+        )
+        parser.add_argument("--json", action="store_true", dest="json")
+
+    p_maintenance_run = maintenance_subs.add_parser(
+        "run",
+        help="Run the retention sweep. Archives; does not delete unless --purge-archives-after-days.",
+    )
+    p_maintenance_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Compute and report every decision without changing anything.",
+    )
+    _add_retention_flags(p_maintenance_run)
+    p_maintenance_run.set_defaults(func=_cmd_maintenance_run)
+
+    p_maintenance_status = maintenance_subs.add_parser(
+        "status",
+        help="Show event/archive sizes, whether rotation is due, and past retention runs.",
+    )
+    _add_retention_flags(p_maintenance_status)
+    p_maintenance_status.set_defaults(func=_cmd_maintenance_status)
 
     # -- Autonomy: objective-scoped consent grants -------------------------
 
@@ -778,6 +913,35 @@ def _build_parser() -> argparse.ArgumentParser:
         default=KIND_ONCE,
     )
     p_objective_create.add_argument("--every", default=None, help="Recurring interval: 7d, 12h, 30m.")
+    p_objective_create.add_argument(
+        "--cron",
+        default=None,
+        help="Calendar recurrence, 5-field cron: '0 9 * * 1' = 09:00 every Monday.",
+    )
+    p_objective_create.add_argument(
+        "--timezone",
+        default=None,
+        dest="timezone",
+        help="IANA timezone the cron fields are read in (default UTC). Cron only.",
+    )
+    p_objective_create.add_argument(
+        "--missed-run-policy",
+        choices=list(MISSED_RUN_POLICIES),
+        default=None,
+        dest="missed_run_policy",
+        help=(
+            "What to do with runs missed while MR1 was down. "
+            "skip: run none of them. catch_up_once (default): run one. "
+            "bounded: run up to --max-catch-up-runs."
+        ),
+    )
+    p_objective_create.add_argument(
+        "--max-catch-up-runs",
+        type=int,
+        default=None,
+        dest="max_catch_up_runs",
+        help="Ceiling on make-up runs after downtime. Only with --missed-run-policy bounded.",
+    )
     p_objective_create.add_argument("--trigger", default=None, help="Full JSON trigger spec.")
     p_objective_create.add_argument("--owner", default=None, help="Owner agent id (default: root).")
     p_objective_create.add_argument("--fallback", default=None, help="Fallback statement if the plan keeps failing.")

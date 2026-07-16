@@ -224,9 +224,34 @@ def test_watcher_trigger_reuses_the_watcher_registry(tmp_path):
     assert "satisfied" in why
 
 
-def test_an_unknown_trigger_type_never_fires(tmp_path):
-    store, clock = _store(tmp_path)
-    objective = _create(store, trigger={"type": "telepathy"})
+def test_an_unknown_trigger_type_is_rejected_at_creation(tmp_path):
+    """
+    B2 moved this check earlier: an unschedulable trigger is now refused when a
+    human creates it, rather than quietly never firing on an unattended tick.
+    """
+    from mr1.autonomy.triggers import TriggerError
+
+    store, _clock = _store(tmp_path)
+    with pytest.raises(TriggerError, match="unknown trigger type"):
+        _create(store, trigger={"type": "telepathy"})
+
+
+def test_an_unknown_trigger_type_still_never_fires(tmp_path):
+    """
+    And the fail-closed evaluation stays, for an objective file edited by hand
+    or written by an older version. Rejecting at the door is not a reason to
+    trust whatever is already inside.
+    """
+    from mr1.autonomy.objectives import Objective
+
+    _store_, clock = _store(tmp_path)
+    objective = Objective(
+        objective_id="obj-telepathy",
+        title="t",
+        statement="read my mind",
+        owner_agent_id="ag-root",
+        trigger={"type": "telepathy"},
+    )
 
     ready, why = trigger_is_ready(objective, now=clock.now())
     assert ready is False

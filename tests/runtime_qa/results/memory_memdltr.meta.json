@@ -1,7 +1,7 @@
 {
   "category": "memory",
   "description": "/memdltr triggers compression+restart cycle \u2014 should not crash isolated harness",
-  "elapsed_s": 22.91,
+  "elapsed_s": 23.74,
   "findings": [],
   "scenario": "memory_memdltr",
   "session_error": null,
