@@ -114,7 +114,7 @@ from mr1.cli.agents import (
     _format_runtime_agent_health as _format_runtime_agent_health,
     _format_runtime_agents as _format_runtime_agents,
     _format_scope_grants as _format_scope_grants,
-    _persistent_agent_payload as _persistent_agent_payload,
+    _agent_payload as _agent_payload,
     _print_agent_usage_error as _print_agent_usage_error,
     _summarize_last_action as _summarize_last_action,
 )

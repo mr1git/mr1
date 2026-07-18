@@ -14,7 +14,7 @@ from typing import Any, Optional
 from mr1.clock import Clock, default_clock, parse_iso
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import MAX_AUTONOMOUS_CLEARANCE, PersistentAgentStore
+from mr1.scoped_agents import MAX_AUTONOMOUS_CLEARANCE, AgentStore, actor_category
 from mr1.workflow_store import WorkflowStore
 
 
@@ -28,15 +28,15 @@ DEFAULT_APPROVAL_TTL_S = 86_400.0
 _ALLOWED_DECISION_STATUSES = frozenset({"allowed", "denied", "requires_approval"})
 _ALLOWED_FINAL_EFFECTS = frozenset({"executed", "blocked", "skipped"})
 _ALLOWED_INVOCATION_MODES = frozenset({"direct", "workflow"})
-_ALLOWED_ACTOR_TYPES = frozenset({"mr1", "mrn", "kazi", "workflow"})
+_ALLOWED_ACTOR_TYPES = frozenset({"root_orchestrator", "orchestrator", "worker", "workflow"})
 _ALLOWED_KINDS = frozenset({"tool", "watcher", "agent"})
 _ALLOWED_APPROVAL_STATUSES = frozenset({"pending", "approved", "denied", "expired", "superseded"})
 _ALLOWED_APPROVAL_DECISIONS = frozenset({"approved", "denied"})
 _ALLOWED_APPROVAL_SCOPES = frozenset({"single_use", "grant_scope"})
 _ALLOWED_ACTOR_THRESHOLDS = {
-    "mr1": {"direct": 0.50, "workflow": MAX_AUTONOMOUS_CLEARANCE},
-    "mrn": {"direct": 0.20, "workflow": MAX_AUTONOMOUS_CLEARANCE},
-    "kazi": {"direct": 0.00, "workflow": MAX_AUTONOMOUS_CLEARANCE},
+    "root_orchestrator": {"direct": 0.50, "workflow": MAX_AUTONOMOUS_CLEARANCE},
+    "orchestrator": {"direct": 0.20, "workflow": MAX_AUTONOMOUS_CLEARANCE},
+    "worker": {"direct": 0.00, "workflow": MAX_AUTONOMOUS_CLEARANCE},
 }
 
 
@@ -717,7 +717,7 @@ _CAPABILITY_METADATA_RAW: dict[str, dict[str, Any]] = {
         "is_blocking": False,
         "path_arg_fields": [],
     },
-    "kazi": {
+    "worker": {
         "effect": "execute",
         "risk_score": 1.00,
         "direct_allowed": False,
@@ -863,7 +863,7 @@ def build_scope_context(
     *,
     actor_id: str,
     workspace_root: Path,
-    scoped_agent_store: PersistentAgentStore,
+    scoped_agent_store: AgentStore,
     workflow_store: Optional[WorkflowStore] = None,
     workflow_id: Optional[str] = None,
     task_id: Optional[str] = None,
@@ -1128,7 +1128,7 @@ class CapabilityApprovalStore:
         approval_request_id: str,
         *,
         decision: CapabilityApprovalDecision,
-        scoped_agent_store: PersistentAgentStore,
+        scoped_agent_store: AgentStore,
     ) -> CapabilityApprovalRequest:
         approval = self.require(approval_request_id)
         if approval.status != "pending":
@@ -1155,7 +1155,7 @@ class CapabilityApprovalStore:
         updated_payload["used_by_audit_id"] = None
         updated = CapabilityApprovalRequest.from_dict(updated_payload)
         path = self.save(updated)
-        decider_type = decider.agent_type
+        decider_type = decider.actor_category
         self._event_log.emit(
             event_type="approval_approved" if decision.decision == "approved" else "approval_denied",
             actor_id=decision.decided_by,
@@ -1581,7 +1581,7 @@ def find_approver(
     actor_id: str,
     risk_score: float,
     *,
-    scoped_agent_store: PersistentAgentStore,
+    scoped_agent_store: AgentStore,
 ) -> str:
     for ancestor_id in scoped_agent_store.ancestor_ids(actor_id):
         ancestor = scoped_agent_store.require_agent(ancestor_id)
@@ -1603,7 +1603,7 @@ def maybe_route_approval_request(
     *,
     approval_store: CapabilityApprovalStore,
     message_store: MessageStore,
-    scoped_agent_store: PersistentAgentStore,
+    scoped_agent_store: AgentStore,
 ) -> tuple[str, bool]:
     existing = approval_store.load(approval.approval_request_id)
     if existing is not None:

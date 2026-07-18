@@ -17,7 +17,7 @@ from mr1.memory_feedback import (
     feedback_id_for,
     update_insight_feedback,
 )
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.tools import default_tool_registry
 from mr1.workflow_models import Provenance, Workflow
 from mr1.workflow_store import WorkflowStore
@@ -43,7 +43,7 @@ def insight_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture

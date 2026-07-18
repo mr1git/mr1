@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from mr1.event_log import EventLog
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 _DEFAULT_ROOT = Path(__file__).resolve().parent / "memory" / "messages"
@@ -121,11 +121,11 @@ class MessageStore:
         self,
         root: Optional[Path] = None,
         *,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
     ):
         self._root = Path(root) if root else _DEFAULT_ROOT
         self._root.mkdir(parents=True, exist_ok=True)
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+        self._scoped_agents = scoped_agent_store or AgentStore(
             root=self._root.parent / "agents"
         )
         self._lock = threading.RLock()
@@ -197,7 +197,7 @@ class MessageStore:
         self._event_log.emit(
             event_type="message_sent",
             actor_id=from_agent_id,
-            actor_type=sender.agent_type,
+            actor_type=sender.actor_category,
             target_id=to_agent_id,
             target_type="agent",
             status="sent",
@@ -293,7 +293,7 @@ class MessageStore:
             self._event_log.emit(
                 event_type="message_read",
                 actor_id=reader_id,
-                actor_type=reader.agent_type if reader is not None else None,
+                actor_type=reader.actor_category if reader is not None else None,
                 target_id=updated.message_id,
                 target_type="message",
                 status="read",

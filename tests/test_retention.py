@@ -26,9 +26,9 @@ from mr1.autonomy.retention import RetentionManager, RetentionPolicy
 from mr1.clock import VirtualClock
 from mr1.event_archive import EventArchive, EventArchiveError
 from mr1.event_log import EventLog
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.scheduler import Scheduler
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Provenance, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -42,7 +42,7 @@ SPEC = {
             "label": "only",
             "title": "One task",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do it",
         }
     ],
@@ -58,7 +58,7 @@ def _emit(log: EventLog, n: int, *, start: int = 0) -> None:
         log.emit(
             event_type="workflow_created",
             actor_id="MR1",
-            actor_type="mr1",
+            actor_type="root_orchestrator",
             target_id=f"wf-{i}",
             target_type="workflow",
             status="pending",
@@ -177,7 +177,7 @@ def test_a_causal_parent_survives_rotation(tmp_path):
     parent = log.emit(
         event_type="capability_requested",
         actor_id="MR1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="shell_command",
         target_type="capability",
         status="requested",
@@ -191,7 +191,7 @@ def test_a_causal_parent_survives_rotation(tmp_path):
     child = log.emit(
         event_type="capability_allowed",
         actor_id="MR1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="shell_command",
         target_type="capability",
         status="allowed",
@@ -236,7 +236,7 @@ def test_a_corrupt_manifest_does_not_read_as_no_history(tmp_path):
 def runtime(tmp_path):
     root = tmp_path / "runtime"
     store = WorkflowStore(root=root / "workflows")
-    agents = PersistentAgentStore(root=root / "agents")
+    agents = AgentStore(root=root / "agents")
     return root, store, agents
 
 
@@ -388,7 +388,7 @@ def test_a_workflow_with_a_pending_approval_is_never_archived(runtime, monkeypat
     approvals = CapabilityApprovalStore(root / "capability_approvals", clock=clock)
     request = CapabilityRequest(
         actor_id=agents.root_agent_id,
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         actor_clearance=0.99,
         invocation_mode="workflow",
         capability_name="shell_command",

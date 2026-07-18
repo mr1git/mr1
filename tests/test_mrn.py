@@ -92,16 +92,16 @@ class TestParseResponse:
         assert text == "Just a normal answer."
         assert directive is None
 
-    def test_kazi_delegation(self):
-        raw = 'I will do it. [DELEGATE]{"agent": "kazi", "task": "read file", "context": "none"}[/DELEGATE]'
+    def test_worker_delegation(self):
+        raw = 'I will do it. [DELEGATE]{"agent": "worker", "task": "read file", "context": "none"}[/DELEGATE]'
         text, directive = _parse_response(raw)
         assert text == "I will do it."
-        assert directive["agent"] == "kazi"
+        assert directive["agent"] == "worker"
 
     def test_mrn_delegation(self):
-        raw = '[DELEGATE]{"agent": "mr3", "task": "complex job", "context": "ctx"}[/DELEGATE]'
+        raw = '[DELEGATE]{"agent": "orchestrator", "task": "complex job", "context": "ctx"}[/DELEGATE]'
         text, directive = _parse_response(raw)
-        assert directive["agent"] == "mr3"
+        assert directive["agent"] == "orchestrator"
 
     def test_invalid_agent_rejected(self):
         raw = '[DELEGATE]{"agent": "rogue", "task": "hack"}[/DELEGATE]'
@@ -114,12 +114,12 @@ class TestBuildSystemPrompt:
         prompt = _build_system_prompt(level=2, height_limit=4)
         assert "MR2" in prompt
         assert "MR3" in prompt
-        assert "Kazi" in prompt
+        assert "worker" in prompt
 
     def test_at_height_limit(self):
         prompt = _build_system_prompt(level=4, height_limit=4)
-        assert "CANNOT spawn manager agents" in prompt
-        assert "Kazi" in prompt
+        assert "CANNOT spawn another orchestrator" in prompt
+        assert "worker" in prompt
 
 
 class TestRun:

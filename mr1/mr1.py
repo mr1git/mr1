@@ -1,14 +1,15 @@
 """
-MR1 — Persistent Orchestrator Agent
-====================================
-The only truly persistent agent in the MR1 system. Conversation state is
-kept across turns by resuming a Claude Code session, while MR1 itself
-persists local task state, memory, and delegation history on disk.
+MR1 — Root Orchestrator Agent
+================================
+The root agent (role=orchestrator, mr_level=1, lifecycle=standing).
+Conversation state is kept across turns by resuming a Claude Code session,
+while MR1 itself persists local task state, memory, and delegation
+history on disk.
 
 MR1 decides whether to:
   1. Answer directly from its own knowledge/memory
-  2. Spawn an MR2 agent to manage a complex multi-step task
-  3. Spawn a Kazi directly for a simple one-shot job
+  2. Spawn an orchestrator agent (mr_level=2) to manage a complex multi-step task
+  3. Spawn a worker directly for a simple one-shot job
 
 MR1 never restarts unless /memdltr explicitly triggers the
 compression + restart cycle.
@@ -76,7 +77,7 @@ from mr1.orchestrator.root import (
     _CONTEXT_PATH as _CONTEXT_PATH,
     _MR1_CONFIG_PATH as _MR1_CONFIG_PATH,
     _MRN_CONFIG_PATH as _MRN_CONFIG_PATH,
-    _KAZI_CONFIG_PATH as _KAZI_CONFIG_PATH,
+    _WORKER_CONFIG_PATH as _WORKER_CONFIG_PATH,
     _OUTPUT_TRUNCATE_LINES as _OUTPUT_TRUNCATE_LINES,
     _MAX_DELEGATION_ROUNDS as _MAX_DELEGATION_ROUNDS,
     _MAX_OBSERVATION_ROUNDS as _MAX_OBSERVATION_ROUNDS,
@@ -102,15 +103,15 @@ from mr1.orchestrator.root import (
     _AGENT_REFERENCE_ALIASES as _AGENT_REFERENCE_ALIASES,
     _AGENT_CREATED_REFERENCE_ALIASES as _AGENT_CREATED_REFERENCE_ALIASES,
     _AUTO_REPLY_SYNTHESIS_MARKERS as _AUTO_REPLY_SYNTHESIS_MARKERS,
-    _DEFAULT_PERSISTENT_CHILD_TITLES as _DEFAULT_PERSISTENT_CHILD_TITLES,
+    _DEFAULT_ORCHESTRATOR_CHILD_TITLES as _DEFAULT_ORCHESTRATOR_CHILD_TITLES,
     _BULK_AGENT_ACTIONS as _BULK_AGENT_ACTIONS,
     _FINDINGS_PREFERRED_LABEL_TOKENS as _FINDINGS_PREFERRED_LABEL_TOKENS,
     _has_workflow_pronoun_reference as _has_workflow_pronoun_reference,
     _DELEGATE_PATTERN as _DELEGATE_PATTERN,
-    _PERSISTENT_DELEGATION_MARKERS as _PERSISTENT_DELEGATION_MARKERS,
-    _PERSISTENT_CHILD_TITLE_PATTERNS as _PERSISTENT_CHILD_TITLE_PATTERNS,
+    _ORCHESTRATOR_DELEGATION_MARKERS as _ORCHESTRATOR_DELEGATION_MARKERS,
+    _ORCHESTRATOR_CHILD_TITLE_PATTERNS as _ORCHESTRATOR_CHILD_TITLE_PATTERNS,
     _META_EXPLANATION_PATTERNS as _META_EXPLANATION_PATTERNS,
-    _PERSISTENT_DELEGATION_IMPERATIVE_PATTERNS as _PERSISTENT_DELEGATION_IMPERATIVE_PATTERNS,
+    _ORCHESTRATOR_DELEGATION_IMPERATIVE_PATTERNS as _ORCHESTRATOR_DELEGATION_IMPERATIVE_PATTERNS,
     _DUMP_COMPLETE_SIGNAL as _DUMP_COMPLETE_SIGNAL,
     _normalize_routing_text as _normalize_routing_text,
     _truncate_grounding_message_body as _truncate_grounding_message_body,

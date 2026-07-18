@@ -36,7 +36,7 @@ from mr1.memory_graph import EDGE_TYPES, NODE_TYPES, MemoryGraphStore
 from mr1.memory_queries import MEMORY_CAPABILITY_NAMES
 from mr1.memory_retrieval import LexicalMemoryRetriever, RETRIEVAL_DOC_TYPES, RetrievalStore
 from mr1.messages import PersistentMessage
-from mr1.scoped_agents import PersistentAgent
+from mr1.scoped_agents import AgentRecord
 from mr1.capability_policy import normalize_path
 from mr1.workflow_models import TaskStatus, Workflow, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
@@ -279,9 +279,9 @@ def _load_workflows_direct(runtime_root: Path) -> tuple[list[Workflow], list[str
     return workflows, errors
 
 
-def _load_agents_direct(runtime_root: Path) -> tuple[dict[str, PersistentAgent], list[str]]:
+def _load_agents_direct(runtime_root: Path) -> tuple[dict[str, AgentRecord], list[str]]:
     root = runtime_root / "agents"
-    agents: dict[str, PersistentAgent] = {}
+    agents: dict[str, AgentRecord] = {}
     errors: list[str] = []
     if not root.exists():
         return agents, errors
@@ -290,7 +290,7 @@ def _load_agents_direct(runtime_root: Path) -> tuple[dict[str, PersistentAgent],
             payload = _load_json_file(path)
             if not isinstance(payload, dict):
                 raise ValueError("agent payload must be an object")
-            agent = PersistentAgent.from_dict(payload)
+            agent = AgentRecord.from_dict(payload)
             agents[agent.agent_id] = agent
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             errors.append(f"{path}: {exc}")
@@ -1182,7 +1182,7 @@ def _validate_agents(runtime_root: Path) -> DoctorCheckResult:
     root_agents = [
         agent.agent_id
         for agent in agents.values()
-        if agent.agent_type == "mr1" and agent.parent_agent_id is None
+        if agent.mr_level == 1 and agent.parent_agent_id is None
     ]
     if len(root_agents) != 1:
         errors.append(f"expected exactly one root MR1 agent, found {len(root_agents)}")
@@ -1194,10 +1194,18 @@ def _validate_agents(runtime_root: Path) -> DoctorCheckResult:
             parent = agents.get(agent.parent_agent_id)
             if parent is None:
                 errors.append(f"{agent.agent_id}: missing parent {agent.parent_agent_id}")
-            elif agent.security_clearance > parent.security_clearance:
-                errors.append(
-                    f"{agent.agent_id}: security_clearance {agent.security_clearance} exceeds parent {parent.security_clearance}"
-                )
+            else:
+                if agent.security_clearance > parent.security_clearance:
+                    errors.append(
+                        f"{agent.agent_id}: security_clearance {agent.security_clearance} exceeds parent {parent.security_clearance}"
+                    )
+                if agent.mr_level != parent.mr_level + 1:
+                    errors.append(
+                        f"{agent.agent_id}: mr_level {agent.mr_level} is not parent {parent.agent_id}'s "
+                        f"mr_level {parent.mr_level} + 1"
+                    )
+        elif agent.mr_level != 1:
+            errors.append(f"{agent.agent_id}: has no parent but mr_level is {agent.mr_level}, expected 1")
         seen_in_chain: set[str] = set()
         current_id = agent.agent_id
         while True:

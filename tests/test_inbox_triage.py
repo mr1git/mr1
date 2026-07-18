@@ -10,10 +10,10 @@ import pytest
 from mr1 import inbox_triage as inbox_triage_module
 from mr1 import workflow_cli
 from mr1.inbox_triage import InboxTriagePolicy, InboxTriageRunner
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.messages import MessageStore
 from mr1.mr1 import MR1, StateManager
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_compiler import WorkflowCompilerClient
 from mr1.workflow_store import WorkflowStore
 
@@ -25,7 +25,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -140,13 +140,13 @@ def _compiler_envelope(*, needs_confirmation: bool = False) -> str:
     })
 
 
-def _root_and_child(agent_store: PersistentAgentStore, title: str = "research"):
+def _root_and_child(agent_store: AgentStore, title: str = "research"):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, title)
     return root, child
 
 
-def _root_message(message_store: MessageStore, agent_store: PersistentAgentStore, *, subject: str = "Update", body: str = "Body"):
+def _root_message(message_store: MessageStore, agent_store: AgentStore, *, subject: str = "Update", body: str = "Body"):
     root, child = _root_and_child(agent_store)
     message = message_store.create_message(
         from_agent_id=child.agent_id,

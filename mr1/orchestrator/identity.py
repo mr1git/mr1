@@ -20,7 +20,7 @@ _PKG_ROOT = Path(__file__).resolve().parent.parent
 _AGENTS_DIR = _PKG_ROOT / "agents"
 _MR1_CONFIG_PATH = _AGENTS_DIR / "mr1.yml"
 _MRN_CONFIG_PATH = _AGENTS_DIR / "mrn.yml"
-_KAZI_CONFIG_PATH = _AGENTS_DIR / "kazi.yml"
+_WORKER_CONFIG_PATH = _AGENTS_DIR / "worker.yml"
 
 
 def _load_agent_config(path: Path) -> dict:

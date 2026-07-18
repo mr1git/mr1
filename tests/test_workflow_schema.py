@@ -52,7 +52,7 @@ class TestWorkflowSchemaRegistry:
         task_kinds = default_workflow_schema_registry().describe_task_kinds()
 
         assert task_kinds["agent"]["required_fields"] == {
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "string",
         }
         assert task_kinds["tool"]["required_fields"] == {

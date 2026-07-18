@@ -41,7 +41,7 @@ from typing import Any, Optional
 from mr1.capability_policy import CapabilityMetadata, CapabilityRequest, normalize_path
 from mr1.clock import Clock, default_clock, parse_iso
 from mr1.event_log import EventLog
-from mr1.scoped_agents import MAX_AUTONOMOUS_CLEARANCE, PersistentAgentStore
+from mr1.scoped_agents import MAX_AUTONOMOUS_CLEARANCE, AgentStore
 
 
 CONSENT_DIR_NAME = "consent_grants"
@@ -296,7 +296,7 @@ class ConsentGrantStore:
         runtime_root: Path,
         *,
         clock: Optional[Clock] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
     ):
         self._runtime_root = Path(runtime_root)
         self._root = self._runtime_root / CONSENT_DIR_NAME
@@ -618,7 +618,7 @@ class ConsentGrantStore:
             self._event_log.emit(
                 event_type=event_type,
                 actor_id=grant.granted_by,
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id=grant.grant_id,
                 target_type="consent_grant",
                 status=status,

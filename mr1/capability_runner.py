@@ -40,7 +40,7 @@ from mr1.memory_queries import (
     memory_insights_search,
 )
 from mr1.memory_retrieval import update_memory_retrieval
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.memory_curator import InsightStore, evaluate_memory_curation_due_for_runtime_root
 from mr1.memory_graph import MemoryGraphStore
 from mr1.tools import _read_file_pure
@@ -79,12 +79,12 @@ class CapabilityRunner:
         self,
         *,
         capability_registry: Optional[CapabilityRegistry] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         message_store: Optional[MessageStore] = None,
         workspace_root: Optional[Path] = None,
     ):
         self._registry = capability_registry or default_capability_registry()
-        self._agents = scoped_agent_store or PersistentAgentStore()
+        self._agents = scoped_agent_store or AgentStore()
         self._workspace_root = Path(workspace_root) if workspace_root else self._agents.root.parent
         self._message_store = message_store or MessageStore(
             root=self._agents.root.parent / "messages",
@@ -113,7 +113,7 @@ class CapabilityRunner:
         except ValueError:
             raise ValueError(f"capability not found: {name}")
         caller_type = self._resolve_caller_type(caller_agent_id)
-        if caller_type not in {"mr1", "mrn"}:
+        if caller_type not in {"root_orchestrator", "orchestrator"}:
             raise ValueError("access denied")
         metadata = CapabilityMetadata.from_dict(meta)
         request = CapabilityRequest(
@@ -326,7 +326,7 @@ class CapabilityRunner:
         )
 
     def _resolve_caller_type(self, caller_agent_id: str) -> str:
-        return "mr1" if self._agents.is_root_agent(caller_agent_id) else "mrn"
+        return self._agents.require_agent(caller_agent_id).actor_category
 
     def _resolve_caller_clearance(self, caller_agent_id: str) -> float:
         return float(self._agents.require_agent(caller_agent_id).security_clearance)

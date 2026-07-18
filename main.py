@@ -29,7 +29,7 @@ _REQUIRED_DIRS = [
 _REQUIRED_AGENT_CONFIGS = [
     _PKG_DIR / "agents" / "mr1.yml",
     _PKG_DIR / "agents" / "mrn.yml",
-    _PKG_DIR / "agents" / "kazi.yml",
+    _PKG_DIR / "agents" / "worker.yml",
     _PKG_DIR / "agents" / "mini" / "mem_dltr.yml",
     _PKG_DIR / "agents" / "mini" / "mem_rtvr.yml",
     _PKG_DIR / "agents" / "mini" / "ctx_pkgr.yml",

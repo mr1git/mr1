@@ -1,9 +1,0 @@
-{
-  "category": "delegation",
-  "description": "Create persistent agent then send it a message",
-  "elapsed_s": 27.58,
-  "findings": [],
-  "scenario": "deleg_persistent_then_message",
-  "session_error": null,
-  "turn_count": 2
-}

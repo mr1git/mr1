@@ -105,14 +105,14 @@ class TestDistill:
             "started_at": "2026-01-01T00:00:00",
             "tasks": {
                 "task-done": {
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "status": "completed",
                     "description": "finished task",
                     "started_at": "2026-01-01T00:00:00",
                     "finished_at": "2026-01-01T00:01:00",
                 },
                 "task-running": {
-                    "agent_type": "kami",
+                    "agent_type": "orchestrator",
                     "status": "running",
                     "description": "still running",
                     "started_at": "2026-01-01T00:00:00",

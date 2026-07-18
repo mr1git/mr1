@@ -8,12 +8,12 @@ import pytest
 
 from mr1.capability_policy import CapabilityApprovalDecision, CapabilityApprovalStore
 from mr1.capability_runner import CapabilityRunner
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentStore
 
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture

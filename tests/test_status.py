@@ -34,7 +34,7 @@ from mr1.autonomy.status import (
     collect_status,
 )
 from mr1.clock import VirtualClock
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -45,7 +45,7 @@ def runtime(tmp_path):
     root = tmp_path / "runtime"
     root.mkdir(parents=True)
     (root / "workflows").mkdir()
-    PersistentAgentStore(root=root / "agents")
+    AgentStore(root=root / "agents")
     return root
 
 
@@ -266,11 +266,11 @@ def test_an_unanswered_approval_escalates_from_warning_to_error(runtime):
     clock = _clock()
     _beat(runtime, clock)
 
-    agents = PersistentAgentStore(root=runtime / "agents")
+    agents = AgentStore(root=runtime / "agents")
     approvals = CapabilityApprovalStore(runtime / "capability_approvals", clock=clock)
     request = CapabilityRequest(
         actor_id=agents.root_agent_id,
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         actor_clearance=0.99,
         invocation_mode="workflow",
         capability_name="shell_command",
@@ -308,7 +308,7 @@ def test_an_unanswered_approval_escalates_from_warning_to_error(runtime):
 def test_a_quarantined_objective_is_an_error_and_a_waiting_one_is_a_warning(runtime):
     clock = _clock()
     _beat(runtime, clock)
-    agents = PersistentAgentStore(root=runtime / "agents")
+    agents = AgentStore(root=runtime / "agents")
     store = ObjectiveStore(runtime, clock=clock)
 
     waiting = store.create(
@@ -399,7 +399,7 @@ def test_scheduler_tick_errors_are_surfaced(runtime):
 def test_an_expiring_grant_warns_before_the_objective_stalls(runtime):
     clock = _clock()
     _beat(runtime, clock)
-    agents = PersistentAgentStore(root=runtime / "agents")
+    agents = AgentStore(root=runtime / "agents")
     grants = ConsentGrantStore(runtime, clock=clock, scoped_agent_store=agents)
 
     grants.create(

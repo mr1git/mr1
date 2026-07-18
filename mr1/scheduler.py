@@ -64,7 +64,7 @@ from mr1.dataflow import (
     parse_input_reference,
     register_artifacts,
 )
-from mr1.kazi_runner import (
+from mr1.worker_runner import (
     MockRunner,
     RunHandle,
     RunResult,
@@ -79,7 +79,7 @@ from mr1.tools import (
 )
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore, is_agent_terminal
+from mr1.scoped_agents import AgentStore, is_agent_terminal
 from mr1.scheduler_core.attempts import (
     AttemptManager,
     UNSET as ATTEMPT_UNSET,
@@ -174,7 +174,7 @@ def validate_spec(
       * `tasks` is a non-empty list.
       * each task has a non-empty `label`.
       * labels are unique across the workflow.
-      * each agent task has `agent_type == "kazi"`.
+      * each agent task has `agent_type == "worker"`.
       * each watcher task has a registered `watcher_type` and valid config.
       * `depends_on` entries must reference labels defined in the same spec.
       * no cycles (topological sort must succeed).
@@ -204,9 +204,9 @@ def validate_spec(
 
         task_kind = raw.get("task_kind", "agent")
         if task_kind == "agent":
-            agent_type = raw.get("agent_type", "kazi")
+            agent_type = raw.get("agent_type", "worker")
             if not agents.is_registered(agent_type):
-                supported_agents = ", ".join(repr(name) for name in agents.list_agents()) or "'kazi'"
+                supported_agents = ", ".join(repr(name) for name in agents.list_agents()) or "'worker'"
                 raise WorkflowSpecError(
                     f"task '{label}': agent_type '{agent_type}' not supported (only {supported_agents})"
                 )
@@ -318,7 +318,7 @@ def build_workflow_from_spec(
     created_by: Provenance,
     owner_agent_id: Optional[str] = None,
     workflow_metadata: Optional[dict[str, Any]] = None,
-    scoped_agent_store: Optional[PersistentAgentStore] = None,
+    scoped_agent_store: Optional[AgentStore] = None,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
     agent_registry: Optional[AgentRegistry] = None,
@@ -335,7 +335,7 @@ def build_workflow_from_spec(
         agent_registry=agent_registry,
     )
 
-    scoped_agents = scoped_agent_store or PersistentAgentStore()
+    scoped_agents = scoped_agent_store or AgentStore()
     resolved_owner_agent_id = owner_agent_id or scoped_agents.root_agent_id
     owner_agent = scoped_agents.require_agent(resolved_owner_agent_id)
     if is_agent_terminal(owner_agent):
@@ -370,7 +370,7 @@ def build_workflow_from_spec(
             label=raw["label"],
             title=raw.get("title", raw["label"]),
             task_kind=raw.get("task_kind", "agent"),
-            agent_type=raw.get("agent_type", "kazi")
+            agent_type=raw.get("agent_type", "worker")
             if raw.get("task_kind", "agent") == "agent" else None,
             prompt=raw.get("prompt", "")
             if raw.get("task_kind", "agent") == "agent" else "",
@@ -418,7 +418,7 @@ def submit_spec_to_disk(
     owner_agent_id: Optional[str] = None,
     caller_agent_id: Optional[str] = None,
     workflow_metadata: Optional[dict[str, Any]] = None,
-    scoped_agent_store: Optional[PersistentAgentStore] = None,
+    scoped_agent_store: Optional[AgentStore] = None,
     watcher_registry: Optional[WatcherRegistry] = None,
     tool_registry: Optional[ToolRegistry] = None,
     agent_registry: Optional[AgentRegistry] = None,
@@ -431,7 +431,7 @@ def submit_spec_to_disk(
     Called by both `Scheduler.submit_workflow` (in-process) and the
     standalone `workflow_cli submit` command.
     """
-    scoped_agents = scoped_agent_store or PersistentAgentStore()
+    scoped_agents = scoped_agent_store or AgentStore()
     if caller_agent_id is not None:
         scoped_agents.require_agent(caller_agent_id)
     resolved_owner_agent_id = (
@@ -830,7 +830,7 @@ class Scheduler:
         auto_tick: bool = True,
         tick_interval_s: float = 1.0,
         agent_id: str = "scheduler",
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         message_store: Optional[MessageStore] = None,
         workspace_root: Optional[Path] = None,
         logger: Optional[Logger] = None,
@@ -862,7 +862,7 @@ class Scheduler:
         self._watchers = watcher_registry or default_watcher_registry()
         self._tools = tool_registry or default_tool_registry()
         self._capabilities = capability_registry or default_capability_registry()
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+        self._scoped_agents = scoped_agent_store or AgentStore(
             root=self._store.root.parent / "agents"
         )
         self._message_store = message_store or MessageStore(
@@ -1022,7 +1022,7 @@ class Scheduler:
             self._timeline.emit(
                 event_type="scheduler_tick_failed",
                 actor_id=self._agent_id,
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id="scheduler",
                 target_type="scheduler",
                 status="error",

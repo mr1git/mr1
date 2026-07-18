@@ -37,7 +37,7 @@ class Spawner:
     Usage:
         spawner = Spawner()
         record = spawner.spawn(
-            agent_type="kazi",
+            agent_type="worker",
             task_id="task-001",
             prompt="Summarize the README",
             model="claude-3-5-haiku-20241022",

@@ -61,7 +61,7 @@ def _important_capability_failure(event_log: EventLog) -> str:
     requested = event_log.emit(
         event_type="capability_requested",
         actor_id="ag-1",
-        actor_type="mrn",
+        actor_type="orchestrator",
         target_id="read_file",
         target_type="capability",
         status="requested",
@@ -70,7 +70,7 @@ def _important_capability_failure(event_log: EventLog) -> str:
     failed = event_log.emit(
         event_type="capability_failed",
         actor_id="ag-1",
-        actor_type="mrn",
+        actor_type="orchestrator",
         target_id="read_file",
         target_type="capability",
         status="failed",
@@ -110,7 +110,7 @@ def test_due_check_false_without_important_events(event_log: EventLog, insight_s
     event_log.emit(
         event_type="capability_requested",
         actor_id="ag-1",
-        actor_type="mrn",
+        actor_type="orchestrator",
         target_id="read_file",
         target_type="capability",
         status="requested",

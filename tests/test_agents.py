@@ -11,7 +11,7 @@ import pytest
 
 from mr1 import workflow_cli
 from mr1.agents import default_agent_registry, run_agent_health
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.mrn_loop import MRnStepResult
 from mr1.mrn_run import MRnRunResult
 from mr1.mr1 import MR1, StateManager
@@ -39,12 +39,12 @@ class TestAgentRegistry:
     def test_lists_runtime_profiles(self):
         registry = default_agent_registry()
 
-        assert registry.list_agents() == ["kazi", "memory_curator", "workflow_compiler"]
+        assert registry.list_agents() == ["memory_curator", "worker", "workflow_compiler"]
 
     def test_describe_agent_shape(self):
-        description = default_agent_registry().describe_agent("kazi")
+        description = default_agent_registry().describe_agent("worker")
 
-        assert description["name"] == "kazi"
+        assert description["name"] == "worker"
         assert description["type"] == "agent"
         assert description["runtime"]["binary"] == "claude"
         assert description["runtime"]["supports_json_output"] is True
@@ -98,7 +98,7 @@ class TestAgentHealth:
             ),
         ]
 
-        result = run_agent_health("kazi")
+        result = run_agent_health("worker")
 
         assert result["status"] == "healthy"
         assert result["checks"]["binary"] == "/usr/local/bin/claude"
@@ -112,7 +112,7 @@ class TestAgentHealth:
     def test_health_failure_missing_binary(self, mock_which):
         mock_which.return_value = None
 
-        result = run_agent_health("kazi")
+        result = run_agent_health("worker")
 
         assert result["status"] == "unhealthy"
         assert result["checks"]["binary"] == "missing"
@@ -137,7 +137,7 @@ class TestAgentHealth:
             ),
         ]
 
-        result = run_agent_health("kazi")
+        result = run_agent_health("worker")
 
         assert result["status"] == "unhealthy"
         assert result["checks"]["prompt_test"] == "passed"
@@ -153,22 +153,22 @@ class TestAgentCli:
         assert rc == 0
         out = capsys.readouterr().out
         assert "MR1" in out
-        assert "mr1" in out
+        assert "orchestrator" in out
 
     def test_agent_command(self, store, capsys):
-        rc = workflow_cli.main(["agent", "kazi"], store=store)
+        rc = workflow_cli.main(["agent", "worker"], store=store)
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "name:         kazi" in out
+        assert "name:         worker" in out
         assert '"binary": "claude"' in out
 
     def test_agent_json_command(self, store, capsys):
-        rc = workflow_cli.main(["agent", "kazi", "--json"], store=store)
+        rc = workflow_cli.main(["agent", "worker", "--json"], store=store)
 
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["name"] == "kazi"
+        assert payload["name"] == "worker"
         assert payload["runtime"]["binary"] == "claude"
 
     @patch("mr1.workflow_cli.run_agent_health")
@@ -186,11 +186,11 @@ class TestAgentCli:
             },
         }
 
-        rc = workflow_cli.main(["agent", "kazi", "health"], store=store)
+        rc = workflow_cli.main(["agent", "worker", "health"], store=store)
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "agent:       kazi" in out
+        assert "agent:       worker" in out
         assert "status:      healthy" in out
         assert "binary: /usr/local/bin/claude" in out
 
@@ -208,15 +208,15 @@ class TestAgentBuiltins:
         output = mr1._handle_builtin("/agents")
 
         assert "MR1" in output
-        assert "mr1" in output
+        assert "orchestrator" in output
 
     def test_agent_builtin(self, tmp_path):
         mr1 = _build_mr1(tmp_path)
 
-        output = mr1._handle_builtin("/agent kazi --json")
+        output = mr1._handle_builtin("/agent worker --json")
         payload = json.loads(output)
 
-        assert payload["name"] == "kazi"
+        assert payload["name"] == "worker"
         assert payload["runtime"]["supports_json_output"] is True
 
     @patch("mr1.workflow_cli.run_agent_health")
@@ -235,9 +235,9 @@ class TestAgentBuiltins:
             },
         }
 
-        output = mr1._handle_builtin("/agent kazi health")
+        output = mr1._handle_builtin("/agent worker health")
 
-        assert "agent:       kazi" in output
+        assert "agent:       worker" in output
         assert "status:      healthy" in output
 
     def test_unknown_agent_builtin_is_deterministic(self, tmp_path):
@@ -257,7 +257,7 @@ class TestAgentBuiltins:
         reloaded = mr1._scoped_agents.require_agent(child.agent_id)
         assert reloaded.mission == "Investigate the repo"
 
-    def test_persistent_agent_builtins_show_derived_lifecycle_for_legacy_conflict(self, tmp_path):
+    def test_agent_builtins_show_derived_activity_for_legacy_conflict(self, tmp_path):
         mr1 = _build_mr1(tmp_path)
         child = mr1._scoped_agents.create_child_agent(mr1._root_agent_id, "research")
         child.run_status = "terminated"
@@ -270,7 +270,7 @@ class TestAgentBuiltins:
         assert "terminated" in child_line
         assert "status:       active" in agent_output
         assert "run_status:   terminated" in agent_output
-        assert "lifecycle:    terminated" in agent_output
+        assert "activity:     terminated" in agent_output
         assert "status_conflict: yes" in agent_output
 
     def test_runtime_agent_json_builtin_includes_assignment_packet(self, tmp_path):

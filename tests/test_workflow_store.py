@@ -25,7 +25,7 @@ def _make_workflow(wf_id: str = "wf-test") -> Workflow:
         label="a",
         title="Task A",
         task_kind="agent",
-        agent_type="kazi",
+        agent_type="worker",
         prompt="Say hi",
         status=TaskStatus.READY,
     )

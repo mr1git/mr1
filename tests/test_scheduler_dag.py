@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from mr1 import workflow_events as ev
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
@@ -24,14 +24,14 @@ SPEC = {
             "label": "a",
             "title": "Task A",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do a",
         },
         {
             "label": "b",
             "title": "Task B",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do b",
             "depends_on": ["a"],
         },
@@ -39,7 +39,7 @@ SPEC = {
             "label": "c",
             "title": "Task C",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do c",
             "depends_on": ["a"],
         },
@@ -185,11 +185,11 @@ class TestDagProgression:
                 "title": "parallel",
                 "tasks": [
                     {"label": "a", "title": "a", "task_kind": "agent",
-                     "agent_type": "kazi", "prompt": "x"},
+                     "agent_type": "worker", "prompt": "x"},
                     {"label": "b", "title": "b", "task_kind": "agent",
-                     "agent_type": "kazi", "prompt": "x"},
+                     "agent_type": "worker", "prompt": "x"},
                     {"label": "c", "title": "c", "task_kind": "agent",
-                     "agent_type": "kazi", "prompt": "x"},
+                     "agent_type": "worker", "prompt": "x"},
                 ],
             }
             wf_id = sched.submit_workflow(spec, Provenance(type="agent", id="MR1"))
@@ -220,14 +220,14 @@ class TestDataflowDag:
                     "label": "a",
                     "title": "Produce",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Produce text",
                 },
                 {
                     "label": "b",
                     "title": "Consume",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Summarize the upstream text.",
                     "depends_on": ["a"],
                     "inputs": [{"name": "producer_text", "from": "a.result.text"}],
@@ -267,14 +267,14 @@ class TestDataflowDag:
                     "label": "a",
                     "title": "Produce",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Produce text",
                 },
                 {
                     "label": "b",
                     "title": "Consume",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Consume metrics",
                     "depends_on": ["a"],
                     "inputs": [{"name": "accuracy", "from": "a.result.metrics.accuracy"}],
@@ -311,7 +311,7 @@ class TestDataflowDag:
                             "label": "a",
                             "title": "Produce",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "prompt": "Produce artifact",
                         }
                     ],

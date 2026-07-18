@@ -51,9 +51,10 @@ from tests.soak.hierarchical.outcomes import (
     COMMAND,
     DIRECT,
     INSPECTION,
-    MESSAGE,
     NO_ACTION,
-    PERSISTENT_AGENT,
+    ORCHESTRATOR_CREATED,
+    ORCHESTRATOR_REUSED,
+    WORKER_SPAWN,
     WORKFLOW,
     Turn,
 )
@@ -119,15 +120,15 @@ _CATEGORY_A: List[EpisodicCluster] = [
         category="A",
         topic="direct ownership request",
         goal="A direct request to own a broad, ongoing responsibility becomes "
-             "a persistent agent, then is scoped by follow-up without "
+             "an orchestrator, then is scoped by follow-up without "
              "spawning a duplicate.",
         turns=[
             _a("I want somebody to own runtime testing. Make an agent for that.",
-               (PERSISTENT_AGENT, CLARIFY), expect_agent=True,
+               (ORCHESTRATOR_CREATED, CLARIFY), expect_agent=True,
                note="direct ownership request -> persistent owner"),
             _a("Good. Have it start read-only — just report on what's "
                "covered so far.",
-               (COMMAND, MESSAGE, DIRECT, CLARIFY), forbid_agent=True,
+               (COMMAND, ORCHESTRATOR_REUSED, DIRECT, CLARIFY), forbid_agent=True,
                references=("it",),
                note="scope the just-created owner; must not spawn again"),
         ],
@@ -137,13 +138,15 @@ _CATEGORY_A: List[EpisodicCluster] = [
         category="A",
         topic="bounded investigation",
         goal="A broad but bounded investigation request is treated as "
-             "investigation — a workflow or direct pass, not an automatic "
-             "standing commitment.",
+             "investigation — a worker delegation or a workflow, not an "
+             "automatic standing commitment and not an ungrounded refusal.",
         uses_fixture=True,
         turns=[
             _a("Investigate this repository.",
-               (WORKFLOW, INSPECTION, COMMAND, CLARIFY, DIRECT),
-               note="broad but bounded investigation ask"),
+               (WORKER_SPAWN, WORKFLOW, INSPECTION, COMMAND, CLARIFY, DIRECT),
+               note="broad but bounded investigation ask — a bounded worker "
+                    "spawn or proportionate workflow is preferred over a "
+                    "direct answer or canned refusal"),
             _talk("What did you find?",
                   "follow-up must read back real findings, not invent new work"),
         ],
@@ -158,8 +161,9 @@ _CATEGORY_A: List[EpisodicCluster] = [
         uses_fixture=True,
         turns=[
             _a("Take a look through this repo and tell me what seems fragile.",
-               (WORKFLOW, INSPECTION, COMMAND, CLARIFY, DIRECT),
-               note="broad but bounded investigation ask, alternate phrasing"),
+               (WORKER_SPAWN, WORKFLOW, INSPECTION, COMMAND, CLARIFY, DIRECT),
+               note="broad but bounded investigation ask, alternate phrasing "
+                    "— a bounded worker spawn is preferred"),
             _talk("What did you find?",
                   "follow-up must read back real findings, not invent new work"),
         ],
@@ -174,8 +178,9 @@ _CATEGORY_A: List[EpisodicCluster] = [
         uses_fixture=True,
         turns=[
             _a("Figure out why these tests are flaky.",
-               (WORKFLOW, INSPECTION, COMMAND, CLARIFY, DIRECT),
-               note="targeted bounded investigation ask"),
+               (WORKER_SPAWN, WORKFLOW, INSPECTION, COMMAND, CLARIFY, DIRECT),
+               note="targeted bounded investigation ask — a bounded worker "
+                    "spawn is preferred"),
             _talk("What did you find?",
                   "follow-up must read back real findings, not invent new work"),
         ],
@@ -188,7 +193,7 @@ _CATEGORY_A: List[EpisodicCluster] = [
              "standing owner, not a single check.",
         turns=[
             _a("Keep an eye on this codebase — make an agent to own that.",
-               (PERSISTENT_AGENT, WORKFLOW, CLARIFY),
+               (ORCHESTRATOR_CREATED, WORKFLOW, CLARIFY),
                note="ongoing monitoring ask -> standing owner is the natural read"),
             _talk("What would it actually watch for?",
                   "follow-up discussion, no duplicate creation"),
@@ -202,7 +207,7 @@ _CATEGORY_A: List[EpisodicCluster] = [
         turns=[
             _a("Create a persistent agent called 'watchtower' that monitors "
                "open approvals.",
-               (PERSISTENT_AGENT, CLARIFY), expect_agent=True),
+               (ORCHESTRATOR_CREATED, CLARIFY), expect_agent=True),
             _a("Please stop that agent.",
                (COMMAND, DIRECT, CLARIFY), forbid_agent=True,
                references=("that agent",),
@@ -261,11 +266,67 @@ _CATEGORY_A: List[EpisodicCluster] = [
              "than overloading the first.",
         turns=[
             _a("Make an agent to own the overall code review for this repo.",
-               (PERSISTENT_AGENT, CLARIFY), expect_agent=True),
+               (ORCHESTRATOR_CREATED, CLARIFY), expect_agent=True),
             _a("We need security covered too — make an agent to own "
                "security review.",
-               (PERSISTENT_AGENT, CLARIFY), expect_agent=True,
+               (ORCHESTRATOR_CREATED, CLARIFY), expect_agent=True,
                note="genuinely different responsibility -> a second agent is right"),
+        ],
+    ),
+    EpisodicCluster(
+        name="bare_bounded_inspection",
+        category="A",
+        topic="bare bounded inspection, no explicit worker instruction",
+        goal="A bare 'take a look through this repo' is treated as a bounded "
+             "investigation — MR1 should reach for a worker on its own, "
+             "without Marwan having to say 'spawn a worker.'",
+        uses_fixture=True,
+        turns=[
+            _a("Take a look through this repo.",
+               (WORKER_SPAWN, WORKFLOW, INSPECTION, CLARIFY, DIRECT),
+               note="tests whether MR1 naturally uses a worker for bounded "
+                    "context isolation without being told to"),
+            _talk("What did you find?",
+                  "follow-up must read back real findings, not invent new work"),
+        ],
+    ),
+    EpisodicCluster(
+        name="open_ended_bounded_opinion",
+        category="A",
+        topic="open-ended bounded opinion request",
+        goal="An open-ended 'does anything worry you' request gets a "
+             "delegated focused pass and a grounded opinion back, not "
+             "another intake menu.",
+        uses_fixture=True,
+        turns=[
+            _a("See if anything here worries you.",
+               (WORKER_SPAWN, WORKFLOW, INSPECTION, CLARIFY, DIRECT),
+               note="tests whether MR1 delegates a focused pass and returns "
+                    "a grounded opinion instead of producing another intake "
+                    "menu"),
+            _talk("What did you find?",
+                  "follow-up must read back a real, grounded opinion, not "
+                  "invent new work"),
+        ],
+    ),
+    EpisodicCluster(
+        name="worker_to_orchestrator_escalation",
+        category="A",
+        topic="worker-to-orchestrator escalation",
+        goal="A bounded probe escalates to durable ownership only once "
+             "recurrence is named — the critical boundary test: bounded "
+             "probe -> repeated responsibility -> durable owner.",
+        turns=[
+            _a("Can you check whether the scheduler is dropping ticks?",
+               (WORKER_SPAWN, WORKFLOW, CLARIFY),
+               note="a bounded probe -> worker_spawn or a proportionate "
+                    "bounded workflow, not a standing owner yet"),
+            _a("Yeah, this keeps coming up every week.",
+               (ORCHESTRATOR_CREATED, DIRECT, CLARIFY),
+               note="recurrence named -> recognize the pattern and either "
+                    "create/propose a project_scoped or standing owner; "
+                    "silently repeating another one-shot check would miss "
+                    "the escalation signal"),
         ],
     ),
 ]
@@ -289,7 +350,7 @@ _CATEGORY_B_TOPICS: List[EpisodicCluster] = [
             _b("I don't know, I just keep thinking about it but never start.",
                "read this as a procrastination/motivation moment, not an "
                "operational request — direct discussion or a light offer is "
-               "appropriate; spawning a persistent agent here would be "
+               "appropriate; spawning an orchestrator here would be "
                "presumptuous"),
             _b("yeah... maybe. what would it even take?",
                "a real, grounded answer about scope and first steps; this is "
@@ -323,9 +384,11 @@ _CATEGORY_B_TOPICS: List[EpisodicCluster] = [
                "straight to a build plan is not"),
             _b("maybe it's worth actually looking into.",
                "a soft green light for a bounded look, not a permanent "
-               "owner — a small workflow-sized investigation is a "
-               "reasonable next step, but so is asking what 'looking into' "
-               "should mean"),
+               "owner — a small, disclosed worker probe (or a "
+               "workflow-sized investigation) is a reasonable next step and "
+               "should be recognized as good, cheap behavior here, not "
+               "penalized as under-reacting; so is asking what 'looking "
+               "into' should mean"),
         ],
     ),
     EpisodicCluster(
@@ -343,10 +406,12 @@ _CATEGORY_B_TOPICS: List[EpisodicCluster] = [
                "still discussion — help him articulate the worry before "
                "proposing any action"),
             _b("maybe someone should actually go through it properly.",
-               "this is the point where a bounded investigation or a "
-               "persistent reviewer becomes reasonable — but it should "
+               "this is the point where a bounded investigation — a "
+               "disclosed worker probe is a cheap, good option here, not "
+               "just a persistent reviewer — becomes reasonable; it should "
                "still confirm scope rather than silently commit to the "
-               "biggest possible interpretation"),
+               "biggest possible interpretation (a full standing reviewer "
+               "is a bigger commitment than this sentence alone justifies)"),
         ],
     ),
     EpisodicCluster(
@@ -409,7 +474,7 @@ _CATEGORY_B_TOPICS: List[EpisodicCluster] = [
             _b("I keep forgetting to do this, honestly.",
                "a memory/attention complaint — discussing it or offering a "
                "lightweight reminder is reasonable; unilaterally spinning "
-               "up a persistent agent is over-initiative"),
+               "up an orchestrator is over-initiative"),
             _b("I wonder if this deserves more attention.",
                "an open question, not a decision — direct discussion is "
                "the safe read; committing to a workflow or owner here "
@@ -468,9 +533,12 @@ _CATEGORY_B_RESTRAINT: List[EpisodicCluster] = [
         turns=[
             _b("Someone should really fix all the flaky tests at some point.",
                "a passive complaint aimed at nobody in particular — "
-               "spawning an owner or workflow immediately would be "
-               "presumptuous; discussion or a scoped clarifying question "
-               "is correct"),
+               "spawning a standing owner or a workflow immediately would "
+               "be presumptuous; discussion or a scoped clarifying question "
+               "is correct, and so is a lightweight, disclosed worker probe "
+               "('want me to spawn a quick check on which tests are flaky?') "
+               "since that's cheap and reversible — but a worker is not "
+               "required here, this is not a mandate to always investigate"),
         ],
     ),
 ]

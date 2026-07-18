@@ -1,6 +1,6 @@
 # MR1 — Multi-Agent Orchestration System
 
-MR1 is a persistent, terminal-based multi-agent system built on the Claude CLI. A top-level orchestrator (`MR1`) maintains a live conversation with the user and routes tasks to specialised sub-agents: `Kami` handles complex, multi-step work with broad tool access, while `Kazi` handles scoped one-shot jobs. A set of lightweight mini-agents manages memory, context packaging, and communication summarisation without ever invoking an LLM — all deterministic, no surprises.
+MR1 is a terminal-based multi-agent system built on the Claude CLI. Every agent has three independent properties — `mr_level` (its depth in the hierarchy: MR1 is level 1, its children are level 2, and so on), `role` (`orchestrator` or `worker`), and `lifecycle` (how long it's expected to exist) — see [docs/architecture/AGENT_ONTOLOGY.md](docs/architecture/AGENT_ONTOLOGY.md) for the full model. The root orchestrator (`MR1`, `mr_level=1`, `lifecycle=standing`) maintains a live conversation with the user and routes tasks: it creates orchestrator children for ownership/delegation, or delegates a single scoped job to a worker for a one-shot task with no delegation capability. A set of lightweight mini-agents manages memory, context packaging, and communication summarisation without ever invoking an LLM — all deterministic, no surprises.
 
 ## How to run
 
@@ -34,7 +34,7 @@ The new TUI is a separate read-only runtime viewer over the persisted MR1 state.
 
 It provides:
 
-- a live MR1/MRn tree with MR1 pinned at the top
+- a live agent tree (all MR levels) with MR1 pinned at the top
 - keyboard-first navigation by parent, child, and sibling
 - timeline mode for recent runtime events
 - a right-side detail panel for the selected agent or event
@@ -53,19 +53,19 @@ For synthetic workload generation in the plain loop, use:
 ## Agent hierarchy
 
 ```
-MR1 (persistent orchestrator — haiku)
- ├── Kami  (senior autonomous agent — haiku)
- │    └── Kazi  (task worker — haiku)
- └── Kazi  (task worker — haiku)
+MR1 (mr_level=1, role=orchestrator, lifecycle=standing — haiku)
+ ├── "Repository Inspector"  (mr_level=2, role=orchestrator, lifecycle=project_scoped — haiku)
+ │    └── worker  (role=worker, lifecycle=ephemeral, one scoped job — haiku)
+ └── worker  (role=worker, lifecycle=ephemeral, one scoped job — haiku)
 
 Mini agents (no LLM calls, deterministic):
  ├── mem_dltr   memory distillation & garbage collection
  ├── mem_rtvr   memory retrieval (chromadb RAG + dump search)
- ├── ctx_pkgr   context packaging for Kazi prompts
+ ├── ctx_pkgr   context packaging for worker prompts
  └── com_smrzr  communication summarisation → RAG ingestion
 ```
 
-MR1 decides per-turn whether to answer directly, delegate to Kami (complex), or delegate to Kazi (simple). All spawns pass through the `Dispatcher` permission gate before any subprocess is created.
+MR1 decides per-turn whether to answer directly, create/delegate to an orchestrator (ownership, one MR level below the caller), or delegate to a worker (a single scoped one-shot job). All spawns pass through the `Dispatcher` permission gate before any subprocess is created. See [docs/architecture/AGENT_ONTOLOGY.md](docs/architecture/AGENT_ONTOLOGY.md) for the full role/level/lifecycle model.
 
 ## Built-in commands (while MR1 is running)
 
@@ -105,7 +105,7 @@ Supported commands in the plain loop:
 | `/artifacts <workflow_id>` | List registered artifacts for a workflow |
 | `/jobs` | List live workflow tasks |
 | `/watchers` | List active watcher tasks |
-| `/agents` | List persistent scoped agents visible to the caller |
+| `/agents` | List scoped agents visible to the caller |
 | `/agent create <title>` | Create a scoped MRn child agent |
 | `/agent <ag-id>` | Show one scoped agent record and its reports |
 | `/agent run <ag-id> --steps N` | Run a bounded multi-step MRn loop under explicit policy |
@@ -123,7 +123,7 @@ Supported commands in the plain loop:
 | `/timeline trace <correlation_id>` | Trace one causal chain |
 | `/timeline blocked` | Show currently blocked timeline items |
 | `/timeline approvals` | Show approval lifecycle events |
-| `/agent kazi` | Show one runtime agent profile |
+| `/agent worker` | Show one runtime agent profile |
 | `/capabilities` | List all registered capabilities across tools, watchers, and agents |
 | `/capability <name>` | Show one capability contract |
 | `/schema [section]` | Show workflow schema metadata (`workflow`, `task`, `inputs`, `refs`, `task-kinds`) |
@@ -132,7 +132,7 @@ Supported commands in the plain loop:
 | `/events <workflow_id>` | Show recent workflow events |
 | `/scheduler tick` | Force one deterministic scheduler pass |
 
-Phase 1 started with DAGs of Kazi agent tasks. Phase 2 adds deterministic watcher tasks that gate downstream work without invoking an LLM.
+Phase 1 started with DAGs of worker agent tasks. Phase 2 adds deterministic watcher tasks that gate downstream work without invoking an LLM.
 
 A minimal agent-only spec looks like:
 
@@ -194,8 +194,8 @@ python -m mr1.workflow_cli timeline show <event_id>
 python -m mr1.workflow_cli timeline trace <correlation_id>
 python -m mr1.workflow_cli timeline blocked
 python -m mr1.workflow_cli timeline approvals
-python -m mr1.workflow_cli agent kazi
-python -m mr1.workflow_cli agent kazi health
+python -m mr1.workflow_cli agent worker
+python -m mr1.workflow_cli agent worker health
 python -m mr1.workflow_cli result <task_id>
 python -m mr1.workflow_cli inputs <task_id>
 python -m mr1.workflow_cli artifacts <workflow_id>
@@ -277,14 +277,14 @@ Branch example:
       "label": "check",
       "title": "Check exit code",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "prompt": "Run the check."
     },
     {
       "label": "success_path",
       "title": "Success path",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": ["check"],
       "run_if": {
         "ref": "check.result.data.exit_code",
@@ -297,7 +297,7 @@ Branch example:
       "label": "failure_path",
       "title": "Failure path",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": ["check"],
       "run_if": {
         "ref": "check.result.data.exit_code",
@@ -310,7 +310,7 @@ Branch example:
       "label": "final",
       "title": "Join",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": ["success_path", "failure_path"],
       "dependency_policy": "any_succeeded",
       "prompt": "Summarize the branch result."
@@ -355,7 +355,7 @@ An example watcher workflow is available at `examples/workflows/watcher_demo.jso
 2. Run `/scheduler tick` until `/watchers` shows `wait_file` as running.
 3. Create the file with `touch /tmp/mr1_watcher_demo.txt`.
 4. Run `/scheduler tick` again.
-5. Confirm the watcher succeeded and the downstream Kazi task unlocked.
+5. Confirm the watcher succeeded and the downstream worker task unlocked.
 
 ## Phase 3: Workflow Dataflow + Artifacts
 
@@ -411,14 +411,14 @@ Example Phase 3 workflow:
       "label": "producer",
       "title": "Produce text",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "prompt": "Write hello world."
     },
     {
       "label": "consumer",
       "title": "Consume producer output",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": ["producer"],
       "inputs": [
         {"name": "producer_text", "from": "producer.result.text"}
@@ -487,12 +487,14 @@ The distinction matters during workflow authoring:
 
 ## Scoped Agents
 
-MR1 now persists a scoped agent tree alongside workflows.
+MR1 now persists a scoped agent tree alongside workflows. Every persisted
+agent here is `role=orchestrator` — see
+[docs/architecture/AGENT_ONTOLOGY.md](docs/architecture/AGENT_ONTOLOGY.md).
 
-- MR1 is the root agent and can see every workflow and agent branch.
-- MRn agents are persistent child agents with their own `ag-...` identity, title, parent, level, lifecycle state, and owned workflows.
+- MR1 is the root agent (`mr_level=1`, `lifecycle=standing`) and can see every workflow and agent branch.
+- Orchestrator children have their own `ag-...` identity, title, parent, `mr_level`, `lifecycle` (`project_scoped` by default), and owned workflows.
 - Workflows are not global. Each workflow stores `owner_agent_id`, `owner_agent_title`, and `parent_agent_id`.
-- MRn visibility is limited to self plus descendants. Sibling and parent branches are hidden.
+- An orchestrator's visibility is limited to self plus descendants. Sibling and parent branches are hidden.
 - Terminating an agent blocks future workflow creation for that agent, but its existing workflows and reports remain on disk.
 
 Scoped agent commands:
@@ -510,13 +512,13 @@ Scoped agent commands:
 Scoped workflow rules:
 
 - MR1 can inspect and mutate every workflow.
-- MRn can inspect and mutate only workflows it owns or workflows owned by descendant agents.
+- A non-root orchestrator can inspect and mutate only workflows it owns or workflows owned by descendant agents.
 - Workflow-id commands return `access denied: workflow not in agent scope` when the caller is outside the owning branch.
 - Task-id lookups resolve only inside the caller's visible workflows.
 
-## Persistent MRn Execution Step
+## MRn Execution Step
 
-MR1 is the root MRn at `tree_level=1`. Persistent MRn agents can now be assigned a mission and advanced one bounded step at a time.
+MR1 is the root orchestrator at `mr_level=1`. Any orchestrator agent (any MR level) can be assigned a mission and advanced one bounded step at a time.
 
 - `/agent step <ag-id>` runs exactly one reasoning/action iteration.
 - MRn actions are structured and deterministic: create a scoped workflow, inspect a scoped workflow, write a report, ask the parent for clarification, or stay idle.
@@ -526,7 +528,7 @@ MR1 is the root MRn at `tree_level=1`. Persistent MRn agents can now be assigned
 
 ## Controlled MRn Runs
 
-MRn can now execute multiple bounded steps under an explicit MR1-controlled run policy.
+An orchestrator agent can now execute multiple bounded steps under an explicit MR1-controlled run policy.
 
 - `step` runs one iteration and returns immediately.
 - `run` executes up to a fixed number of iterations and stops deterministically when policy requires it.
@@ -576,7 +578,7 @@ mr1/memory/agents/<agent_id>/logs/runs.jsonl
 
 Workflow validation and scoped ownership rules are unchanged. A bounded run can request workflow creation, but it cannot bypass workflow confirmation policy, runtime validation, or agent scope.
 
-## Persistent Agent Messaging
+## Agent Messaging
 
 MR1 now persists local durable agent messages under:
 
@@ -585,10 +587,10 @@ mr1/memory/messages/<message_id>.json
 ```
 
 - Messages are local coordination records, not external notifications.
-- MRn agents do not contact the user directly.
-- MRn agents report upward through MR1/root, and MR1 decides what reaches the user.
-- Root can read all messages and send to any persistent agent.
-- MRn agents can read only their own inbox/outbox and can send only to their parent or owned descendants.
+- Orchestrator agents do not contact the user directly.
+- Orchestrator agents report upward through MR1/root, and MR1 decides what reaches the user.
+- Root can read all messages and send to any agent.
+- A non-root orchestrator can read only its own inbox/outbox and can send only to its parent or owned descendants.
 - Archived messages remain on disk and are hidden from inbox/outbox listings unless explicitly requested.
 
 Inspection and control commands:
@@ -622,7 +624,7 @@ python -m mr1.workflow_cli message-send <ag-id> "subject" path/to/body.txt
 Inbox triage is a single bounded coordination pass over unread root inbox messages. MR1 reads a capped slice of unread messages, produces a JSON-only triage plan, executes a small number of safe local actions, then stops.
 
 - There is no daemon, background worker, or autonomous loop.
-- Triage can summarize messages, mark or archive them, reply locally, advance scoped MRn agents, assign missions, or prepare a workflow.
+- Triage can summarize messages, mark or archive them, reply locally, advance scoped orchestrator agents, assign missions, or prepare a workflow.
 - Workflow creation keeps the existing confirmation path: if the compiler requires confirmation, MR1 stores a pending workflow draft instead of submitting immediately.
 - Triage never sends email, SMS, or any other external message.
 
@@ -655,20 +657,20 @@ The distinction from the other capability types is:
 You can inspect the registered agent profiles directly:
 
 ```text
-/agent kazi
-/agent kazi --json
-/agent kazi health
+/agent worker
+/agent worker --json
+/agent worker health
 ```
 
 And through the deterministic CLI:
 
 ```bash
-python -m mr1.workflow_cli agent kazi
-python -m mr1.workflow_cli agent kazi --json
-python -m mr1.workflow_cli agent kazi health
+python -m mr1.workflow_cli agent worker
+python -m mr1.workflow_cli agent worker --json
+python -m mr1.workflow_cli agent worker health
 ```
 
-`/agent kazi health` validates the binary path, version response, runtime config, dispatcher-approved flags, non-interactive prompt execution, auth state, and JSON envelope parsing.
+`/agent worker health` validates the binary path, version response, runtime config, dispatcher-approved flags, non-interactive prompt execution, auth state, and JSON envelope parsing.
 
 ## WorkflowCompiler Agentic Tool
 
@@ -700,8 +702,8 @@ You can inspect those contracts directly:
 /tools
 /tool shell_command --example
 /agents
-/agent kazi
-/agent kazi health
+/agent worker
+/agent worker health
 ```
 
 Example tool to agent handoff:
@@ -723,7 +725,7 @@ Example tool to agent handoff:
       "label": "summarize",
       "title": "Summarize notes",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": ["read_notes"],
       "inputs": [
         {"name": "notes", "from": "read_notes.result.text"}
@@ -787,9 +789,9 @@ python -c "from mr1.mini.mem_dltr import distill; distill()"
 mr1/
 ├── main.py                  entry point
 ├── mr1/
-│   ├── mr1.py               persistent orchestrator
+│   ├── mr1.py               root orchestrator (lifecycle=standing)
 │   ├── kami.py              senior autonomous agent
-│   ├── kazi.py              ephemeral task worker
+│   ├── worker.py             ephemeral task worker
 │   ├── core/
 │   │   ├── dispatcher.py    permission gate (no LLM)
 │   │   ├── spawner.py       subprocess lifecycle manager

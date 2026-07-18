@@ -34,7 +34,7 @@ from mr1.memory_graph import (
 )
 from mr1.memory_retrieval import RetrievalStore, update_memory_retrieval
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgent, PersistentAgentStore
+from mr1.scoped_agents import AgentRecord, AgentStore
 from mr1.scheduler import submit_spec_to_disk
 from mr1.workflow_models import Provenance
 from mr1.workflow_store import WorkflowStore
@@ -51,12 +51,12 @@ def workflow_store(runtime_root: Path) -> WorkflowStore:
 
 
 @pytest.fixture
-def agent_store(runtime_root: Path) -> PersistentAgentStore:
-    return PersistentAgentStore(root=runtime_root / "agents")
+def agent_store(runtime_root: Path) -> AgentStore:
+    return AgentStore(root=runtime_root / "agents")
 
 
 @pytest.fixture
-def message_store(runtime_root: Path, agent_store: PersistentAgentStore) -> MessageStore:
+def message_store(runtime_root: Path, agent_store: AgentStore) -> MessageStore:
     return MessageStore(root=runtime_root / "messages", scoped_agent_store=agent_store)
 
 
@@ -79,7 +79,7 @@ def _seed_event_log(runtime_root: Path) -> EventLog:
     log.emit(
         event_type="workflow_created",
         actor_id="cli",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="wf-1",
         target_type="workflow",
         status="pending",
@@ -197,7 +197,7 @@ def _seed_feedback(runtime_root: Path, *, duplicate: bool = False) -> None:
 
 def _seed_workflow(
     workflow_store: WorkflowStore,
-    agent_store: PersistentAgentStore,
+    agent_store: AgentStore,
     owner_agent_id: str,
     *,
     title: str = "Doctor workflow",
@@ -211,7 +211,7 @@ def _seed_workflow(
                     "label": "a",
                     "title": "A",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "x",
                 }
             ],
@@ -224,7 +224,7 @@ def _seed_workflow(
     )
 
 
-def _seed_pending_approval(runtime_root: Path, agent_store: PersistentAgentStore) -> str:
+def _seed_pending_approval(runtime_root: Path, agent_store: AgentStore) -> str:
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "child", security_clearance=0.1)
     approval = CapabilityApprovalRequest(
@@ -238,7 +238,7 @@ def _seed_pending_approval(runtime_root: Path, agent_store: PersistentAgentStore
         scope_summary={"scope_roots": []},
         original_request=CapabilityRequest(
             actor_id=child.agent_id,
-            actor_type="mrn",
+            actor_type="orchestrator",
             actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
@@ -471,7 +471,7 @@ def test_doctor_missing_memory_maintenance_workflow_is_warning(runtime_root: Pat
     assert maintenance_check.status == "warning"
 
 
-def test_doctor_valid_agent_tree_is_ok(runtime_root: Path, agent_store: PersistentAgentStore):
+def test_doctor_valid_agent_tree_is_ok(runtime_root: Path, agent_store: AgentStore):
     root = agent_store.ensure_root_agent()
     agent_store.create_child_agent(root.agent_id, "child")
 
@@ -480,18 +480,18 @@ def test_doctor_valid_agent_tree_is_ok(runtime_root: Path, agent_store: Persiste
     assert report.status == "ok"
 
 
-def test_doctor_agent_missing_parent_clearance_and_cycle_are_errors(runtime_root: Path, agent_store: PersistentAgentStore):
+def test_doctor_agent_missing_parent_clearance_and_cycle_are_errors(runtime_root: Path, agent_store: AgentStore):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "child", security_clearance=0.5)
     payload = child.to_dict()
     payload["parent_agent_id"] = "ag-missing"
     payload["security_clearance"] = 2.0
     _write_json(runtime_root / "agents" / f"{child.agent_id}.json", payload)
-    cyclic = PersistentAgent(
+    cyclic = AgentRecord(
         agent_id="ag-cycle",
-        agent_type="mrn",
+        role="orchestrator",
         title="cycle",
-        tree_level=2,
+        mr_level=2,
         parent_agent_id="ag-cycle",
         security_clearance=0.1,
     )
@@ -530,7 +530,7 @@ def test_doctor_capabilities_detect_invalid_metadata(monkeypatch, runtime_root: 
 
 def test_doctor_pending_approval_and_unread_message_are_warning(
     runtime_root: Path,
-    agent_store: PersistentAgentStore,
+    agent_store: AgentStore,
     message_store: MessageStore,
 ):
     requester_id = _seed_pending_approval(runtime_root, agent_store)
@@ -662,7 +662,7 @@ def test_snapshot_cli_variants(runtime_root: Path, workflow_store: WorkflowStore
     assert payload["snapshot_id"] == snapshot_id
 
 
-def test_doctor_workflow_maintenance_presence_and_warning(runtime_root: Path, workflow_store: WorkflowStore, agent_store: PersistentAgentStore):
+def test_doctor_workflow_maintenance_presence_and_warning(runtime_root: Path, workflow_store: WorkflowStore, agent_store: AgentStore):
     root = agent_store.ensure_root_agent()
     _seed_workflow(workflow_store, agent_store, root.agent_id, metadata={"system_workflow": "memory_maintenance"})
 
@@ -743,14 +743,14 @@ class TestRepairStateFile:
         state.write_text("{bad", encoding="utf-8")
 
         from mr1.workflow_store import WorkflowStore
-        from mr1.scoped_agents import PersistentAgentStore
+        from mr1.scoped_agents import AgentStore
         from mr1.cli.memory import _cmd_repair_state
         import argparse
 
         # Build a minimal args namespace mirroring what the real parser produces.
         args = argparse.Namespace(state_path=str(state), json=False)
         store = WorkflowStore(root=tmp_path / "workflows")
-        sa = PersistentAgentStore(root=tmp_path / "agents")
+        sa = AgentStore(root=tmp_path / "agents")
         rc = _cmd_repair_state(args, store, "test-actor", sa)
 
         assert rc == 0
@@ -763,14 +763,14 @@ class TestRepairStateFile:
         state.write_text('{"session_id": "ok"}', encoding="utf-8")
 
         from mr1.workflow_store import WorkflowStore
-        from mr1.scoped_agents import PersistentAgentStore
+        from mr1.scoped_agents import AgentStore
         from mr1.cli.memory import _cmd_repair_state
         import argparse
         import sys
 
         args = argparse.Namespace(state_path=str(state), json=False)
         store = WorkflowStore(root=tmp_path / "workflows")
-        sa = PersistentAgentStore(root=tmp_path / "agents")
+        sa = AgentStore(root=tmp_path / "agents")
         rc = _cmd_repair_state(args, store, "test-actor", sa)
 
         assert rc == 2

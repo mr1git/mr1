@@ -71,7 +71,7 @@ def render_tree_lines(
             else:
                 label.append("│  " if has_more else "   ", style="dim")
         style = color_for_agent(
-            depth=agent.tree_level,
+            depth=agent.mr_level,
             status=agent.status,
             run_status=agent.run_status,
             selected=agent_id == selected_agent_id,
@@ -120,13 +120,15 @@ def render_timeline_lines(
 
 def format_agent_detail(detail: dict[str, Any]) -> list[str]:
     lines = [
-        detail.get("title") or "MRn",
+        detail.get("title") or "Unnamed agent",
         f"agent_id: {detail.get('agent_id', '-')}",
+        f"role: {detail.get('role', '-')}",
         f"status: {detail.get('status', '-')}",
         f"run_status: {detail.get('run_status', '-')}",
-        f"lifecycle: {detail.get('lifecycle_status', detail.get('status', '-'))}",
+        f"activity: {detail.get('lifecycle_status', detail.get('status', '-'))}",
+        f"lifecycle: {detail.get('lifecycle', '-')}",
         f"status_conflict: {'yes' if detail.get('status_conflict') else 'no'}",
-        f"tree_level: {detail.get('tree_level', '-')}",
+        f"mr_level: {detail.get('mr_level', '-')}",
         f"parent: {detail.get('parent_agent_id') or '-'}",
         f"clearance: {detail.get('security_clearance', '-')}",
         f"owned_workflows: {len(detail.get('owned_workflow_ids', []))}",

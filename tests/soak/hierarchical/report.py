@@ -30,7 +30,7 @@ def render_report(layout: RunLayout, result: Dict[str, Any]) -> str:
     rollup = result.get("rollup", {})
     w(f"- **planner:** `{result.get('planner')}`  ·  **restarted mid-conversation:** "
       f"{result.get('restarted')}")
-    w(f"- **turns:** {counts.get('turns')}  ·  **persistent agents:** {counts.get('agents')}  ·  "
+    w(f"- **turns:** {counts.get('turns')}  ·  **orchestrator agents:** {counts.get('agents')}  ·  "
       f"**messages:** {counts.get('messages')}  ·  **workflows:** {counts.get('workflows')}")
     if rollup:
         w(f"- **RSS:** {rollup.get('rss_start_mb')}→{rollup.get('rss_end_mb')} MB  ·  "
@@ -129,7 +129,7 @@ def _render_hierarchy(w, result: Dict[str, Any]) -> None:
         for a in sorted(by_parent.get(node_id, []), key=lambda x: x.get("created_at", "")):
             status = a.get("status", "active")
             w(f"{'  ' * depth}- **{a.get('title')}** "
-              f"(`{a.get('agent_id')}`, {a.get('agent_type')}, depth {a.get('tree_level')}, {status})")
+              f"(`{a.get('agent_id')}`, {a.get('agent_type')}, depth {a.get('mr_level')}, {status})")
             walk(a.get("agent_id"), depth + 1)
 
     root = next((a for a in agents if a.get("agent_id") == root_id), None)
@@ -151,7 +151,7 @@ def _render_agent_rationale(w, transcript) -> None:
             w(f"- **{a.get('title')}** — from turn [{e['index']}] "
               f"({e['text']!r}). Mission: {a.get('mission') or '(none recorded)'}")
     if not any_agent:
-        w("_No persistent agents were created in this run._")
+        w("_No orchestrator agents were created in this run._")
     w("")
 
 
@@ -273,14 +273,14 @@ def _render_marwan_judgment(w, result, transcript) -> None:
     outcomes = counts.get("outcomes", {})
 
     judgments: List[str] = []
-    if outcomes.get("direct_response", 0) and outcomes.get("persistent_agent", 0):
+    if outcomes.get("direct_response", 0) and outcomes.get("orchestrator_created", 0):
         judgments.append(
             "MR1 kept discussion and action distinct — architectural questions were "
             "answered directly, and only genuinely broad, long-lived responsibilities "
-            "became persistent agents.")
+            "became orchestrator agents.")
     if agents <= result.get("limits", {}).get("max_total_agents", 12):
         judgments.append(
-            f"The hierarchy stayed small ({agents} persistent agents), well under the "
+            f"The hierarchy stayed small ({agents} orchestrator agents), well under the "
             f"ceiling — it did not manufacture owners it did not need.")
     if outcomes.get("workflow", 0):
         judgments.append(

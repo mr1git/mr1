@@ -9,12 +9,12 @@ from unittest.mock import patch
 import pytest
 
 from mr1.capability_runner import CapabilityRunner
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -257,9 +257,9 @@ class TestAuditLog:
 
 
 class TestCallerTypeResolution:
-    def test_root_agent_resolves_to_mr1(self, agent_store, runner, root_agent_id):
-        assert runner._resolve_caller_type(root_agent_id) == "mr1"
+    def test_root_agent_resolves_to_root_orchestrator(self, agent_store, runner, root_agent_id):
+        assert runner._resolve_caller_type(root_agent_id) == "root_orchestrator"
 
-    def test_child_agent_resolves_to_mrn(self, agent_store, runner, root_agent_id):
+    def test_child_agent_resolves_to_orchestrator(self, agent_store, runner, root_agent_id):
         child = agent_store.create_child_agent(root_agent_id, "child")
-        assert runner._resolve_caller_type(child.agent_id) == "mrn"
+        assert runner._resolve_caller_type(child.agent_id) == "orchestrator"

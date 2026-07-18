@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
@@ -17,7 +17,7 @@ SPEC = {
             "label": "a",
             "title": "A",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "x",
         }
     ],
@@ -112,14 +112,14 @@ class TestAttempts:
                     "label": "a",
                     "title": "A",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "x",
                 },
                 {
                     "label": "b",
                     "title": "B",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "y",
                     "depends_on": ["a"],
                 },

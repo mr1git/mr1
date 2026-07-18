@@ -70,7 +70,31 @@ _RUN_COMMAND_VERBS = (
     "tell",
     "stop",
 )
-_PERSISTENT_MARKERS = (
+_RECURRENCE_LANGUAGE_MARKERS = (
+    # Phase D.4: recurrence language is only ever an *advisory signal* — it
+    # names a pattern worth noticing, never a command. Whether it should
+    # actually surface an ownership consideration is decided in
+    # `orchestrator/root.py` (`_recent_investigation_unresolved`), which
+    # additionally requires a recent bounded investigation in this same
+    # conversation. Matching here is deliberately broad/cheap.
+    "keeps happening",
+    "keeps coming up",
+    "keeps breaking",
+    "keeps recurring",
+    "every week",
+    "every day",
+    "every month",
+    "every single time",
+    "recurring",
+    "nobody owns this",
+    "no one owns this",
+    "we revisit this constantly",
+    "we keep revisiting this",
+    "repeatedly breaks",
+    "happened again",
+    "again",
+)
+_ORCHESTRATOR_OWNERSHIP_MARKERS = (
     "persistent agent",
     "owner agent",
     "own self-evolution",
@@ -85,7 +109,19 @@ _PERSISTENT_MARKERS = (
     "self-evolving",
     "not handled by mr1 directly",
 )
-_PERSISTENT_IMPERATIVE_PATTERNS = (
+_BOUNDED_INVESTIGATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Bounded, one-shot investigation of the actual repo/codebase content —
+    # distinct from `inspect_existing_state`, which is about MR1's own
+    # runtime state (agents/workflows/approvals), and from
+    # `orchestrator_ownership`, which asks for a standing owner.
+    re.compile(r"\binvestigate\s+(?:this|the)\s+(?:repo|repository|codebase)\b", re.IGNORECASE),
+    re.compile(r"\b(?:take\s+a\s+)?look\s+(?:through|into|over)\s+(?:this|the)\s+(?:repo|repository|codebase)\b", re.IGNORECASE),
+    re.compile(r"\bfigure\s+out\s+why\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+seems\s+fragile\b", re.IGNORECASE),
+    re.compile(r"\b(?:see\s+if|check\s+(?:whether|if))\s+anything\b.{0,40}\bworr(?:y|ies)\s+you\b", re.IGNORECASE),
+    re.compile(r"\bcheck\s+(?:whether|if)\b.{0,60}\b(?:dropping|failing|broken|stuck|hanging|flaky)\b", re.IGNORECASE),
+)
+_ORCHESTRATOR_IMPERATIVE_PATTERNS = (
     re.compile(r"\bcreate\s+(?:a|an)\s+(?!workflow\b)(?:\w+\s+){0,3}(?:agent|child)\b", re.IGNORECASE),
     re.compile(
         r"\b(?:spawn|make|add|start|set\s+up)\s+(?!workflow\b)(?:(?:a|an)\s+)?(?:\w+\s+){0,4}(?:agent|agents|child|children)\b",
@@ -316,11 +352,11 @@ def _advice(
     )
 
 
-_PERSISTENT_IMPERATIVE_PATTERN_LABELS = (
+_ORCHESTRATOR_IMPERATIVE_PATTERN_LABELS = (
     "create agent imperative",
     "spawn/make/add/start agent imperative",
     "create owner agent imperative",
-    "create persistent agent imperative",
+    "create orchestrator imperative",
     "create agent to own imperative",
     "have an agent own imperative",
     "delegate domain ownership imperative",
@@ -354,18 +390,30 @@ def _matched_inspection_phrases(normalized: str) -> list[str]:
     return list(dict.fromkeys(matched))
 
 
-def _matched_persistent_agent_patterns(user_input: str, normalized: str) -> list[str]:
+def _matched_orchestrator_ownership_patterns(user_input: str, normalized: str) -> list[str]:
     matched = [
         label
-        for label, pattern in zip(_PERSISTENT_IMPERATIVE_PATTERN_LABELS, _PERSISTENT_IMPERATIVE_PATTERNS)
+        for label, pattern in zip(_ORCHESTRATOR_IMPERATIVE_PATTERN_LABELS, _ORCHESTRATOR_IMPERATIVE_PATTERNS)
         if pattern.search(user_input)
     ]
     matched.extend(
         marker
-        for marker in _PERSISTENT_MARKERS
+        for marker in _ORCHESTRATOR_OWNERSHIP_MARKERS
         if marker in normalized
     )
     return list(dict.fromkeys(matched))
+
+
+def _matched_recurrence_language(normalized: str) -> list[str]:
+    return [marker for marker in _RECURRENCE_LANGUAGE_MARKERS if _contains_phrase(normalized, marker)]
+
+
+def _matched_bounded_investigation_patterns(user_input: str, normalized: str) -> list[str]:
+    return [
+        f"bounded investigation pattern #{i}"
+        for i, pattern in enumerate(_BOUNDED_INVESTIGATION_PATTERNS)
+        if pattern.search(user_input)
+    ]
 
 
 def _matched_workflow_patterns(
@@ -412,7 +460,9 @@ def _build_route_signals(
     return {
         "matched_operational_verbs": _matched_operational_verbs(normalized),
         "matched_inspection_phrases": _matched_inspection_phrases(normalized),
-        "matched_persistent_agent_patterns": _matched_persistent_agent_patterns(user_input, normalized),
+        "matched_orchestrator_ownership_patterns": _matched_orchestrator_ownership_patterns(user_input, normalized),
+        "matched_bounded_investigation_patterns": _matched_bounded_investigation_patterns(user_input, normalized),
+        "matched_recurrence_language": _matched_recurrence_language(normalized),
         "matched_workflow_patterns": _matched_workflow_patterns(
             user_input,
             normalized,
@@ -447,13 +497,13 @@ def build_route_advice(
         pending_state=pending_state,
         required_refs=required_refs,
     )
-    persistent_request = (
+    orchestrator_ownership_request = (
         not _is_meta_request(normalized)
-        and any(pattern.search(user_input) for pattern in _PERSISTENT_IMPERATIVE_PATTERNS)
+        and any(pattern.search(user_input) for pattern in _ORCHESTRATOR_IMPERATIVE_PATTERNS)
     )
-    persistent_request = persistent_request or (
+    orchestrator_ownership_request = orchestrator_ownership_request or (
         not _is_meta_request(normalized)
-        and any(marker in normalized for marker in _PERSISTENT_MARKERS)
+        and any(marker in normalized for marker in _ORCHESTRATOR_OWNERSHIP_MARKERS)
         and (
             "agent" in normalized
             or "child" in normalized
@@ -531,6 +581,22 @@ def build_route_advice(
             signals=signals,
         )
 
+    if (
+        not orchestrator_ownership_request
+        and not _is_meta_request(normalized)
+        and _matched_bounded_investigation_patterns(user_input, normalized)
+    ):
+        return _advice(
+            "bounded_investigation",
+            required_refs=required_refs,
+            side_effects_allowed=True,
+            recommended_commands=["spawn_worker"],
+            confidence=0.85,
+            reason="The turn asks for a bounded, one-shot investigation of the repo/system rather than "
+                   "ongoing ownership — a worker delegation is proportionate.",
+            signals=signals,
+        )
+
     if _has_explicit_operational_intent(normalized):
         if message_ids and _REPLY_INTENT_PATTERN.search(user_input):
             return _advice(
@@ -598,7 +664,7 @@ def build_route_advice(
     has_inspection_intent = has_inspection_intent or bool(
         re.search(r"\bwhat\s+workflows?\s+are\s+running\b", normalized)
     )
-    if has_inspection_intent and not persistent_request and not _is_meta_request(normalized):
+    if has_inspection_intent and not orchestrator_ownership_request and not _is_meta_request(normalized):
         explicit_state_refs = bool(workflow_ids or task_ids or agent_ids)
         workflow_language = any(
             token in normalized for token in ("workflow", "task", "findings", "results", "status", "running")
@@ -651,24 +717,24 @@ def build_route_advice(
             )
 
     if not _is_meta_request(normalized):
-        if persistent_request and any(pattern.search(user_input) for pattern in _PERSISTENT_IMPERATIVE_PATTERNS):
+        if orchestrator_ownership_request and any(pattern.search(user_input) for pattern in _ORCHESTRATOR_IMPERATIVE_PATTERNS):
             return _advice(
-                "persistent_agent",
+                "orchestrator_ownership",
                 required_refs=required_refs,
                 side_effects_allowed=True,
-                recommended_commands=["list_agents", "create_persistent_agent", "send_message_to_agent"],
+                recommended_commands=["list_agents", "create_orchestrator", "send_message_to_agent"],
                 confidence=0.94,
-                reason="The turn requests long-term ownership/delegation to a persistent agent rather than one-shot execution.",
+                reason="The turn requests long-term ownership/delegation to an orchestrator rather than one-shot execution.",
                 signals=signals,
             )
-        if persistent_request:
+        if orchestrator_ownership_request:
             return _advice(
-                "persistent_agent",
+                "orchestrator_ownership",
                 required_refs=required_refs,
                 side_effects_allowed=True,
-                recommended_commands=["list_agents", "create_persistent_agent", "send_message_to_agent"],
+                recommended_commands=["list_agents", "create_orchestrator", "send_message_to_agent"],
                 confidence=0.82,
-                reason="The turn describes persistent ownership or self-evolution handling outside MR1's direct execution path.",
+                reason="The turn describes ongoing (orchestrator-level) ownership or self-evolution handling outside MR1's direct execution path.",
                 signals=signals,
             )
 

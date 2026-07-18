@@ -416,7 +416,7 @@ def default_agent_registry() -> AgentRegistry:
     if _DEFAULT_REGISTRY is None:
         registry = AgentRegistry()
         registry.register(
-            "kazi",
+            "worker",
             description="Claude Code CLI-based reasoning agent for scoped workflow execution.",
             config_schema={
                 "model": {"type": "string", "required": False, "optional": True},
@@ -455,11 +455,11 @@ def default_agent_registry() -> AgentRegistry:
                     "label": "summarize",
                     "title": "Summarize",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Summarize the provided inputs.",
                 }
             ],
-            config_path=_AGENTS_DIR / "kazi.yml",
+            config_path=_AGENTS_DIR / "worker.yml",
         )
         registry.register(
             "workflow_compiler",
@@ -503,7 +503,7 @@ def default_agent_registry() -> AgentRegistry:
                     "label": "compile_workflow",
                     "title": "Compile workflow",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "This profile is inspectable only and cannot be used in workflow tasks.",
                 }
             ],
@@ -550,7 +550,7 @@ def default_agent_registry() -> AgentRegistry:
                     "label": "curate_memory",
                     "title": "Curate memory",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "This profile is internal only and cannot be used in workflow tasks.",
                 }
             ],

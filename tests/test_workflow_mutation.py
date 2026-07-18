@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.scheduler import (
     Scheduler,
     WorkflowSpecError,
@@ -36,7 +36,7 @@ class TestWorkflowMutation:
         spec = {
             "title": "Append",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
             ],
         }
         wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))
@@ -50,7 +50,7 @@ class TestWorkflowMutation:
                         "label": "b",
                         "title": "B",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "prompt": "y",
                         "depends_on": ["a"],
                     }
@@ -69,8 +69,8 @@ class TestWorkflowMutation:
         spec = {
             "title": "Insert",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
-                {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "kazi", "prompt": "y", "depends_on": ["a"]},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
+                {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "worker", "prompt": "y", "depends_on": ["a"]},
             ],
         }
         wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))
@@ -85,7 +85,7 @@ class TestWorkflowMutation:
                         "label": "x",
                         "title": "X",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "prompt": "mid",
                     }
                 ]
@@ -104,7 +104,7 @@ class TestWorkflowMutation:
         spec = {
             "title": "Replace",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "old"},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "old"},
             ],
         }
         wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))
@@ -124,7 +124,7 @@ class TestWorkflowMutation:
                         "label": "a",
                         "title": "A2",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "prompt": "new",
                     }
                 ]
@@ -144,7 +144,7 @@ class TestWorkflowMutation:
         spec = {
             "title": "Replace reject",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "old"},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "old"},
             ],
         }
         wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))
@@ -165,7 +165,7 @@ class TestWorkflowMutation:
                             "label": "a",
                             "title": "A2",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "prompt": "new",
                         }
                     ]

@@ -15,7 +15,7 @@ from mr1.autonomy.objectives import KIND_ONCE, KIND_RECURRING, KIND_STANDING
 from mr1.autonomy.triggers import MISSED_RUN_POLICIES
 from mr1.event_log import bind_correlation_id, cli_correlation_id
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_store import WorkflowStore
 
 # Handler imports — every `_cmd_X` function used in `set_defaults(func=...)`
@@ -56,6 +56,7 @@ from mr1.cli.events import (
 from mr1.cli.memory import (
     _cmd_doctor,
     _cmd_repair_state,
+    _cmd_migrate_ontology,
     _cmd_memory_agent,
     _cmd_memory_capabilities,
     _cmd_memory_curate,
@@ -242,6 +243,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_repair_state.add_argument("--json", action="store_true", dest="json")
     p_repair_state.set_defaults(func=_cmd_repair_state)
 
+    p_migrate_ontology = subs.add_parser(
+        "migrate-ontology",
+        help=(
+            "Migrate agent JSON files to the current role/mr_level/lifecycle "
+            "schema. Idempotent; safe to re-run."
+        ),
+    )
+    p_migrate_ontology.add_argument("--json", action="store_true", dest="json")
+    p_migrate_ontology.set_defaults(func=_cmd_migrate_ontology)
+
     p_snapshot = subs.add_parser("snapshot", help="Create and inspect runtime snapshots.")
     snapshot_subs = p_snapshot.add_subparsers(dest="snapshot_command", required=True)
 
@@ -322,7 +333,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_tools, include_example=False)
     p_tools.set_defaults(func=_cmd_tools)
 
-    p_agents = subs.add_parser("agents", help="List persistent scoped agents.")
+    p_agents = subs.add_parser("agents", help="List scoped agents.")
     add_common_flags(p_agents, include_example=False)
     p_agents.set_defaults(func=_cmd_agents)
 
@@ -341,16 +352,16 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_flags(p_agent, include_example=False)
     p_agent.set_defaults(func=_cmd_agent)
 
-    p_agent_assign = subs.add_parser("agent-assign", help="Assign a mission file to a persistent scoped agent.")
+    p_agent_assign = subs.add_parser("agent-assign", help="Assign a mission file to a scoped agent.")
     p_agent_assign.add_argument("agent_id")
     p_agent_assign.add_argument("mission_file")
     p_agent_assign.set_defaults(func=_cmd_agent_assign)
 
-    p_agent_step = subs.add_parser("agent-step", help="Run one bounded MRn step for a persistent scoped agent.")
+    p_agent_step = subs.add_parser("agent-step", help="Run one bounded MRn step for a scoped agent.")
     p_agent_step.add_argument("agent_id")
     p_agent_step.set_defaults(func=_cmd_agent_step)
 
-    p_agent_run = subs.add_parser("agent-run", help="Run a bounded multi-step MRn run for a persistent scoped agent.")
+    p_agent_run = subs.add_parser("agent-run", help="Run a bounded multi-step MRn run for a scoped agent.")
     p_agent_run.add_argument("agent_id")
     p_agent_run.add_argument("--steps", type=int, default=3)
     p_agent_run.add_argument("--max-workflows", type=int, default=2)
@@ -1008,14 +1019,14 @@ def main(
     *,
     store: Optional[WorkflowStore] = None,
     caller_agent_id: Optional[str] = None,
-    scoped_agent_store: Optional[PersistentAgentStore] = None,
+    scoped_agent_store: Optional[AgentStore] = None,
     message_store: Optional[MessageStore] = None,
     workflow_compiler: Optional[Any] = None,
 ) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     active_store = store if store is not None else WorkflowStore(root=args.store_root)
-    active_scoped_store = scoped_agent_store or PersistentAgentStore(
+    active_scoped_store = scoped_agent_store or AgentStore(
         root=active_store.root.parent / "agents"
     )
     active_message_store = message_store or MessageStore(

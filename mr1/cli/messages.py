@@ -17,7 +17,7 @@ from typing import Optional
 from mr1.capability_policy import CapabilityApprovalStore
 from mr1.inbox_triage import InboxTriagePolicy, InboxTriageResult, InboxTriageRunner
 from mr1.messages import MessageStore, PersistentMessage
-from mr1.scoped_agents import AgentScopeError, PersistentAgent, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentRecord, AgentStore
 from mr1.workflow_compiler import WorkflowCompilerClient
 from mr1.workflow_store import WorkflowStore
 
@@ -80,7 +80,7 @@ def _message_preview_payload(message: PersistentMessage) -> dict[str, str]:
     }
 
 def _pending_parent_messages(
-    agent: PersistentAgent,
+    agent: AgentRecord,
     message_store: MessageStore,
 ) -> list[PersistentMessage]:
     if not agent.parent_agent_id:
@@ -154,7 +154,7 @@ def _cmd_inbox(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     message_store = getattr(args, "message_store")
@@ -178,7 +178,7 @@ def _cmd_inbox_triage(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     from mr1.mr1 import StateManager
 
@@ -210,7 +210,7 @@ def _cmd_outbox(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     message_store = getattr(args, "message_store")
@@ -234,7 +234,7 @@ def _cmd_message(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     runtime_access = _runtime_access_for(
         store,
@@ -258,7 +258,7 @@ def _cmd_message_read(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, scoped_agents
     message_store = getattr(args, "message_store")
@@ -277,7 +277,7 @@ def _cmd_message_archive(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, scoped_agents
     message_store = getattr(args, "message_store")
@@ -296,7 +296,7 @@ def _cmd_message_send(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     message_store = getattr(args, "message_store")

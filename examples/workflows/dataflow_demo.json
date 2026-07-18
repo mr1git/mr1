@@ -5,14 +5,14 @@
       "label": "producer",
       "title": "Produce text",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "prompt": "Write hello world."
     },
     {
       "label": "consumer",
       "title": "Consume producer output",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": [
         "producer"
       ],

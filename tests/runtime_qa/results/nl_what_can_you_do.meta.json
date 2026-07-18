@@ -1,7 +1,7 @@
 {
   "category": "routing",
   "description": "Meta question should not delegate or create workflows",
-  "elapsed_s": 8.12,
+  "elapsed_s": 10.65,
   "findings": [],
   "scenario": "nl_what_can_you_do",
   "session_error": null,

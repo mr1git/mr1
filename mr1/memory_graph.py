@@ -457,7 +457,7 @@ def _canonical_workflow_structure(workflow_record_or_spec: Any) -> Optional[dict
             "dependency_policy": str(raw.get("dependency_policy", "all_succeeded")),
         }
         if task_kind == "agent":
-            item["agent_type"] = str(raw.get("agent_type", "kazi"))
+            item["agent_type"] = str(raw.get("agent_type", "worker"))
         elif task_kind == "tool":
             item["tool_type"] = str(raw.get("tool_type") or "")
             item["shape_config"] = _structural_config_subset(dict(raw.get("tool_config", {})))
@@ -548,7 +548,7 @@ def _task_to_spec(task: Task, workflow: Workflow) -> dict[str, Any]:
     if task.timeout_s is not None:
         item["timeout_s"] = task.timeout_s
     if task.task_kind == "agent":
-        item["agent_type"] = task.agent_type or "kazi"
+        item["agent_type"] = task.agent_type or "worker"
     elif task.task_kind == "tool":
         item["tool_type"] = task.tool_type
         item["tool_config"] = dict(task.tool_config)
@@ -709,7 +709,7 @@ def _process_event(
             metadata={
                 "agent_id": event.target_id,
                 "parent_agent_id": event.metadata.get("parent_agent_id"),
-                "tree_level": event.metadata.get("tree_level"),
+                "mr_level": event.metadata.get("mr_level"),
                 "title": event.metadata.get("title"),
             },
         )

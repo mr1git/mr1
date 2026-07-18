@@ -1,7 +1,7 @@
 """Agent-related CLI: agent/agents/scope/lifecycle commands and formatters.
 
 Contains all `_cmd_agent*` handlers, runtime-agent formatters, MRn
-step/run result formatters, scope-grant formatting, and persistent-agent
+step/run result formatters, scope-grant formatting, and agent-record
 payload helpers.
 """
 
@@ -21,8 +21,8 @@ from mr1.mrn_run import MRnRunPolicy, MRnRunResult, MRnRunRunner
 from mr1.messages import MessageStore
 from mr1.scoped_agents import (
     AgentScopeError,
-    PersistentAgent,
-    PersistentAgentStore,
+    AgentRecord,
+    AgentStore,
     derive_agent_lifecycle,
 )
 from mr1.workflow_models import Provenance, TaskStatus, Workflow
@@ -121,19 +121,19 @@ def _format_runtime_agent_health(
     return "\n".join(lines)
 
 def _format_agents(
-    agents: list[PersistentAgent],
+    agents: list[AgentRecord],
     *,
     json_output: bool = False,
     brief: bool = False,
 ) -> str:
     if not agents:
         return "No agents."
-    payload = [_persistent_agent_payload(agent) for agent in agents]
+    payload = [_agent_payload(agent) for agent in agents]
     if json_output and brief:
         payload = [
             {
                 "agent_id": item["agent_id"],
-                "agent_type": item["agent_type"],
+                "role": item["role"],
                 "title": item["title"],
                 "status": item["lifecycle_status"],
             }
@@ -141,21 +141,21 @@ def _format_agents(
         ]
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
-    rows = [("AGENT_ID", "TYPE", "TITLE", "STATUS", "LEVEL", "PARENT", "WORKFLOWS")]
+    rows = [("AGENT_ID", "ROLE", "TITLE", "STATUS", "MR_LEVEL", "PARENT", "WORKFLOWS")]
     for item in payload:
         rows.append((
             item["agent_id"],
-            item["agent_type"],
+            item["role"],
             item["title"],
             item["lifecycle_status"],
-            str(item["tree_level"]),
+            str(item["mr_level"]),
             item["parent_agent_id"] or "-",
             str(len(item["owned_workflow_ids"])),
         ))
     return _render_table(rows)
 
-def _persistent_agent_payload(
-    agent: PersistentAgent,
+def _agent_payload(
+    agent: AgentRecord,
     *,
     reports: Optional[list[Path]] = None,
     message_store: Optional[MessageStore] = None,
@@ -207,7 +207,7 @@ def _summarize_last_action(action: Optional[dict[str, Any]]) -> str:
     return f"{action_name} -> {next_status} ({reason})"
 
 def _format_agent(
-    agent: PersistentAgent,
+    agent: AgentRecord,
     *,
     reports: Optional[list[Path]] = None,
     message_store: Optional[MessageStore] = None,
@@ -218,7 +218,8 @@ def _format_agent(
     if isinstance(agent, dict):
         payload = dict(agent)
         agent_id = str(payload["agent_id"])
-        agent_type = str(payload["agent_type"])
+        role = str(payload["role"])
+        lifecycle = str(payload.get("lifecycle", "-"))
         title = str(payload["title"])
         status = str(payload["status"])
         clearance = float(payload.get("security_clearance", 0.0))
@@ -228,21 +229,22 @@ def _format_agent(
         current_iteration = int(payload.get("current_iteration", 0))
         last_step_at = payload.get("last_step_at")
         last_action = payload.get("last_action")
-        tree_level = int(payload.get("tree_level", 0))
+        mr_level = int(payload.get("mr_level", 0))
         parent_agent_id = payload.get("parent_agent_id")
         created_at = str(payload.get("created_at", "-"))
         owned_workflow_ids = list(payload.get("owned_workflow_ids", []))
         scope_roots = list(payload.get("scope_roots", []))
         report_names = [Path(str(path)).name for path in payload.get("reports", [])]
     else:
-        payload = _persistent_agent_payload(
+        payload = _agent_payload(
             agent,
             reports=reports,
             message_store=message_store,
             workflow_store=workflow_store,
         )
         agent_id = agent.agent_id
-        agent_type = agent.agent_type
+        role = agent.role
+        lifecycle = agent.lifecycle
         title = agent.title
         status = agent.status
         clearance = agent.security_clearance
@@ -252,7 +254,7 @@ def _format_agent(
         current_iteration = agent.current_iteration
         last_step_at = agent.last_step_at
         last_action = agent.last_action
-        tree_level = agent.tree_level
+        mr_level = agent.mr_level
         parent_agent_id = agent.parent_agent_id
         created_at = agent.created_at
         owned_workflow_ids = list(agent.owned_workflow_ids)
@@ -261,19 +263,20 @@ def _format_agent(
     if json_output and brief:
         payload = {
             "agent_id": payload["agent_id"],
-            "agent_type": payload["agent_type"],
+            "role": payload["role"],
             "title": payload["title"],
             "status": payload.get("lifecycle_status", payload["status"]),
         }
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
-    lifecycle_status = str(payload.get("lifecycle_status", status))
+    activity_status = str(payload.get("lifecycle_status", status))
     lines = [
         f"agent_id:     {agent_id}",
-        f"type:         {agent_type}",
+        f"role:         {role}",
+        f"lifecycle:    {lifecycle}",
         f"title:        {title}",
         f"status:       {status}",
-        f"lifecycle:    {lifecycle_status}",
+        f"activity:     {activity_status}",
         f"status_conflict: {'yes' if payload.get('status_conflict') else 'no'}",
         f"clearance:    {clearance:.2f}",
         f"mission:      {_compact_text(mission)}",
@@ -293,7 +296,7 @@ def _format_agent(
         f"parent_req:   {_compact_text(payload.get('parent_request'))}",
         f"waiting_on_parent: {'yes' if payload.get('waiting_on_parent') else 'no'}",
         f"pending_parent_questions: {payload.get('pending_parent_questions', 0)}",
-        f"tree_level:   {tree_level}",
+        f"mr_level:   {mr_level}",
         f"parent:       {parent_agent_id or '-'}",
         f"created_at:   {created_at}",
         f"workflows:    {len(owned_workflow_ids)}",
@@ -325,7 +328,7 @@ def _format_agent(
     return "\n".join(lines)
 
 def _agent_runtime_activity_payload(
-    agent: PersistentAgent,
+    agent: AgentRecord,
     workflow_store: WorkflowStore,
 ) -> dict[str, Any]:
     active_jobs = 0
@@ -389,7 +392,7 @@ def _format_mrn_run_result(result: MRnRunResult) -> str:
     ])
 
 def _format_scope_grants(
-    agent: PersistentAgent,
+    agent: AgentRecord,
     *,
     json_output: bool = False,
 ) -> str:
@@ -427,7 +430,7 @@ def _cmd_agents(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     rc = _reject_invalid_flag_combination(args)
@@ -444,12 +447,12 @@ def _cmd_agent(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     usage = (
         "agent <create <title>|kill <ag-id>|assign <ag-id> <mission-file>|"
         "step <ag-id>|run <ag-id> [--steps N] [--max-workflows N] "
-        "[--no-confirm-workflows]|<ag-id>|kazi [health]>"
+        "[--no-confirm-workflows]|<ag-id>|worker [health]>"
     )
     rc = _reject_invalid_flag_combination(args)
     if rc is not None:
@@ -564,7 +567,7 @@ def _cmd_agent_assign(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     mission_path = Path(args.mission_file)
@@ -588,7 +591,7 @@ def _cmd_agent_step(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     runner = MRnStepRunner(
         workflow_store=store,
@@ -608,7 +611,7 @@ def _cmd_agent_run(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     runner = MRnRunRunner(
         workflow_store=store,
@@ -638,7 +641,7 @@ def _cmd_agent_grant_scope(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     try:
@@ -659,7 +662,7 @@ def _cmd_agent_revoke_scope(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     try:
@@ -675,7 +678,7 @@ def _cmd_agent_scopes(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     try:

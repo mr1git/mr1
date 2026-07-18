@@ -39,8 +39,8 @@ from mr1.autonomy.budget import BudgetLedger, BudgetLimits
 from mr1.autonomy.objectives import KIND_RECURRING, ObjectiveStore
 from mr1.autonomy.service import Supervisor, SupervisorConfig
 from mr1.clock import VirtualClock
-from mr1.kazi_runner import MockRunner, RunStatus
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.worker_runner import MockRunner, RunStatus
+from mr1.scoped_agents import AgentStore
 
 
 START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -227,7 +227,7 @@ class _CountingPlanner:
                 "label": "t",
                 "title": "T",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "do it",
             }],
         }
@@ -235,7 +235,7 @@ class _CountingPlanner:
 
 def _runtime(tmp_path, clock, planner, runner, **config):
     root = tmp_path / "runtime"
-    agents = PersistentAgentStore(root=root / "agents")
+    agents = AgentStore(root=root / "agents")
     objectives = ObjectiveStore(root, clock=clock)
     objectives.create(
         title="Recurring",

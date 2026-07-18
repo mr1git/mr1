@@ -44,9 +44,9 @@ class Dispatcher:
 
     Usage:
         dispatcher = Dispatcher()
-        dispatcher.validate_cli_flags("kazi", ["-p", "--model", "claude-3-5-haiku-20241022"])
-        dispatcher.validate_shell_command("kazi", "ls -la /tmp")
-        dispatcher.validate_tools("kazi", ["Read", "Glob"])
+        dispatcher.validate_cli_flags("worker", ["-p", "--model", "claude-3-5-haiku-20241022"])
+        dispatcher.validate_shell_command("worker", "ls -la /tmp")
+        dispatcher.validate_tools("worker", ["Read", "Glob"])
         dispatcher.validate_spawn_level(2, "mr3")
     """
 
@@ -193,11 +193,11 @@ class Dispatcher:
         Validate that spawning the child agent from this parent level is allowed.
 
         Rules:
-          - Kazis can be spawned from any level.
+          - Workers can be spawned from any level.
           - MR(n+1) can be spawned only if (n+1) <= height_limit.
           - MRn can only spawn MR(n+1), not MR(n+2) or MR(n-1).
         """
-        if child_agent == "kazi":
+        if child_agent == "worker":
             return True
 
         if child_agent.startswith("mr") and len(child_agent) > 2:

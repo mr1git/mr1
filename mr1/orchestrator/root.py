@@ -1,7 +1,8 @@
 """Root orchestrator implementation: the `MR1` class and its module-level
 state.
 
-`MR1` is the persistent root agent (MRn at tree_level=1). This module
+`MR1` is the root orchestrator agent (role=orchestrator, mr_level=1,
+lifecycle=standing). This module
 hosts the class, its module-level constants, and three small helper
 functions that were previously defined in `mr1.mr1`. The historical
 `mr1.mr1` module is now a thin facade that re-exports the public
@@ -35,10 +36,10 @@ from typing import Any, Callable, Optional
 import yaml
 
 from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
-from mr1 import kazi, mrn
+from mr1 import worker, mrn
 from mr1.orchestrator.identity import (
     _AGENTS_DIR as _AGENTS_DIR_IMPORTED,
-    _KAZI_CONFIG_PATH as _KAZI_CONFIG_PATH_IMPORTED,
+    _WORKER_CONFIG_PATH as _WORKER_CONFIG_PATH_IMPORTED,
     _MR1_CONFIG_PATH as _MR1_CONFIG_PATH_IMPORTED,
     _MRN_CONFIG_PATH as _MRN_CONFIG_PATH_IMPORTED,
     _compact_text as _compact_text,
@@ -61,7 +62,7 @@ from mr1.capability_policy import (
     CapabilityApprovalStore,
 )
 from mr1.brain_tools import governed_brain_tools
-from mr1.kazi_runner import KaziAsyncRunner, MockRunner, Runner
+from mr1.worker_runner import WorkerAsyncRunner, MockRunner, Runner
 from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunRunner
@@ -78,7 +79,7 @@ from mr1.autonomy.ownership import ROLE_REPL as OWNERSHIP_ROLE_REPL, ExecutionOw
 from mr1.scheduler import Scheduler, WatcherTriggerError, WorkflowSpecError, rerun_task_on_disk
 from mr1.scoped_agents import (
     AgentScopeError,
-    PersistentAgentStore,
+    AgentStore,
     build_assignment_packet,
     render_assignment_mission,
 )
@@ -122,7 +123,7 @@ _AGENTS_DIR = _AGENTS_DIR_IMPORTED
 _CONTEXT_PATH = _PKG_ROOT / "memory" / "active" / "mr1_context.md"
 _MR1_CONFIG_PATH = _MR1_CONFIG_PATH_IMPORTED
 _MRN_CONFIG_PATH = _MRN_CONFIG_PATH_IMPORTED
-_KAZI_CONFIG_PATH = _KAZI_CONFIG_PATH_IMPORTED
+_WORKER_CONFIG_PATH = _WORKER_CONFIG_PATH_IMPORTED
 
 # Long-output threshold for the chat UI: lines above this are summarised.
 _OUTPUT_TRUNCATE_LINES = 40
@@ -130,6 +131,11 @@ _OUTPUT_TRUNCATE_LINES = 40
 # Maximum delegation rounds per user turn.
 _MAX_DELEGATION_ROUNDS = 5
 _MAX_OBSERVATION_ROUNDS = 2
+# Workers are supposed to be a cheap, bounded investigation — MR1 should
+# never sit blocked for the worker's full 300s default ceiling on a single
+# turn. Killed early, a partial result (if any) is still surfaced honestly
+# rather than treated as a hard failure.
+_BOUNDED_INVESTIGATION_WORKER_TIMEOUT_S = 90
 _TEST_AGENT_MAX_HEIGHT = 5
 _TEST_AGENT_PREFIX = "test-agent"
 _GROUNDING_AGENT_LIMIT = 8
@@ -216,7 +222,7 @@ _AUTO_REPLY_SYNTHESIS_MARKERS = (
     "based on our conversation",
     "using the context",
 )
-_DEFAULT_PERSISTENT_CHILD_TITLES = (
+_DEFAULT_ORCHESTRATOR_CHILD_TITLES = (
     "Sentinel",
     "Darwin",
     "Architect",
@@ -272,7 +278,30 @@ _MUTATION_CLAIM_PATTERN = re.compile(
 _MUTATION_NEGATION_CUE_PATTERN = re.compile(
     r"\b(did not|didn't|does not|doesn't|do not|don't|cannot|can't|"
     r"was not|wasn't|were not|weren't|has not|hasn't|have not|haven't|"
-    r"will not|won't|never|no|not|without)\b",
+    r"will not|won't|never|no|not|nothing|without)\b",
+    re.IGNORECASE,
+)
+# Phase D fast-follow: a bare mutation verb was matching ordinary descriptive
+# language ("worth pausing on", "was just created" about a real pre-existing
+# agent) and clobbering otherwise-good responses. A sentence now also needs
+# *positive* evidence it claims MR1 executed the mutation this turn (a
+# first-person subject close to the verb, a dropped-first-person-subject, or
+# a completion/current-turn marker) and must not carry hypothetical/
+# historical framing, which trumps that evidence even when present ("is
+# currently waiting" after "was just created"). The first-person check is
+# proximity-bound (within ~3 words of the verb) rather than sentence-wide —
+# a long sentence can carry an unrelated "I" in an earlier clause (a
+# hypothetical example quoted in a rhetorical question) that has nothing to
+# do with a mutation word appearing later in that same sentence.
+_MUTATION_FIRST_PERSON_SUBJECT_PATTERN = re.compile(
+    r"\b(?:i|we)\b(?:'\w+)?(?:\s+\S+){0,3}\s*$", re.IGNORECASE,
+)
+_MUTATION_COMPLETION_CUE_PATTERN = re.compile(
+    r"\b(?:done|now|just|successfully)\b|\bfor you\b", re.IGNORECASE,
+)
+_MUTATION_CONDITIONAL_CUE_PATTERN = re.compile(r"\b(?:if|could|would|should)\b", re.IGNORECASE)
+_MUTATION_HISTORICAL_CUE_PATTERN = re.compile(
+    r"\b(?:was\s+already|had\s+already|existing|previously|currently|reported\s+that)\b",
     re.IGNORECASE,
 )
 _SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
@@ -288,6 +317,20 @@ def _direct_response_makes_unverified_mutation_claim(text: str) -> bool:
         preceding = sentence[: match.start()]
         if _MUTATION_NEGATION_CUE_PATTERN.search(preceding):
             continue  # a disclaimer ("did not ... delete"), not a claim
+        if _MUTATION_CONDITIONAL_CUE_PATTERN.search(preceding):
+            continue  # hypothetical/modal framing ("if we renamed it...")
+        if _MUTATION_HISTORICAL_CUE_PATTERN.search(sentence):
+            continue  # describes real, already-established state, not a fresh claim
+        # A mutation verb opening the sentence ("Created the agent.") is a
+        # dropped-subject status announcement — MR1's own terse register —
+        # and counts the same as an explicit first-person subject.
+        sentence_opens_with_verb = not preceding.strip()
+        if not (
+            sentence_opens_with_verb
+            or _MUTATION_FIRST_PERSON_SUBJECT_PATTERN.search(preceding)
+            or _MUTATION_COMPLETION_CUE_PATTERN.search(sentence)
+        ):
+            continue  # no evidence MR1 is claiming to have done this itself, this turn
         return True
     return False
 
@@ -299,7 +342,7 @@ def _looks_like_unresolved_agent_design(text: str) -> bool:
     to start with ``AGENT_TITLE: <title>``; when it doesn't, this catches the
     common case where the brain declined because the request was ambiguous
     (e.g. no domain specified) — so the caller can surface that clarification
-    to the human instead of creating a persistent agent with the question
+    to the human instead of creating an orchestrator with the question
     itself standing in as its mission.
     """
     stripped = (text or "").strip()
@@ -317,14 +360,16 @@ def _looks_like_unresolved_agent_design(text: str) -> bool:
 # display text, and routes to the appropriate agent via the spawner.
 #
 # Format inside the markers must be valid JSON:
-#   {"agent": "mr2"|"kazi", "task": "...", "context": "..."}
+#   {"agent": "orchestrator"|"worker", "task": "...", "context": "..."}
+# "orchestrator" always spawns one MR level below the caller (mr_level=2 from
+# MR1); "worker" spawns a role=worker, non-persisted, single-task agent.
 # ---------------------------------------------------------------------------
 _DELEGATE_PATTERN = re.compile(
     r"\[DELEGATE\]\s*(\{.*?\})\s*\[/DELEGATE\]",
     re.DOTALL,
 )
 
-_PERSISTENT_DELEGATION_MARKERS = (
+_ORCHESTRATOR_DELEGATION_MARKERS = (
     "create a child",
     "create child",
     "create an agent",
@@ -354,13 +399,13 @@ _UNRESOLVED_AGENT_DESIGN_MARKERS = (
     "what would you like",
 )
 
-_PERSISTENT_CHILD_TITLE_PATTERNS = (
+_ORCHESTRATOR_CHILD_TITLE_PATTERNS = (
     re.compile(r"\bchild(?:\s+of\s+yours)?(?:\s+agent)?[,\s]+(MR\d+)\b", re.IGNORECASE),
     re.compile(r"\bagent\s+(MR\d+)\b", re.IGNORECASE),
     re.compile(r"\bnamed\s+(MR\d+)\b", re.IGNORECASE),
 )
 
-_EXPLICIT_PERSISTENT_CHILD_TITLE_PATTERNS = (
+_EXPLICIT_ORCHESTRATOR_CHILD_TITLE_PATTERNS = (
     re.compile(r"\bnamed\s+['\"]([^'\"]{1,64})['\"]", re.IGNORECASE),
     re.compile(r"\bcalled\s+['\"]([^'\"]{1,64})['\"]", re.IGNORECASE),
     re.compile(r"\bpersistent\s+agent\s+['\"]([^'\"]{1,64})['\"]", re.IGNORECASE),
@@ -378,7 +423,7 @@ _META_EXPLANATION_PATTERNS = (
     re.compile(r"\bwhat(?:'s| is) the difference between\b", re.IGNORECASE),
 )
 
-_PERSISTENT_DELEGATION_IMPERATIVE_PATTERNS = (
+_ORCHESTRATOR_DELEGATION_IMPERATIVE_PATTERNS = (
     re.compile(r"\bcreate (?:a|an) (?:child|agent)\b", re.IGNORECASE),
     re.compile(r"\bmake (?:mr\d+|the agent|that agent|an agent|a child)\b", re.IGNORECASE),
     re.compile(r"\bdelegate\b", re.IGNORECASE),
@@ -446,7 +491,7 @@ class MR1:
     """
     The persistent orchestrator. Wires together:
       - A single persistent claude process (MR1Process)
-      - Delegation (MR2/Kazi subprocesses via spawner)
+      - Delegation (orchestrator/worker subprocesses via spawner)
       - State persistence (mr1_state.json)
     """
 
@@ -456,7 +501,7 @@ class MR1:
         *,
         state_manager: Optional[StateManager] = None,
         workflow_store: Optional[WorkflowStore] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         message_store: Optional[MessageStore] = None,
         workflow_runner: Optional[Runner] = None,
         workflow_concurrency: int = 4,
@@ -481,7 +526,7 @@ class MR1:
         # Load agent configs from YAML definitions.
         self._mr1_config = _load_agent_config(_MR1_CONFIG_PATH)
         self._mrn_config = _load_agent_config(_MRN_CONFIG_PATH)
-        self._kazi_config = _load_agent_config(_KAZI_CONFIG_PATH)
+        self._worker_config = _load_agent_config(_WORKER_CONFIG_PATH)
         self._mr1_brain_tools = governed_brain_tools(self._mr1_config.get("allowed_tools"))
 
         # The persistent claude process — created in start().
@@ -491,7 +536,7 @@ class MR1:
 
         # Workflow scheduler (Phase 1). Lives inside this MR1 process.
         self._workflow_store = workflow_store or WorkflowStore()
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+        self._scoped_agents = scoped_agent_store or AgentStore(
             root=self._workflow_store.root.parent / "agents"
         )
         self._message_store = message_store or MessageStore(
@@ -510,7 +555,7 @@ class MR1:
             event_log=self._event_log,
         )
         self._root_agent_id = self._scoped_agents.root_agent_id
-        runner = workflow_runner or KaziAsyncRunner(
+        runner = workflow_runner or WorkerAsyncRunner(
             self._workflow_store,
             dispatcher=self._dispatcher,
         )
@@ -607,7 +652,7 @@ class MR1:
         config_block = (
             f"Agent: {self._mr1_config['name']}\n"
             f"Model: {self._mr1_config['model']}\n"
-            f"Lifetime: {self._mr1_config['lifetime']}\n"
+            f"Lifecycle: {self._mr1_config['lifecycle']}\n"
             f"Memory access: {self._mr1_config['memory_access']}\n"
             f"Available tools: {', '.join(self._mr1_brain_tools)}\n"
         )
@@ -646,7 +691,7 @@ class MR1:
         if "agent" not in directive or "task" not in directive:
             return raw.strip(), None
 
-        if directive["agent"] not in ("mr2", "kazi"):
+        if directive["agent"] not in ("orchestrator", "worker"):
             return raw.strip(), None
 
         # Strip the directive block from the display text.
@@ -945,8 +990,10 @@ class MR1:
         advice_route = route_advice.route
         if advice_route == "direct_response":
             return final_route == "direct_answer"
-        if advice_route == "persistent_agent":
-            return final_route == "persistent_delegation"
+        if advice_route == "orchestrator_ownership":
+            return final_route == "orchestrator_delegation"
+        if advice_route == "bounded_investigation":
+            return final_route == "worker_delegation"
         if advice_route == "inspect_existing_state":
             return final_route in {
                 "inspect_task",
@@ -981,8 +1028,10 @@ class MR1:
     def _final_action_for_route(final_route: str) -> str:
         if final_route == "direct_answer":
             return "direct_response"
-        if final_route == "persistent_delegation":
-            return "persistent_agent"
+        if final_route == "orchestrator_delegation":
+            return "orchestrator_ownership"
+        if final_route == "worker_delegation":
+            return "bounded_investigation"
         if final_route in {
             "create_workflow",
             "modify_workflow",
@@ -1039,7 +1088,7 @@ class MR1:
         signal_labels = {
             "matched_operational_verbs": "operational verbs",
             "matched_inspection_phrases": "inspection phrases",
-            "matched_persistent_agent_patterns": "persistent-agent patterns",
+            "matched_orchestrator_ownership_patterns": "orchestrator-ownership patterns",
             "matched_workflow_patterns": "workflow patterns",
         }
         for key, label in signal_labels.items():
@@ -1156,7 +1205,7 @@ class MR1:
         self._event_log.emit(
             event_type="runtime_turn_decided",
             actor_id=self._root_agent_id,
-            actor_type="mr1",
+            actor_type="root_orchestrator",
             target_id=turn_id,
             target_type="turn",
             status=str(final_action),
@@ -2185,11 +2234,59 @@ class MR1:
     def _direct_response_claims_unverified_mutation(self, text: str) -> bool:
         return _direct_response_makes_unverified_mutation_claim(text)
 
+    # Actions that mean a prior bounded investigation in this conversation
+    # already got a standing owner — recurrence language after one of these
+    # is not a fresh escalation signal, it's the same gap already closed.
+    _OWNERSHIP_RESOLVED_ACTIONS = frozenset({
+        "spawn_persistent_mr2", "spawn_mr3", "spawn_mr4",
+    })
+
+    def _recent_investigation_unresolved(self, lookback: int = 6) -> bool:
+        """The contextual half of the recurrence-escalation gate (Phase D.4):
+        true only when the most recent relevant decision in this
+        conversation's rolling window is a bounded worker investigation
+        (`spawn_worker`) that hasn't since been followed by a standing
+        ownership decision. Recurrence *language* alone never triggers
+        escalation — see `_format_recurrence_escalation_guidance`."""
+        for entry in reversed(self._state.decisions[-lookback:]):
+            action = entry.get("action")
+            if action in self._OWNERSHIP_RESOLVED_ACTIONS:
+                return False
+            if action == "spawn_worker":
+                return True
+        return False
+
+    def _format_recurrence_escalation_guidance(self, recurrence_signals: list[str]) -> str:
+        matched = ", ".join(sorted(set(recurrence_signals)))
+        return "\n".join([
+            "RECURRENCE SIGNAL DETECTED.",
+            f"This turn names a recurring pattern ({matched}), and a bounded worker "
+            "investigation into the same issue ran earlier in this conversation. A concrete "
+            "recurring issue plus a one-shot check already being rediscovered is real evidence "
+            "that standing ownership, not another isolated check, may be the right structure now.",
+            "Check RUNTIME GROUNDING above for an existing agent already scoped to this area. "
+            "If one exists, propose reusing it by name rather than proposing a new one.",
+            "If none exists, name the ownership gap plainly in a sentence or two — do not bury it "
+            "in a menu of options, and do not just quietly repeat another one-off answer. For "
+            "example: \"Since this appears to recur weekly, it may be worth having a dedicated "
+            "owner for scheduler health.\" or \"We keep revisiting this — a project-scoped "
+            "orchestrator could track it and stop the repeated rediscovery.\"",
+            "You cannot create or reuse an orchestrator from this response — only propose it in "
+            "words; do not claim you have created, spawned, or set anything up this turn.",
+            "Still answer the substance of what Marwan actually said first — the ownership "
+            "observation is additive, not a replacement for a real answer.",
+            "If the recurrence claim is vague, or there's no real evidence ownership would help "
+            "beyond mild, one-off annoyance, it's fine to just respond normally without raising "
+            "ownership at all.",
+        ])
+
     def _answer_directly_with_grounding(
         self,
         user_input: str,
         runtime_grounding: dict[str, Any],
         route_advice: RouteAdvice,
+        *,
+        recurrence_escalation_signals: Optional[list[str]] = None,
     ) -> dict[str, str]:
         observation_payloads: list[dict[str, Any]] = []
         last_prompt = ""
@@ -2200,6 +2297,7 @@ class MR1:
                 runtime_grounding,
                 route_advice,
                 observation_payloads=observation_payloads,
+                recurrence_escalation_signals=recurrence_escalation_signals,
             )
             raw = self._send_to_brain(prompt)
             last_prompt = prompt
@@ -2248,6 +2346,7 @@ class MR1:
         route_advice: RouteAdvice,
         *,
         observation_payloads: Optional[list[dict[str, Any]]] = None,
+        recurrence_escalation_signals: Optional[list[str]] = None,
     ) -> str:
         parts = [
             self._format_runtime_grounding_block(runtime_grounding),
@@ -2260,13 +2359,15 @@ class MR1:
                 "Use the observation results above when answering. "
                 "Do not emit another OBSERVE block unless you still need additional read-only runtime detail."
             )
+        if recurrence_escalation_signals:
+            parts.append(self._format_recurrence_escalation_guidance(recurrence_escalation_signals))
         parts.extend([
-            "Answer this request directly. Do not delegate to MR2 or Kazi.",
+            "Answer this request directly. Do not delegate to an orchestrator or a worker.",
             f"User request:\n{user_input}",
         ])
         return "\n\n".join(parts)
 
-    def _build_persistent_agent_design_prompt(
+    def _build_orchestrator_design_prompt(
         self,
         user_input: str,
         runtime_grounding: dict[str, Any],
@@ -2276,23 +2377,23 @@ class MR1:
             self._format_runtime_grounding_block(runtime_grounding),
             self._format_routing_advice_block(route_advice),
             "\n".join([
-                "Design the persistent agent requested below.",
+                "Design the orchestrator agent requested below.",
                 "First line of your response must be exactly: AGENT_TITLE: <title>",
                 "Choose a purpose-driven title that reflects the agent's responsibility (e.g. Genesis, Sentinel, Auditor).",
-                "Do not use a generic MR2/MR3-style label as the title unless the user explicitly requested that exact name.",
+                "Do not use a generic MR-level label (e.g. MR2, MR3) as the title unless the user explicitly requested that exact name.",
                 "Then write the complete mission: what the agent owns, how it operates, its scope, escalation rules, and first actions.",
             ]),
             f"User request:\n{user_input}",
         ]
         return "\n\n".join(parts)
 
-    def _design_and_delegate_persistent_agent(
+    def _design_and_delegate_orchestrator(
         self,
         user_input: str,
         runtime_grounding: dict[str, Any],
         route_advice: RouteAdvice,
     ) -> dict[str, str]:
-        design_prompt = self._build_persistent_agent_design_prompt(
+        design_prompt = self._build_orchestrator_design_prompt(
             user_input, runtime_grounding, route_advice
         )
         raw = self._send_to_brain(design_prompt)
@@ -2303,7 +2404,7 @@ class MR1:
         if not first_line.upper().startswith("AGENT_TITLE:") and _looks_like_unresolved_agent_design(design_text):
             # The brain declined to design (asked a clarifying question instead
             # of following the required AGENT_TITLE: format) — surface that to
-            # the human rather than creating a persistent agent whose mission
+            # the human rather than creating an orchestrator whose mission
             # would be the unresolved question itself.
             return {
                 "text": (design_text or "").strip()
@@ -2336,7 +2437,7 @@ class MR1:
                 agent.title,
                 user_input,
                 {
-                    **self._build_persistent_delegation_context(),
+                    **self._build_orchestrator_delegation_context(),
                     "assigned_clearance": agent.security_clearance,
                 },
             )
@@ -2375,7 +2476,7 @@ class MR1:
         self._state.add_decision(user_input, "spawn_persistent_mr2", agent.agent_id)
         return {
             "text": "\n".join([
-                f"delegated to persistent agent: {agent.agent_id} ({agent.title})",
+                f"delegated to orchestrator: {agent.agent_id} ({agent.title})",
                 workflow_cli._format_mrn_run_result(result),
             ]),
             "brain_prompt": design_prompt,
@@ -2427,15 +2528,15 @@ class MR1:
             return False
         return any(pattern.search(normalized) for pattern in _META_EXPLANATION_PATTERNS)
 
-    def _is_persistent_delegation_request(self, user_input: str) -> bool:
+    def _is_orchestrator_delegation_request(self, user_input: str) -> bool:
         normalized = _normalize_routing_text(user_input)
         if not normalized:
             return False
         if self._is_meta_explanation_request(user_input):
             return False
-        if not any(pattern.search(normalized) for pattern in _PERSISTENT_DELEGATION_IMPERATIVE_PATTERNS):
+        if not any(pattern.search(normalized) for pattern in _ORCHESTRATOR_DELEGATION_IMPERATIVE_PATTERNS):
             return False
-        if any(marker in normalized for marker in _PERSISTENT_DELEGATION_MARKERS):
+        if any(marker in normalized for marker in _ORCHESTRATOR_DELEGATION_MARKERS):
             return True
 
         has_agent_target = any(token in normalized for token in ("mr2", "child", "agent"))
@@ -2460,8 +2561,8 @@ class MR1:
     ) -> str:
         if self._is_meta_explanation_request(user_input):
             return "direct_answer"
-        if pending_draft is None and self._is_persistent_delegation_request(user_input):
-            return "persistent_delegation"
+        if pending_draft is None and self._is_orchestrator_delegation_request(user_input):
+            return "orchestrator_delegation"
         return self._workflow_authoring.classify_request(
             user_input,
             pending_draft=pending_draft,
@@ -2471,7 +2572,7 @@ class MR1:
         explicit_title = self._extract_explicit_requested_child_title(user_input)
         if explicit_title:
             return explicit_title
-        for pattern in _PERSISTENT_CHILD_TITLE_PATTERNS:
+        for pattern in _ORCHESTRATOR_CHILD_TITLE_PATTERNS:
             match = pattern.search(user_input)
             if match:
                 return match.group(1).upper()
@@ -2490,17 +2591,19 @@ class MR1:
             agent.title.lower()
             for agent in self._scoped_agents.list_visible_agents(self._root_agent_id)
         }
-        for candidate in _DEFAULT_PERSISTENT_CHILD_TITLES:
+        for candidate in _DEFAULT_ORCHESTRATOR_CHILD_TITLES:
             if candidate.lower() not in existing_titles:
                 return candidate
-        return "MR2"
+        # Rotation exhausted: fall back to the ontology's literal unset-title
+        # string (AGENT_ONTOLOGY.md §6), never a level-shaped "MR<n>" label.
+        return "Unnamed agent"
 
     def _extract_explicit_requested_child_title(self, user_input: str) -> Optional[str]:
-        for pattern in _PERSISTENT_CHILD_TITLE_PATTERNS:
+        for pattern in _ORCHESTRATOR_CHILD_TITLE_PATTERNS:
             match = pattern.search(user_input)
             if match:
                 return match.group(1).upper()
-        for pattern in _EXPLICIT_PERSISTENT_CHILD_TITLE_PATTERNS:
+        for pattern in _EXPLICIT_ORCHESTRATOR_CHILD_TITLE_PATTERNS:
             match = pattern.search(user_input)
             if not match:
                 continue
@@ -2509,7 +2612,7 @@ class MR1:
                 return title
         return None
 
-    def _build_persistent_delegation_context(self) -> dict[str, Any]:
+    def _build_orchestrator_delegation_context(self) -> dict[str, Any]:
         agent_ids: list[str] = []
         seen_agent_ids: set[str] = set()
         for agent_id in (
@@ -2572,7 +2675,7 @@ class MR1:
             ),
         }
 
-    def _route_to_persistent_delegation(self, user_input: str) -> str:
+    def _route_to_orchestrator_delegation(self, user_input: str) -> str:
         agent_title = self._extract_requested_child_title(user_input)
         try:
             parent_agent = self._scoped_agents.require_agent(self._root_agent_id)
@@ -2582,7 +2685,7 @@ class MR1:
                 agent.title,
                 user_input,
                 {
-                    **self._build_persistent_delegation_context(),
+                    **self._build_orchestrator_delegation_context(),
                     "assigned_clearance": agent.security_clearance,
                 },
             )
@@ -2618,13 +2721,13 @@ class MR1:
 
         self._state.add_decision(user_input, "spawn_persistent_mr2", agent.agent_id)
         return "\n".join([
-            f"delegated to persistent agent: {agent.agent_id} ({agent.title})",
+            f"delegated to orchestrator: {agent.agent_id} ({agent.title})",
             workflow_cli._format_mrn_run_result(result),
         ])
 
     def _answer_directly(self, user_input: str) -> str:
         raw = self._send_to_brain(
-            "Answer this request directly. Do not delegate to MR2 or Kazi.\n\n"
+            "Answer this request directly. Do not delegate to an orchestrator or a worker.\n\n"
             f"User request:\n{user_input}"
         )
         text, _ = self._parse_response(raw)
@@ -2666,35 +2769,40 @@ class MR1:
     def _execute_delegation(self, directive: dict, user_input: str) -> str:
         """
         Spawn the delegated agent and block until it completes.
-        Routes kazi jobs through kazi.run(), MR2 jobs through mrn.run().
+        Routes role=worker jobs through worker.run(), role=orchestrator jobs
+        (always created one MR level below the caller) through mrn.run().
         Returns the agent's output text.
         """
-        agent_type = directive["agent"]
+        agent_role = directive["agent"]
         task_description = directive["task"]
         context_text = directive.get("context", "")
 
         task_id = _generate_task_id()
 
-        if agent_type == "kazi":
-            return self._delegate_to_kazi(
+        if agent_role == "worker":
+            return self._delegate_to_worker(
                 task_id, task_description, context_text, user_input,
             )
 
-        if agent_type == "mr2":
+        if agent_role == "orchestrator":
+            # This delegation loop only ever runs on MR1 itself (mr_level=1),
+            # so the spawned orchestrator is always one level below: mr_level=2.
             return self._delegate_to_mrn(
                 task_id, 2, task_description, context_text, user_input,
             )
 
-        return f"[ERROR] Unknown agent type: {agent_type}"
+        return f"[ERROR] Unknown agent role: {agent_role}"
 
-    def _delegate_to_kazi(
+    def _delegate_to_worker(
         self,
         task_id: str,
         task_description: str,
         context_text: str,
         user_input: str,
+        *,
+        timeout_s: Optional[int] = None,
     ) -> str:
-        """Route a job through kazi.run() with a proper context package."""
+        """Route a job through worker.run() with a proper context package."""
         instructions = task_description
         if context_text:
             instructions += f"\n\nCONTEXT:\n{context_text}"
@@ -2702,16 +2810,18 @@ class MR1:
         context_pkg = {
             "task_id": task_id,
             "instructions": instructions,
-            "allowed_tools": self._kazi_config["allowed_tools"],
+            "allowed_tools": self._worker_config["allowed_tools"],
             "parent_task_id": "mr1",
             "lane": "conversation",
             "description": task_description,
         }
+        if timeout_s is not None:
+            context_pkg["timeout"] = timeout_s
 
         self._logger.log(
             task_id, "mr1", "delegate", "ok",
             metadata={
-                "to": "kazi",
+                "to": "worker",
                 "description": task_description[:200],
                 "parent_task_id": "mr1",
                 "lane": "conversation",
@@ -2722,13 +2832,13 @@ class MR1:
                 "type": "task_attached",
                 "task_id": task_id,
                 "parent_task_id": "mr1",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "description": task_description[:200],
                 "lane": "conversation",
             }
         )
 
-        result = kazi.run(
+        result = worker.run(
             context=context_pkg,
             spawner=self._spawner,
             logger=self._logger,
@@ -2736,11 +2846,16 @@ class MR1:
         )
 
         self._state.complete_task(task_id, result.status)
-        self._state.add_decision(user_input, "spawn_kazi", task_id)
+        self._state.add_decision(user_input, "spawn_worker", task_id)
 
         if result.ok:
             return result.output
-        return f"[KAZI {result.status.upper()}] {result.error or 'unknown error'}"
+        # A killed/timed-out worker may still have captured partial output
+        # before it was cut off (worker.py's timeout path extracts whatever
+        # stdout was flushed) — surface it instead of silently discarding it,
+        # so the caller can distinguish a partial result from a total blank.
+        partial = f"\n\nPartial output captured before {result.status}:\n{result.output}" if result.output else ""
+        return f"[WORKER {result.status.upper()}] {result.error or 'unknown error'}{partial}"
 
     def _delegate_to_mrn(
         self,
@@ -2803,6 +2918,70 @@ class MR1:
             return result.output
         return f"[MR{level} {result.status.upper()}] {result.error or 'unknown error'}"
 
+    def _route_bounded_investigation(
+        self,
+        user_input: str,
+        *,
+        turn_id: str,
+        route_advice: RouteAdvice,
+        runtime_grounding: dict[str, Any],
+        resolved_references: dict[str, Any],
+        ambiguities: list[dict[str, Any]],
+    ) -> str:
+        """A bounded, one-shot investigation (role=worker, ephemeral, never
+        persisted) — the cheap middle tier between a direct answer and
+        standing orchestrator ownership. Delegates through the same
+        `_delegate_to_worker` a role=worker `[DELEGATE]` directive would have
+        used, then asks the brain to summarize the real result rather than
+        returning raw worker output or fabricating findings.
+        """
+        task_id = _generate_task_id()
+        context_text = (
+            "Scope guardrail: ignore vendored/dependency/build directories "
+            "(.venv, node_modules, .git, dist, build, site-packages, "
+            "__pycache__) — focus only on the project's own source and "
+            "test files. Stay bounded: skim a handful of the most relevant "
+            "files/directories for this request rather than enumerating the "
+            "whole repository — this is a quick, focused pass, not an "
+            "exhaustive audit."
+        )
+        worker_output = self._delegate_to_worker(
+            task_id, user_input, context_text, user_input,
+            timeout_s=_BOUNDED_INVESTIGATION_WORKER_TIMEOUT_S,
+        )
+
+        synthesis_prompt = "\n\n".join([
+            "A worker was delegated to investigate the request below and has already finished "
+            "(or been cut off at its time budget).",
+            f"User request:\n{user_input}",
+            f"Worker output (verbatim — do not invent findings beyond this):\n{worker_output}",
+            "Summarize this for the user in a natural, partner-like way, and briefly mention "
+            "that you had a worker take a focused, bounded pass (one short clause is enough — "
+            "no need to over-explain the mechanics).",
+            "If the worker output starts with \"[WORKER TIMEOUT]\": it ran out of its time "
+            "budget before finishing. If a \"Partial output captured before timeout\" section "
+            "is present, summarize that partial material honestly as partial, incomplete "
+            "findings — do not present it as a complete investigation. If no partial output is "
+            "present, say plainly that the look-through didn't finish in time and offer to "
+            "retry or narrow the scope — do not invent findings.",
+            "If the worker output starts with \"[WORKER\" for any other reason (failed/denied/"
+            "invalid), say so honestly instead of claiming findings that don't exist.",
+        ])
+        raw = self._send_to_brain(synthesis_prompt)
+        text, _ = self._parse_response(raw)
+
+        return self._finalize_turn_response(
+            text,
+            turn_id=turn_id,
+            route="worker_delegation",
+            route_advice=route_advice,
+            runtime_grounding=runtime_grounding,
+            resolved_references=resolved_references,
+            ambiguities=ambiguities,
+            brain_prompt=synthesis_prompt,
+            brain_response=raw,
+        )
+
     # ------------------------------------------------------------------
     # Conversation step
     # ------------------------------------------------------------------
@@ -2857,10 +3036,14 @@ class MR1:
 
         if route_advice.route == "direct_response":
             self._state.add_decision(user_input, "direct_answer")
+            recurrence_signals = list(route_advice.signals.get("matched_recurrence_language") or [])
+            if recurrence_signals and not self._recent_investigation_unresolved():
+                recurrence_signals = []
             answer = self._answer_directly_with_grounding(
                 user_input,
                 runtime_grounding,
                 route_advice,
+                recurrence_escalation_signals=recurrence_signals,
             )
             return self._finalize_turn_response(
                 answer["text"],
@@ -2875,20 +3058,30 @@ class MR1:
                 full_payload=answer["full_payload"],
             )
 
-        if route_advice.route == "persistent_agent":
-            answer = self._design_and_delegate_persistent_agent(
+        if route_advice.route == "orchestrator_ownership":
+            answer = self._design_and_delegate_orchestrator(
                 user_input, runtime_grounding, route_advice
             )
             return self._finalize_turn_response(
                 answer["text"],
                 turn_id=turn_id,
-                route="persistent_delegation",
+                route="orchestrator_delegation",
                 route_advice=route_advice,
                 runtime_grounding=runtime_grounding,
                 resolved_references=resolved_references,
                 ambiguities=ambiguities,
                 brain_prompt=answer["brain_prompt"],
                 brain_response=answer["brain_response"],
+            )
+
+        if route_advice.route == "bounded_investigation":
+            return self._route_bounded_investigation(
+                user_input,
+                turn_id=turn_id,
+                route_advice=route_advice,
+                runtime_grounding=runtime_grounding,
+                resolved_references=resolved_references,
+                ambiguities=ambiguities,
             )
 
         if route_advice.route == "run_commands":
@@ -3316,7 +3509,7 @@ class MR1:
         self._event_log.emit(
             event_type="inbox_triage_failed",
             actor_id=self._root_agent_id,
-            actor_type="mr1",
+            actor_type="root_orchestrator",
             target_id=self._root_agent_id,
             target_type="agent",
             status="error",

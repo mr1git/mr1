@@ -21,13 +21,13 @@ from mr1.capability_policy import (
 from mr1.clock import VirtualClock, parse_iso
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 def _fixture(tmp_path, *, ttl_s=DEFAULT_APPROVAL_TTL_S):
     clock = VirtualClock(start=datetime(2026, 1, 1, tzinfo=timezone.utc))
     runtime_root = tmp_path / "runtime"
-    agents = PersistentAgentStore(root=runtime_root / "agents")
+    agents = AgentStore(root=runtime_root / "agents")
     messages = MessageStore(root=runtime_root / "messages", scoped_agent_store=agents)
     store = CapabilityApprovalStore(
         runtime_root / "capability_approvals",
@@ -43,7 +43,7 @@ def _route_shell_approval(tmp_path, *, ttl_s=DEFAULT_APPROVAL_TTL_S):
     metadata = metadata_for_capability("shell_command", "tool")
     request = CapabilityRequest(
         actor_id=root_id,
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         actor_clearance=0.99,
         invocation_mode="workflow",
         capability_name="shell_command",

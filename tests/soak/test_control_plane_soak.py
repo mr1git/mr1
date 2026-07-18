@@ -22,7 +22,7 @@ from mr1.autonomy.objectives import (
     STATUS_PAUSED,
 )
 from mr1.autonomy.service import SupervisorConfig
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.workflow_models import WorkflowStatus
 from tests.soak.harness import SoakRuntime
 
@@ -99,7 +99,7 @@ def test_pause_lets_in_flight_work_drain(tmp_path):
     # The in-flight task completes; pause must not have cancelled it.
     workflow = runtime.store.load_workflow(workflow_id)
     task_id = next(iter(workflow.tasks))
-    from mr1.kazi_runner import RunStatus
+    from mr1.worker_runner import RunStatus
 
     runtime.runner.complete(task_id, RunStatus.SUCCEEDED, exit_code=0, summary="ok")
     runtime.run(3)
@@ -120,7 +120,7 @@ def test_stopping_drains_then_asks_to_exit(tmp_path):
     assert outcome["gate"] == "draining"
     assert runtime.supervisor.exit_requested is False
 
-    from mr1.kazi_runner import RunStatus
+    from mr1.worker_runner import RunStatus
 
     workflow = runtime.store.load_workflow(workflow_id)
     runtime.runner.complete(

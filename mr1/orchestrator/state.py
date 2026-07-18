@@ -350,6 +350,16 @@ class StateManager:
         with self._lock:
             return deepcopy(self._state.get("runtime_errors", []))
 
+    @property
+    def decisions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return deepcopy(self._state.get("decisions", []))
+
+    @property
+    def tasks(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return deepcopy(self._state.get("tasks", {}))
+
     def format_status(self) -> str:
         """Human-readable status block."""
         with self._lock:

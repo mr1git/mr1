@@ -322,7 +322,7 @@ class Notifier:
             self._event_log.emit(
                 event_type="notification_failed" if failed else "notification_delivered",
                 actor_id="notifier",
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id=notification.objective_id,
                 target_type="objective",
                 status="error" if failed else "ok",

@@ -1,7 +1,7 @@
 {
   "category": "routing",
-  "description": "Direct delegation request should create a persistent agent",
-  "elapsed_s": 27.61,
+  "description": "Direct delegation request should create an orchestrator",
+  "elapsed_s": 28.88,
   "findings": [],
   "scenario": "nl_create_agent_simple",
   "session_error": null,

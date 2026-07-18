@@ -9,7 +9,7 @@ from mr1 import workflow_cli
 from mr1.capability_policy import CapabilityApprovalDecision
 from mr1.capability_runner import CapabilityRunner
 from mr1.event_log import EventLog
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.memory_graph import (
     MemoryGraphStore,
     agent_node_id,
@@ -27,7 +27,7 @@ from mr1.memory_graph import (
     workflow_node_id,
 )
 from mr1.scheduler import Scheduler, submit_spec_to_disk
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Provenance
 from mr1.workflow_store import WorkflowStore
 
@@ -49,13 +49,13 @@ def event_log(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 def _make_tool_workflow(
     tmp_path: Path,
     store: WorkflowStore,
-    agent_store: PersistentAgentStore,
+    agent_store: AgentStore,
 ) -> tuple[str, str, str]:
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.99)
@@ -113,7 +113,7 @@ def test_deterministic_ids_and_template_hash_stability(tmp_path):
                 "label": "summarize",
                 "title": "Summarize",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "summarize",
                 "depends_on": ["read"],
                 "inputs": [{"name": "notes", "from": "read.result.text"}],
@@ -134,7 +134,7 @@ def test_deterministic_ids_and_template_hash_stability(tmp_path):
                 "label": "summarize",
                 "title": "Summarize changed",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "totally different prompt",
                 "depends_on": ["read"],
                 "inputs": [{"name": "renamed_input", "from": "read.result.text"}],
@@ -179,7 +179,7 @@ def test_ingestion_soft_skips_missing_event_metadata(event_log: EventLog, graph_
     event_log.emit(
         event_type="capability_requested",
         actor_id="ag-1",
-        actor_type="mrn",
+        actor_type="orchestrator",
         target_id=None,
         target_type="capability",
         status="requested",

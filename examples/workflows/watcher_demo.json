@@ -14,7 +14,7 @@
       "label": "after_file",
       "title": "Run after file appears",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": [
         "wait_file"
       ],

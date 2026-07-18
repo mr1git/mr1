@@ -173,7 +173,7 @@ class Task:
     label: str
     title: str
     task_kind: str                  # "agent" | "watcher" | "tool"
-    agent_type: Optional[str]       # "kazi" | "mrn" | None
+    agent_type: Optional[str]       # "worker" | None (only "worker" is currently accepted by the scheduler)
     prompt: str
     watcher_type: Optional[str] = None
     watch_config: dict[str, Any] = field(default_factory=dict)
@@ -384,7 +384,7 @@ class WorkflowEvent:
     One entry in a workflow's append-only event log.
 
     `event_type` is a short kebab-like string, e.g. "task_started".
-    `agent_id` is the acting party (scheduler, MR1, kazi, etc.).
+    `agent_id` is the acting party (scheduler, MR1, a worker, etc.).
     `metadata` holds anything extra the emitter wants to preserve.
     """
     timestamp: str

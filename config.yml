@@ -3,5 +3,5 @@
 
 # Maximum depth of the MRn agent hierarchy.
 # MR1 (level 1) is always present. MR2..MR{h} can be spawned.
-# At level h, agents can only spawn Kazis — no more managers.
+# At level h, agents can only spawn workers — no more orchestrators.
 height_limit: 4

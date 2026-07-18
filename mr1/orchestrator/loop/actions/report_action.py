@@ -18,7 +18,7 @@ def execute_write_report(
     prompt_artifact_path: Optional[str] = None,
 ) -> "MRnStepResult":
     content = "\n".join([
-        f"# MRn Report for {agent.title}",
+        f"# Report — {agent.title} (MR{agent.mr_level})",
         "",
         f"- mission: {_compact(agent.mission, limit=240)}",
         f"- iteration: {agent.current_iteration + 1}",

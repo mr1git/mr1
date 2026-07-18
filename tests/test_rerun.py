@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
@@ -30,8 +30,8 @@ class TestRerun:
         spec = {
             "title": "Rerun unblock",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
-                {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "kazi", "prompt": "y", "depends_on": ["a"]},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
+                {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "worker", "prompt": "y", "depends_on": ["a"]},
             ],
         }
         wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))
@@ -59,7 +59,7 @@ class TestRerun:
         spec = {
             "title": "Rerun success",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
             ],
         }
         wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))
@@ -88,8 +88,8 @@ class TestRerun:
         spec = {
             "title": "Cancelled downstream",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
-                {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "kazi", "prompt": "y", "depends_on": ["a"]},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
+                {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "worker", "prompt": "y", "depends_on": ["a"]},
             ],
         }
         wf_id = scheduler.submit_workflow(spec, Provenance(type="agent", id="MR1"))

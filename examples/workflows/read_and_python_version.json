@@ -31,7 +31,7 @@
       "label": "summarize",
       "title": "Summarize results into report",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": [
         "read_notes",
         "python_version"

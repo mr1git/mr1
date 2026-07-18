@@ -4,6 +4,7 @@ node_modules/
 .viz-build/
 .DS_Store
 /tmp/
+.venv/
 # MR1 runtime state
 mr1/memory/**
 !mr1/memory/

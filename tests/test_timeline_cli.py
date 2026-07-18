@@ -8,7 +8,7 @@ import pytest
 from mr1 import workflow_cli
 from mr1.capability_runner import CapabilityRunner
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_store import WorkflowStore
 
 
@@ -19,7 +19,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -157,7 +157,7 @@ def test_timeline_workflow_scope_filtering(store, agent_store, message_store, ca
                 "label": "a",
                 "title": "A",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "x",
             }
         ],

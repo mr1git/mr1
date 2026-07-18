@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from mr1.kazi_runner import RunHandle, RunResult, RunStatus
+from mr1.worker_runner import RunHandle, RunResult, RunStatus
 from mr1.scheduler_core.events import SchedulerEventAdapter
 from mr1.workflow_models import Task, TaskAttempt, TaskStatus, Workflow
 from mr1.workflow_store import WorkflowStore, sync_task_view, sync_workflow_view

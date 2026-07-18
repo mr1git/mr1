@@ -22,7 +22,7 @@ from mr1.autonomy.objectives import (
 )
 from mr1.autonomy.recovery import FailureClass, classify
 from mr1.autonomy.service import SupervisorConfig
-from mr1.kazi_runner import MockRunner, RunResult, RunStatus
+from mr1.worker_runner import MockRunner, RunResult, RunStatus
 from mr1.workflow_models import TaskStatus, WorkflowStatus
 from tests.soak.harness import FakeBrain, FaultInjector, FaultProfile, SoakRuntime
 

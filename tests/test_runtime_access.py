@@ -15,7 +15,7 @@ from mr1.event_log import EventLog
 from mr1.messages import MessageStore
 from mr1.runtime_access import RuntimeAccess
 from mr1.scoped_agents import (
-    PersistentAgentStore,
+    AgentStore,
     build_assignment_packet,
     render_assignment_mission,
 )
@@ -30,7 +30,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -66,7 +66,7 @@ def _make_workflow(child_id: str) -> Workflow:
         label="analyze",
         title="Analyze",
         task_kind="agent",
-        agent_type="kazi",
+        agent_type="worker",
         prompt="Analyze the runtime failure.",
         status=TaskStatus.FAILED,
         last_error="x" * 600,
@@ -89,7 +89,7 @@ def _make_workflow(child_id: str) -> Workflow:
 def test_runtime_access_preview_and_full_reads(
     runtime_access: RuntimeAccess,
     workflow_store: WorkflowStore,
-    agent_store: PersistentAgentStore,
+    agent_store: AgentStore,
     message_store: MessageStore,
     approval_store: CapabilityApprovalStore,
     event_log: EventLog,
@@ -177,7 +177,7 @@ def test_runtime_access_preview_and_full_reads(
 
     request = CapabilityRequest(
         actor_id=child.agent_id,
-        actor_type="mrn",
+        actor_type="orchestrator",
         actor_clearance=child.security_clearance,
         invocation_mode="direct",
         capability_name="read_file",
@@ -208,7 +208,7 @@ def test_runtime_access_preview_and_full_reads(
     event_log.emit(
         event_type="workflow_task_failed",
         actor_id="MR1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="tk-1",
         target_type="task",
         status="failed",
@@ -286,7 +286,7 @@ def test_runtime_access_preview_and_full_reads(
 
 def test_runtime_access_marks_legacy_active_terminated_agent_as_terminal(
     runtime_access: RuntimeAccess,
-    agent_store: PersistentAgentStore,
+    agent_store: AgentStore,
 ):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "Sentinel")

@@ -7,5 +7,5 @@ allowed_tools:
   - Read
   - Glob
   - Grep
-lifetime: persistent    # Always running while the system is active.
+lifecycle: standing     # Always running while the system is active.
 memory_access: full     # Full read/write access to all memory stores.

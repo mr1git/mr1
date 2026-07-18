@@ -13,8 +13,8 @@ from mr1.event_log import EventLog, SystemEvent
 from mr1.messages import MessageStore, PersistentMessage
 from mr1.scoped_agents import (
     AgentScopeError,
-    PersistentAgent,
-    PersistentAgentStore,
+    AgentRecord,
+    AgentStore,
     derive_agent_lifecycle,
 )
 from mr1.scheduler import WorkflowSpecError
@@ -66,7 +66,7 @@ def _message_peer_preview(message: PersistentMessage) -> dict[str, Any]:
 
 
 def _pending_parent_messages(
-    agent: PersistentAgent,
+    agent: AgentRecord,
     message_store: MessageStore,
 ) -> list[PersistentMessage]:
     if not agent.parent_agent_id:
@@ -83,7 +83,7 @@ def _pending_parent_messages(
 
 
 def _agent_runtime_activity_payload(
-    agent: PersistentAgent,
+    agent: AgentRecord,
     workflow_store: WorkflowStore,
 ) -> dict[str, Any]:
     active_jobs = 0
@@ -116,7 +116,7 @@ def _agent_runtime_activity_payload(
     }
 
 
-def _agent_lifecycle_payload(agent: PersistentAgent) -> dict[str, Any]:
+def _agent_lifecycle_payload(agent: AgentRecord) -> dict[str, Any]:
     lifecycle = derive_agent_lifecycle(agent)
     return {
         "lifecycle_status": lifecycle["lifecycle_status"],
@@ -127,7 +127,7 @@ def _agent_lifecycle_payload(agent: PersistentAgent) -> dict[str, Any]:
 
 
 def _normalize_caller_agent_id(
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: Optional[str],
 ) -> str:
     return caller_agent_id or scoped_agents.root_agent_id
@@ -152,7 +152,7 @@ def _prioritize_items(
 
 def visible_workflows(
     store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> list[Workflow]:
     workflows = []
@@ -166,7 +166,7 @@ def visible_workflows(
 def load_scoped_workflow(
     store: WorkflowStore,
     workflow_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> Workflow:
     workflow = store.load_workflow(workflow_id)
@@ -193,7 +193,7 @@ def require_visible_message(
 
 def visible_approvals(
     approval_store: CapabilityApprovalStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> list[CapabilityApprovalRequest]:
     visible_ids = {agent.agent_id for agent in scoped_agents.list_visible_agents(caller_agent_id)}
@@ -212,7 +212,7 @@ def visible_approvals(
 def require_visible_approval(
     approval_store: CapabilityApprovalStore,
     approval_request_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> CapabilityApprovalRequest:
     approval = approval_store.require(approval_request_id)
@@ -229,7 +229,7 @@ def event_visible(
     event: SystemEvent,
     *,
     store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     message_store: MessageStore,
     caller_agent_id: str,
     approval_store: Optional[CapabilityApprovalStore] = None,
@@ -268,7 +268,7 @@ def event_visible(
 
 def visible_timeline_events(
     store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     message_store: MessageStore,
     caller_agent_id: str,
     *,
@@ -295,7 +295,7 @@ class RuntimeAccess:
         self,
         *,
         workflow_store: WorkflowStore,
-        scoped_agent_store: PersistentAgentStore,
+        scoped_agent_store: AgentStore,
         message_store: MessageStore,
         approval_store: Optional[CapabilityApprovalStore] = None,
         event_log: Optional[EventLog] = None,
@@ -311,7 +311,7 @@ class RuntimeAccess:
     def _caller(self, caller_agent_id: Optional[str]) -> str:
         return _normalize_caller_agent_id(self._scoped_agents, caller_agent_id)
 
-    def _agent_preview_payload(self, agent: PersistentAgent) -> dict[str, Any]:
+    def _agent_preview_payload(self, agent: AgentRecord) -> dict[str, Any]:
         mission_preview, mission_truncated, mission_full_available = _preview_text(
             agent.mission,
             limit=_AGENT_PREVIEW_LIMIT,
@@ -335,7 +335,9 @@ class RuntimeAccess:
         payload = {
             "agent_id": agent.agent_id,
             "title": agent.title,
-            "agent_type": agent.agent_type,
+            "role": agent.role,
+            "mr_level": agent.mr_level,
+            "lifecycle": agent.lifecycle,
             "status": agent.status,
             "run_status": agent.run_status,
             "mission_preview": mission_preview,
@@ -485,7 +487,7 @@ class RuntimeAccess:
         ]
         return payload
 
-    def _agent_runtime_activity_payload(self, agent: PersistentAgent) -> dict[str, Any]:
+    def _agent_runtime_activity_payload(self, agent: AgentRecord) -> dict[str, Any]:
         return _agent_runtime_activity_payload(agent, self._workflow_store)
 
     def list_messages(

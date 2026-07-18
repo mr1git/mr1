@@ -21,7 +21,7 @@ from mr1.capability_policy import (
 from mr1.clock import default_clock
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Task, TaskStatus, Workflow
 from mr1.workflow_store import WorkflowStore
 
@@ -32,7 +32,7 @@ class CapabilityGate:
         *,
         store: WorkflowStore,
         capabilities: CapabilityRegistry,
-        scoped_agents: PersistentAgentStore,
+        scoped_agents: AgentStore,
         message_store: MessageStore,
         policy_engine: PolicyEngine,
         approval_store: CapabilityApprovalStore,
@@ -81,8 +81,8 @@ class CapabilityGate:
     def workflow_actor_type(self, workflow: Workflow) -> str:
         owner = self._scoped_agents.load_agent(workflow.owner_agent_id or "")
         if owner is None:
-            return "mr1"
-        return "mr1" if owner.agent_type == "mr1" else "mrn"
+            return "root_orchestrator"
+        return owner.actor_category
 
     def capability_name_for_task(self, task: Task) -> str:
         if task.task_kind == "tool":

@@ -34,7 +34,7 @@ from mr1.memory_queries import (
     memory_insights_search,
     memory_stores_available,
 )
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.scheduler import WorkflowSpecError, validate_spec
 from mr1.tools import ToolRegistry, default_tool_registry
 from mr1.watchers import WatcherRegistry, default_watcher_registry
@@ -237,7 +237,7 @@ class WorkflowCompilerClient:
         compiler: Optional[CompilerFn] = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         workflow_schema_registry: Optional[WorkflowSchemaRegistry] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         watcher_registry: Optional[WatcherRegistry] = None,
         tool_registry: Optional[ToolRegistry] = None,
         submitter: Optional[CompilerSubmitter] = None,
@@ -247,7 +247,7 @@ class WorkflowCompilerClient:
         self._workflow_schema_registry = (
             workflow_schema_registry or default_workflow_schema_registry()
         )
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore()
+        self._scoped_agents = scoped_agent_store or AgentStore()
         self._watcher_registry = watcher_registry or default_watcher_registry()
         self._tool_registry = tool_registry or default_tool_registry()
         self._submitter = submitter

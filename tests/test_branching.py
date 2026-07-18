@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from mr1 import workflow_events as ev
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.scheduler import Scheduler, replace_workflow_on_disk
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
@@ -50,14 +50,14 @@ def _single_branch_spec() -> dict:
                 "label": "check",
                 "title": "Check",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "check",
             },
             {
                 "label": "success_path",
                 "title": "Success path",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["check"],
                 "run_if": {
                     "ref": "check.result.data.exit_code",
@@ -70,7 +70,7 @@ def _single_branch_spec() -> dict:
                 "label": "final",
                 "title": "Final",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["success_path"],
                 "prompt": "final",
             },
@@ -86,14 +86,14 @@ def _join_spec() -> dict:
                 "label": "check",
                 "title": "Check",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "check",
             },
             {
                 "label": "success_path",
                 "title": "Success path",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["check"],
                 "run_if": {
                     "ref": "check.result.data.exit_code",
@@ -106,7 +106,7 @@ def _join_spec() -> dict:
                 "label": "failure_path",
                 "title": "Failure path",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["check"],
                 "run_if": {
                     "ref": "check.result.data.exit_code",
@@ -119,7 +119,7 @@ def _join_spec() -> dict:
                 "label": "final",
                 "title": "Final",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["success_path", "failure_path"],
                 "dependency_policy": "any_succeeded",
                 "prompt": "final",
@@ -305,7 +305,7 @@ class TestBranchingScheduler:
                         "label": "success_path",
                         "title": "Forced path",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "depends_on": ["check"],
                         "prompt": "forced",
                     }

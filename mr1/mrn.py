@@ -1,8 +1,10 @@
 """
-MRn — Parameterized Manager Agent
-==================================
-Handles complex multi-step tasks at any level of the agent hierarchy.
-Spawned by MR(n-1), can delegate to MR(n+1) or Kazi workers.
+MRn — Ephemeral orchestrator-role agent, parameterized by MR level
+====================================================================
+Handles complex multi-step tasks at any level of the agent hierarchy
+(role=orchestrator, lifecycle=task_scoped — bounded to one task tree,
+not persisted). Spawned by MR(n-1), can delegate to MR(n+1) or to
+role=worker agents.
 
 Level n is passed at spawn time. Model and behavior vary by level:
   Level 2: Job orchestrator (haiku)
@@ -187,8 +189,9 @@ def _parse_response(raw: str) -> tuple[str, Optional[dict]]:
         return raw.strip(), None
 
     agent = directive["agent"]
-    # Accept "kazi" or any "mrN" pattern.
-    if agent != "kazi" and not (agent.startswith("mr") and agent[2:].isdigit()):
+    # Accept role tokens only. "orchestrator" always means "one MR level
+    # below me"; the caller computes the numeric level, never the model.
+    if agent not in ("orchestrator", "worker"):
         return raw.strip(), None
 
     display = _DELEGATE_PATTERN.sub("", raw).strip()
@@ -231,28 +234,28 @@ def _build_system_prompt(level: int, height_limit: int) -> str:
     if can_spawn_next:
         delegation_text = (
             f"You can delegate sub-tasks:\n"
-            f"- To MR{next_level} for complex sub-tasks requiring decomposition\n"
-            f"- To Kazi for simple, scoped one-shot jobs\n\n"
+            f"- To another orchestrator (MR{next_level}, one level below you) for complex sub-tasks requiring decomposition\n"
+            f"- To a worker for simple, scoped one-shot jobs\n\n"
             f"To delegate, include this block in your response:\n"
             f"[DELEGATE]\n"
-            f'{{"agent": "mr{next_level}", "task": "description", "context": "context"}}\n'
+            f'{{"agent": "orchestrator", "task": "description", "context": "context"}}\n'
             f"[/DELEGATE]\n\n"
-            f"Or for a kazi:\n"
+            f"Or for a worker:\n"
             f"[DELEGATE]\n"
-            f'{{"agent": "kazi", "task": "description", "context": "context"}}\n'
+            f'{{"agent": "worker", "task": "description", "context": "context"}}\n'
             f"[/DELEGATE]"
         )
     else:
         delegation_text = (
-            "You can delegate simple sub-tasks to Kazi workers:\n"
+            "You can delegate simple sub-tasks to worker agents:\n"
             "[DELEGATE]\n"
-            '{"agent": "kazi", "task": "description", "context": "context"}\n'
+            '{"agent": "worker", "task": "description", "context": "context"}\n'
             "[/DELEGATE]\n\n"
-            "You CANNOT spawn manager agents — you are at the maximum hierarchy depth."
+            "You CANNOT spawn another orchestrator — you are at the maximum hierarchy depth."
         )
 
     return (
-        f"You are MR{level}, a level-{level} agent in the MR1 multi-agent system.\n\n"
+        f"You are an orchestrator agent at MR{level} (hierarchy level {level}) in the MR1 multi-agent system.\n\n"
         f"You receive tasks from MR{level - 1} and execute them thoroughly.\n\n"
         f"{delegation_text}\n\n"
         f"Rules:\n"
@@ -660,35 +663,39 @@ def run(
             description=child_task[:200],
         )
 
-        if child_agent == "kazi":
-            from mr1 import kazi
+        if child_agent == "worker":
+            from mr1 import worker
 
-            child_result = kazi.run(
+            child_result = worker.run(
                 context=child_context_pkg,
                 spawner=spawner,
                 logger=logger,
                 event_callback=event_callback,
             )
             sub_tasks.append({
-                "agent": "kazi",
+                "agent": "worker",
                 "task_id": child_task_id,
                 "status": child_result.status,
                 "output": child_result.output[:500],
             })
             accumulated_results.append({
-                "agent": "kazi",
+                "agent": "worker",
                 "task": child_task,
                 "result": child_result.output,
             })
 
-        elif child_agent.startswith("mr"):
-            child_level = int(child_agent[2:])
+        elif child_agent == "orchestrator":
+            child_level = level + 1
+            # The dispatcher's own permission tiers are still keyed by literal
+            # "mr{level}" strings — that's legitimate MR-level notation, not a
+            # role label, so it's built here purely to call into it.
+            dispatcher_level_key = f"mr{child_level}"
 
             # Validate height limit before recursive spawn.
             try:
-                spawner._dispatcher.validate_spawn_level(level, child_agent)
+                spawner._dispatcher.validate_spawn_level(level, dispatcher_level_key)
             except PermissionDenied as e:
-                logger.log_denied(child_task_id, child_agent, str(e))
+                logger.log_denied(child_task_id, dispatcher_level_key, str(e))
                 accumulated_results.append({
                     "agent": child_agent,
                     "task": child_task,

@@ -10,7 +10,7 @@ import pytest
 
 from mr1 import workflow_cli
 from mr1.capability_policy import CapabilityApprovalDecision
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.mr1 import MR1, StateManager
 from mr1.scheduler import Scheduler, WorkflowSpecError, validate_spec
 from mr1.tools import ToolConfigError, default_tool_registry
@@ -144,7 +144,7 @@ class TestReadWriteTools:
                         "label": "summarize",
                         "title": "Summarize",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "depends_on": ["read_notes"],
                         "inputs": [{"name": "notes", "from": "read_notes.result.text"}],
                         "prompt": "Summarize these notes.",
@@ -237,7 +237,7 @@ class TestReadWriteTools:
                         "label": "consumer",
                         "title": "Consumer",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "depends_on": ["writer"],
                         "inputs": [{"name": "path", "from": "writer.artifact.written_file"}],
                         "prompt": "Use the written file path.",
@@ -397,7 +397,7 @@ class TestToolSchedulerIntegration:
                             "label": "agent",
                             "title": "Agent",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "prompt": "work",
                         },
                         {
@@ -433,7 +433,7 @@ class TestToolSchedulerIntegration:
                     "label": "after",
                     "title": "After",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "depends_on": ["reader"],
                     "prompt": "after",
                 },
@@ -485,7 +485,7 @@ class TestToolDataflowIntegration:
                         "label": "consume",
                         "title": "Consume",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "depends_on": ["shell"],
                         "inputs": [{"name": "stdout", "from": "shell.result.data.stdout"}],
                         "prompt": "Use stdout.",
@@ -521,7 +521,7 @@ class TestToolDataflowIntegration:
                         "label": "consume",
                         "title": "Consume",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "depends_on": ["shell"],
                         "inputs": [{"name": "stdout_path", "from": "shell.artifact.stdout"}],
                         "prompt": "Use stdout artifact.",
@@ -556,7 +556,7 @@ class TestToolDataflowIntegration:
                         "label": "consume",
                         "title": "Consume",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "depends_on": ["shell"],
                         "inputs": [{"name": "missing", "from": "shell.artifact.nope"}],
                         "prompt": "Use missing artifact.",

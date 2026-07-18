@@ -1,7 +1,7 @@
 {
   "category": "workflow",
   "description": "Create workflow, rerun a task via slash command",
-  "elapsed_s": 24.49,
+  "elapsed_s": 7.62,
   "findings": [],
   "scenario": "wf_rerun_via_slash",
   "session_error": null,

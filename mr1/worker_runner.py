@@ -7,10 +7,10 @@ RunStatus`, `cancel(handle)`.
 
 Three implementations are provided:
 
-- `KaziAsyncRunner` — real Kazi runs driven via `subprocess.Popen`, with
+- `WorkerAsyncRunner` — real Worker runs driven via `subprocess.Popen`, with
   stdout/stderr redirected directly to log files so the scheduler never
   has to drain pipes.
-- `KaziBlockingRunner` — wraps the existing synchronous `kazi.run()` for
+- `WorkerBlockingRunner` — wraps the existing synchronous `worker.run()` for
   the rare caller that wants blocking semantics (tests, CLI one-shots).
 - `MockRunner` — test-only. Tasks transition through status callbacks
   provided by the test harness; no subprocess is launched.
@@ -98,11 +98,11 @@ class Runner(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Kazi async runner
+# Worker async runner
 # ---------------------------------------------------------------------------
 
 
-_DEFAULT_KAZI_TIMEOUT_S = 300
+_DEFAULT_WORKER_TIMEOUT_S = 300
 
 
 def _result_payload_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
@@ -128,9 +128,9 @@ def _classify_envelope_error(parsed: dict[str, Any]) -> str:
     return "auth_error" if is_auth_error_text(parsed.get("text")) else "cli_error"
 
 
-class KaziAsyncRunner(Runner):
+class WorkerAsyncRunner(Runner):
     """
-    Runs each Kazi task as a non-blocking subprocess.
+    Runs each Worker task as a non-blocking subprocess.
 
     stdout/stderr are redirected directly to the task's log files so
     the scheduler's poll loop only has to check `process.poll()` —
@@ -149,14 +149,14 @@ class KaziAsyncRunner(Runner):
         self._dispatcher = dispatcher or Dispatcher()
         self._logger = logger or Logger()
         self._claude_binary = claude_binary
-        self._config = load_agent_runtime_config("kazi")
+        self._config = load_agent_runtime_config("worker")
 
     def start(self, task: Task) -> RunHandle:
         prompt = task.prompt or task.title
         tools = list(self._config.get("allowed_tools", []))
-        timeout_s = task.timeout_s or self._config.get("timeout_s") or _DEFAULT_KAZI_TIMEOUT_S
+        timeout_s = task.timeout_s or self._config.get("timeout_s") or _DEFAULT_WORKER_TIMEOUT_S
         cmd = build_agent_command(
-            "kazi",
+            "worker",
             prompt,
             config=self._config,
             binary_override=self._claude_binary,
@@ -164,9 +164,9 @@ class KaziAsyncRunner(Runner):
 
         cli_flags = [tok for tok in cmd[1:] if tok.startswith("-")]
         try:
-            self._dispatcher.validate_full_spawn("kazi", cli_flags, tools)
+            self._dispatcher.validate_full_spawn("worker", cli_flags, tools)
         except PermissionDenied as e:
-            self._logger.log_denied(task.task_id, "kazi", str(e))
+            self._logger.log_denied(task.task_id, "worker", str(e))
             raise
 
         if task.current_attempt > 0:
@@ -204,7 +204,7 @@ class KaziAsyncRunner(Runner):
                     "cmd": cmd,
                 },
             )
-        self._logger.log_spawn(task.task_id, "kazi", proc.pid, cmd)
+        self._logger.log_spawn(task.task_id, "worker", proc.pid, cmd)
 
         return RunHandle(
             task_id=task.task_id,
@@ -242,7 +242,7 @@ class KaziAsyncRunner(Runner):
             ):
                 self._terminate(proc)
                 self._close_handles(handle)
-                self._logger.log_exit(handle.task_id, "kazi", proc.pid, -9)
+                self._logger.log_exit(handle.task_id, "worker", proc.pid, -9)
                 return self._build_result(
                     handle,
                     RunStatus.TIMED_OUT,
@@ -253,7 +253,7 @@ class KaziAsyncRunner(Runner):
             return None
 
         self._close_handles(handle)
-        self._logger.log_exit(handle.task_id, "kazi", proc.pid, returncode)
+        self._logger.log_exit(handle.task_id, "worker", proc.pid, returncode)
         stdout_text = self._read_log(handle.payload["stdout_path"])
         stderr_text = self._read_log(handle.payload["stderr_path"])
 
@@ -306,7 +306,7 @@ class KaziAsyncRunner(Runner):
             return
         self._terminate(proc)
         self._close_handles(handle)
-        self._logger.log_kill(handle.task_id, "kazi", handle.pid or -1, "cancel")
+        self._logger.log_kill(handle.task_id, "worker", handle.pid or -1, "cancel")
 
     def recover_result(self, task: Task) -> Optional[RunResult]:
         """Recover a terminal result from the persisted stdout log file."""
@@ -404,15 +404,15 @@ class KaziAsyncRunner(Runner):
 
 
 # ---------------------------------------------------------------------------
-# Kazi blocking runner
+# Worker blocking runner
 # ---------------------------------------------------------------------------
 
 
-class KaziBlockingRunner(Runner):
+class WorkerBlockingRunner(Runner):
     """
-    Blocking adapter around the legacy `kazi.run()` entry point.
+    Blocking adapter around the legacy `worker.run()` entry point.
 
-    `start()` fully executes the Kazi job inline, then `poll()`
+    `start()` fully executes the Worker job inline, then `poll()`
     immediately returns its terminal `RunResult`. Useful for tests
     and any caller that wants synchronous semantics without spinning
     up the async runner.
@@ -423,14 +423,14 @@ class KaziBlockingRunner(Runner):
         store: WorkflowStore,
         *,
         logger: Optional[Logger] = None,
-        kazi_run: Optional[Callable[..., Any]] = None,
+        worker_run: Optional[Callable[..., Any]] = None,
     ):
         self._store = store
         self._logger = logger or Logger()
-        if kazi_run is None:
-            from mr1 import kazi as _kazi
-            kazi_run = _kazi.run
-        self._kazi_run = kazi_run
+        if worker_run is None:
+            from mr1 import worker as _worker
+            worker_run = _worker.run
+        self._worker_run = worker_run
 
     def start(self, task: Task) -> RunHandle:
         if task.current_attempt > 0:
@@ -449,7 +449,7 @@ class KaziBlockingRunner(Runner):
             "description": task.title,
             "timeout": task.timeout_s,
         }
-        result = self._kazi_run(context, logger=self._logger)
+        result = self._worker_run(context, logger=self._logger)
         stdout_path.write_text(result.output or "", encoding="utf-8")
         if result.error:
             stderr_path.write_text(result.error, encoding="utf-8")
@@ -473,7 +473,7 @@ class KaziBlockingRunner(Runner):
             stderr_path=stderr_path,
             result_payload=dict(getattr(result, "payload", {}) or {
                 "status": status.value,
-                "kazi_status": result.status,
+                "worker_status": result.status,
                 "summary": result.output,
                 "error": result.error,
                 "pid": result.pid,

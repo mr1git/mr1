@@ -8,7 +8,7 @@ import time
 import pytest
 
 from mr1.event_log import EventLog
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler
 from mr1.workflow_store import WorkflowStore
 

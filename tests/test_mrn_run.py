@@ -10,7 +10,7 @@ import pytest
 from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepResult
 from mr1.mrn_run import MRnRunPolicy, MRnRunRunner
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentStore
 from mr1.workflow_store import WorkflowStore
 
 
@@ -21,7 +21,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ def _step_result(
 
 
 class StubStepRunner:
-    def __init__(self, agent_store: PersistentAgentStore, results: list[MRnStepResult]):
+    def __init__(self, agent_store: AgentStore, results: list[MRnStepResult]):
         self._agent_store = agent_store
         self._results = list(results)
         self.calls: list[tuple[str, str | None, str | None]] = []
@@ -83,7 +83,7 @@ class StubStepRunner:
         return result
 
 
-def _child_agent(agent_store: PersistentAgentStore, *, mission: str = "Investigate"):
+def _child_agent(agent_store: AgentStore, *, mission: str = "Investigate"):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
     agent_store.assign_mission(root.agent_id, child.agent_id, mission)

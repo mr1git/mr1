@@ -13,7 +13,7 @@ expectations) the behavioral judge needs.
 from __future__ import annotations
 
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +80,7 @@ class TurnRecord:
     errors: List[Dict[str, Any]]
     outcome: str
     findings: List[tuple]
+    worker_spawns: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -100,6 +101,7 @@ class TurnRecord:
             "errors": self.errors,
             "outcome": self.outcome,
             "findings": [list(f) for f in self.findings],
+            "worker_spawns": self.worker_spawns,
         }
 
 
@@ -117,6 +119,41 @@ def _final_action(payload: Dict[str, Any]) -> Optional[str]:
         if event.get("event_type") == "runtime_turn_decided":
             return (event.get("metadata") or {}).get("final_action")
     return None
+
+
+def _worker_spawns_of(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Structured worker-delegation records for this turn: one per
+    `"spawn_worker"` decision-log entry (the authoritative source — see
+    `tests.soak.hierarchical.outcomes._decisions_with_action`), enriched
+    with the matching task record when the same turn's `tasks` diff has
+    one (task lifecycle — attach/complete/fail — is tracked on
+    `StateManager.tasks` unconditionally, unlike the event log)."""
+    decisions = [
+        d for d in (payload.get("decisions") or []) if d.get("action") == "spawn_worker"
+    ]
+    if not decisions:
+        return []
+    tasks_by_id = {
+        t.get("task_id"): t
+        for t in (
+            list((payload.get("tasks") or {}).get("created") or [])
+            + list((payload.get("tasks") or {}).get("updated") or [])
+        )
+    }
+    spawns = []
+    for d in decisions:
+        task_id = d.get("task_id")
+        task = tasks_by_id.get(task_id) or {}
+        spawns.append({
+            "task_id": task_id,
+            "parent_agent": task.get("parent_task_id"),
+            "mr_level": None,  # workers aren't leveled — not a persisted AgentRecord
+            "lifecycle": "ephemeral",
+            "mission": task.get("description") or d.get("input_summary"),
+            "status": task.get("status"),
+            "decision_timestamp": d.get("timestamp"),
+        })
+    return spawns
 
 
 def build_cluster_session(
@@ -178,5 +215,6 @@ def run_cluster_turns(
             errors=list(payload.get("errors") or []),
             outcome=classify(payload),
             findings=findings,
+            worker_spawns=_worker_spawns_of(payload),
         ))
     return records

@@ -6,11 +6,11 @@ import json
 
 import pytest
 
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scoped_agents import (
     AgentScopeError,
-    PersistentAgent,
-    PersistentAgentStore,
+    AgentRecord,
+    AgentStore,
     agent_display_status,
     build_assignment_packet,
     is_agent_live,
@@ -30,7 +30,7 @@ SPEC = {
             "label": "a",
             "title": "Task A",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do it",
         }
     ],
@@ -39,7 +39,7 @@ SPEC = {
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -51,8 +51,9 @@ class TestRootBootstrap:
     def test_root_bootstrap_persists(self, agent_store):
         root = agent_store.ensure_root_agent()
 
-        assert root.agent_type == "mr1"
-        assert root.tree_level == 1
+        assert root.role == "orchestrator"
+        assert root.mr_level == 1
+        assert root.lifecycle == "standing"
         assert root.mission is None
         assert root.mode == "manual"
         assert root.run_status == "idle"
@@ -64,7 +65,7 @@ class TestRootBootstrap:
         assert agent_store.logs_dir(root.agent_id).exists()
         assert agent_store.report_dir(root.agent_id).exists()
 
-        reloaded = PersistentAgentStore(root=agent_store.root)
+        reloaded = AgentStore(root=agent_store.root)
         same_root = reloaded.ensure_root_agent()
 
         assert same_root.agent_id == root.agent_id
@@ -77,7 +78,7 @@ class TestHierarchy:
         child = agent_store.create_child_agent(root.agent_id, "research")
 
         assert child.parent_agent_id == root.agent_id
-        assert child.tree_level == root.tree_level + 1
+        assert child.mr_level == root.mr_level + 1
         assert child.security_clearance == root.security_clearance
         assert agent_store.agent_path(child.agent_id).exists()
         assert agent_store.memory_path(child.agent_id).exists()
@@ -119,11 +120,11 @@ class TestHierarchy:
     def test_save_agent_rejects_new_duplicate_title_case_insensitively(self, agent_store):
         root = agent_store.ensure_root_agent()
         agent_store.create_child_agent(root.agent_id, "Alpha")
-        duplicate = PersistentAgent(
+        duplicate = AgentRecord(
             agent_id=new_agent_id(),
-            agent_type="mrn",
+            role="orchestrator",
             title="alpha",
-            tree_level=root.tree_level + 1,
+            mr_level=root.mr_level + 1,
             parent_agent_id=root.agent_id,
         )
 
@@ -210,8 +211,8 @@ class TestHierarchy:
             "notes",
         }
         assert reloaded.assignment_packet["parent_agent_id"] == parent.agent_id
-        assert reloaded.assignment_packet["parent_level"] == parent.tree_level
-        assert reloaded.assignment_packet["child_level"] == child.tree_level
+        assert reloaded.assignment_packet["parent_level"] == parent.mr_level
+        assert reloaded.assignment_packet["child_level"] == child.mr_level
         assert reloaded.assignment_packet["assigned_clearance"] == child.security_clearance
         assert reloaded.assignment_packet["full_parent_request"] == child_request
         assert reloaded.assignment_packet["relevant_context"]["agents"] == [parent.agent_id, child.agent_id]
@@ -219,7 +220,7 @@ class TestHierarchy:
         assert reloaded.assignment_packet["relevant_context"]["workflows"] == ["wf-2", "wf-3"]
         assert reloaded.parent_request == reloaded.assignment_packet["full_parent_request"]
         assert reloaded.mission is not None
-        assert "persistent MR3-style child agent" in reloaded.mission
+        assert "MR3, an orchestrator agent owning a scoped assignment" in reloaded.mission
 
     def test_visibility_is_self_and_descendants_only(self, agent_store):
         root = agent_store.ensure_root_agent()
@@ -303,56 +304,56 @@ class TestTerminationEffects:
 
 class TestLifecycleHelpers:
     def test_live_and_terminal_helpers_handle_legacy_conflicts(self):
-        active_idle = PersistentAgent(
+        active_idle = AgentRecord(
             agent_id="ag-idle",
-            agent_type="mrn",
+            role="orchestrator",
             title="Idle",
-            tree_level=2,
+            mr_level=2,
             parent_agent_id="ag-root",
             status="active",
             run_status="idle",
         )
-        active_waiting = PersistentAgent(
+        active_waiting = AgentRecord(
             agent_id="ag-live",
-            agent_type="mrn",
+            role="orchestrator",
             title="Live",
-            tree_level=2,
+            mr_level=2,
             parent_agent_id="ag-root",
             status="active",
             run_status="waiting",
         )
-        active_working = PersistentAgent(
+        active_working = AgentRecord(
             agent_id="ag-working",
-            agent_type="mrn",
+            role="orchestrator",
             title="Working",
-            tree_level=2,
+            mr_level=2,
             parent_agent_id="ag-root",
             status="active",
             run_status="working",
         )
-        legacy_terminated = PersistentAgent(
+        legacy_terminated = AgentRecord(
             agent_id="ag-legacy-term",
-            agent_type="mrn",
+            role="orchestrator",
             title="Legacy",
-            tree_level=2,
+            mr_level=2,
             parent_agent_id="ag-root",
             status="active",
             run_status="terminated",
         )
-        legacy_completed = PersistentAgent(
+        legacy_completed = AgentRecord(
             agent_id="ag-legacy-complete",
-            agent_type="mrn",
+            role="orchestrator",
             title="LegacyComplete",
-            tree_level=2,
+            mr_level=2,
             parent_agent_id="ag-root",
             status="active",
             run_status="completed",
         )
-        terminated = PersistentAgent(
+        terminated = AgentRecord(
             agent_id="ag-dead",
-            agent_type="mrn",
+            role="orchestrator",
             title="Dead",
-            tree_level=2,
+            mr_level=2,
             parent_agent_id="ag-root",
             status="terminated",
             run_status="idle",
@@ -426,12 +427,12 @@ class TestTitleIndex:
         )
 
     def test_index_persists_across_store_instances(self, tmp_path):
-        store_a = PersistentAgentStore(root=tmp_path / "agents")
+        store_a = AgentStore(root=tmp_path / "agents")
         root = store_a.ensure_root_agent()
         store_a.create_child_agent(root.agent_id, "Persistent")
 
         # Fresh store instance — should load existing index.
-        store_b = PersistentAgentStore(root=tmp_path / "agents")
+        store_b = AgentStore(root=tmp_path / "agents")
         root_b = store_b.ensure_root_agent()
         with pytest.raises(ValueError, match="agent title already exists"):
             store_b.create_child_agent(root_b.agent_id, "persistent")

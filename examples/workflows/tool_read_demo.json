@@ -15,7 +15,7 @@
       "label": "summarize",
       "title": "Summarize notes",
       "task_kind": "agent",
-      "agent_type": "kazi",
+      "agent_type": "worker",
       "depends_on": ["read_notes"],
       "inputs": [
         {

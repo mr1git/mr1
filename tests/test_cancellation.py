@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from mr1 import workflow_events as ev
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
@@ -12,8 +12,8 @@ from mr1.workflow_store import WorkflowStore
 SPEC = {
     "title": "Cancellation",
     "tasks": [
-        {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
-        {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "kazi", "prompt": "y", "depends_on": ["a"]},
+        {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
+        {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "worker", "prompt": "y", "depends_on": ["a"]},
     ],
 }
 

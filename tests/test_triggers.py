@@ -34,7 +34,7 @@ from mr1.autonomy.triggers import (
     validate_trigger,
 )
 from mr1.clock import VirtualClock
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 
 
 START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -260,7 +260,7 @@ class _RecordingPlanner:
                 "label": "t",
                 "title": "T",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "work",
             }],
         }
@@ -279,7 +279,7 @@ def _supervisor(root, clock, planner, runner=None):
 
 def _drive_to_completion(supervisor, runner) -> None:
     """Run the planned workflow through to SUCCEEDED and reconcile it."""
-    from mr1.kazi_runner import RunStatus
+    from mr1.worker_runner import RunStatus
 
     scheduler = supervisor.scheduler
     scheduler.tick()
@@ -291,7 +291,7 @@ def _drive_to_completion(supervisor, runner) -> None:
 
 
 def _recurring(root, clock, *, trigger) -> str:
-    from mr1.scoped_agents import PersistentAgentStore
+    from mr1.scoped_agents import AgentStore
 
     objectives = ObjectiveStore(root, clock=clock)
     objective = objectives.create(
@@ -299,7 +299,7 @@ def _recurring(root, clock, *, trigger) -> str:
         statement="run the weekly cycle",
         kind=KIND_RECURRING,
         trigger=trigger,
-        owner_agent_id=PersistentAgentStore(root=root / "agents").root_agent_id,
+        owner_agent_id=AgentStore(root=root / "agents").root_agent_id,
     )
     return objective.objective_id
 

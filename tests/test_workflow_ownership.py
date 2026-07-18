@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.scheduler import (
     Scheduler,
     append_workflow_on_disk,
@@ -24,7 +24,7 @@ SPEC = {
             "label": "a",
             "title": "Task A",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do it",
         }
     ],
@@ -38,7 +38,7 @@ def _replace_spec() -> dict:
                 "label": "a",
                 "title": "Task A replaced",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "replacement",
             }
         ]
@@ -52,7 +52,7 @@ def _append_spec() -> dict:
                 "label": "b",
                 "title": "Task B",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "follow up",
                 "depends_on": ["a"],
             }
@@ -62,7 +62,7 @@ def _append_spec() -> dict:
 
 def test_mr1_submit_defaults_to_root_ownership(tmp_path):
     workflow_store = WorkflowStore(root=tmp_path / "workflows")
-    agent_store = PersistentAgentStore(root=tmp_path / "agents")
+    agent_store = AgentStore(root=tmp_path / "agents")
     root = agent_store.ensure_root_agent()
 
     workflow_id = submit_spec_to_disk(
@@ -82,7 +82,7 @@ def test_mr1_submit_defaults_to_root_ownership(tmp_path):
 
 def test_mrn_submit_stamps_ownership_and_updates_agent_record(tmp_path):
     workflow_store = WorkflowStore(root=tmp_path / "workflows")
-    agent_store = PersistentAgentStore(root=tmp_path / "agents")
+    agent_store = AgentStore(root=tmp_path / "agents")
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
 
@@ -104,7 +104,7 @@ def test_mrn_submit_stamps_ownership_and_updates_agent_record(tmp_path):
 
 def test_workflow_mutations_preserve_ownership(tmp_path):
     workflow_store = WorkflowStore(root=tmp_path / "workflows")
-    agent_store = PersistentAgentStore(root=tmp_path / "agents")
+    agent_store = AgentStore(root=tmp_path / "agents")
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")
 
@@ -126,7 +126,7 @@ def test_workflow_mutations_preserve_ownership(tmp_path):
 
 def test_descendant_access_allowed_and_sibling_access_denied(tmp_path):
     workflow_store = WorkflowStore(root=tmp_path / "workflows")
-    agent_store = PersistentAgentStore(root=tmp_path / "agents")
+    agent_store = AgentStore(root=tmp_path / "agents")
     root = agent_store.ensure_root_agent()
     left = agent_store.create_child_agent(root.agent_id, "left")
     left_child = agent_store.create_child_agent(left.agent_id, "left-child")
@@ -148,7 +148,7 @@ def test_descendant_access_allowed_and_sibling_access_denied(tmp_path):
 
 def test_terminal_mrn_workflow_writes_report(tmp_path):
     workflow_store = WorkflowStore(root=tmp_path / "workflows")
-    agent_store = PersistentAgentStore(root=tmp_path / "agents")
+    agent_store = AgentStore(root=tmp_path / "agents")
     message_store = MessageStore(root=tmp_path / "messages", scoped_agent_store=agent_store)
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research")

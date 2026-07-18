@@ -31,7 +31,7 @@ from mr1.autonomy.control import ControlPlane
 from mr1.clock import Clock, default_clock
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 # After this many consecutive failures, triage stops being a warning and starts
@@ -71,7 +71,7 @@ class GovernedTriage:
         runtime_root: Path,
         *,
         message_store: MessageStore,
-        scoped_agent_store: PersistentAgentStore,
+        scoped_agent_store: AgentStore,
         runner_factory: Callable[[], Any],
         control: Optional[ControlPlane] = None,
         budget: Optional[BudgetLedger] = None,
@@ -209,7 +209,7 @@ class GovernedTriage:
             self._event_log.emit(
                 event_type="inbox_triage_failed",
                 actor_id=self._scoped_agents.root_agent_id,
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id=self._scoped_agents.root_agent_id,
                 target_type="agent",
                 status="error",
@@ -250,7 +250,7 @@ class GovernedTriage:
             self._event_log.emit(
                 event_type="inbox_triage_skipped",
                 actor_id=self._scoped_agents.root_agent_id,
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id=self._scoped_agents.root_agent_id,
                 target_type="agent",
                 status="skipped",

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from mr1.kazi_runner import RunHandle
+from mr1.worker_runner import RunHandle
 from mr1.workflow_models import Task, TaskStatus, Workflow
 from mr1.workflow_store import WorkflowStore
 

@@ -15,7 +15,7 @@ from mr1.autonomy.control import (
 from mr1.autonomy.health import HealthReporter, heartbeat_age_s, heartbeat_is_stale, read_health
 from mr1.autonomy.service import Supervisor, SupervisorConfig
 from mr1.clock import VirtualClock
-from mr1.kazi_runner import MockRunner, RunResult, RunStatus
+from mr1.worker_runner import MockRunner, RunResult, RunStatus
 from mr1.workflow_models import Provenance, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
 

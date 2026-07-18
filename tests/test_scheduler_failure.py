@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from mr1 import workflow_events as ev
 from mr1.core import Logger
-from mr1.kazi_runner import KaziAsyncRunner, MockRunner, RunHandle, RunResult, RunStatus
+from mr1.worker_runner import WorkerAsyncRunner, MockRunner, RunHandle, RunResult, RunStatus
 from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
@@ -18,10 +18,10 @@ from mr1.workflow_store import WorkflowStore
 SPEC = {
     "title": "Failure cascade",
     "tasks": [
-        {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
-        {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "kazi",
+        {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
+        {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "worker",
          "prompt": "x", "depends_on": ["a"]},
-        {"label": "c", "title": "C", "task_kind": "agent", "agent_type": "kazi",
+        {"label": "c", "title": "C", "task_kind": "agent", "agent_type": "worker",
          "prompt": "x", "depends_on": ["a"]},
     ],
 }
@@ -150,8 +150,8 @@ class TestFailureCascade:
                     "label": "kill_agents",
                     "title": "Kill agents",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
-                    "prompt": f"Terminate persistent agent {child.agent_id}.",
+                    "agent_type": "worker",
+                    "prompt": f"Terminate orchestrator {child.agent_id}.",
                 },
             ],
         }
@@ -193,8 +193,8 @@ class TestFailureCascade:
                     "label": "kill_agents",
                     "title": "Kill agents",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
-                    "prompt": f"Terminate persistent agent {child.agent_id}.",
+                    "agent_type": "worker",
+                    "prompt": f"Terminate orchestrator {child.agent_id}.",
                 },
             ],
         }
@@ -207,10 +207,10 @@ class TestFailureCascade:
             runner.complete(
                 task_id,
                 RunStatus.SUCCEEDED,
-                summary=f"Terminated persistent agent {child.agent_id}.",
+                summary=f"Terminated orchestrator {child.agent_id}.",
                 result_payload={
-                    "summary": f"Terminated persistent agent {child.agent_id}.",
-                    "text": f"Terminated persistent agent {child.agent_id}.",
+                    "summary": f"Terminated orchestrator {child.agent_id}.",
+                    "text": f"Terminated orchestrator {child.agent_id}.",
                 },
             )
             scheduler.tick()
@@ -234,7 +234,7 @@ class TestFailureCascade:
                     "label": "run_tests",
                     "title": "Run tests",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Run pytest -q and report the result.",
                 },
             ],
@@ -318,7 +318,7 @@ class TestHandleLoss:
         single_task_spec = {
             "title": "single",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
             ],
         }
         store = WorkflowStore(root=tmp_path / "workflows")
@@ -356,14 +356,14 @@ class TestHandleLoss:
         assert "handle_missing" in actions
         assert "handle_recovered" in actions
 
-    def test_kazi_async_runner_recover_result_reads_stdout_log(self, tmp_path):
-        """KaziAsyncRunner.recover_result parses the stdout log when present."""
+    def test_worker_async_runner_recover_result_reads_stdout_log(self, tmp_path):
+        """WorkerAsyncRunner.recover_result parses the stdout log when present."""
         from pathlib import Path
-        from mr1.kazi_runner import KaziAsyncRunner
+        from mr1.worker_runner import WorkerAsyncRunner
         from mr1.workflow_models import Task, TaskStatus
 
         store = WorkflowStore(root=tmp_path / "workflows")
-        runner = KaziAsyncRunner(store)
+        runner = WorkerAsyncRunner(store)
 
         # Build a minimal Task with a stdout log path.
         log_dir = tmp_path / "logs"
@@ -380,7 +380,7 @@ class TestHandleLoss:
             label="a",
             title="A",
             task_kind="agent",
-            agent_type="kazi",
+            agent_type="worker",
             prompt="",
             log_stdout_path=str(stdout_log),
         )
@@ -390,15 +390,15 @@ class TestHandleLoss:
         assert result.status is RunStatus.SUCCEEDED
         assert result.summary == "done"
 
-    def test_kazi_async_runner_recover_result_returns_none_for_empty_log(self, tmp_path):
-        """KaziAsyncRunner.recover_result returns None when log is absent or empty."""
-        from mr1.kazi_runner import KaziAsyncRunner
+    def test_worker_async_runner_recover_result_returns_none_for_empty_log(self, tmp_path):
+        """WorkerAsyncRunner.recover_result returns None when log is absent or empty."""
+        from mr1.worker_runner import WorkerAsyncRunner
         from mr1.workflow_models import Task
 
         store = WorkflowStore(root=tmp_path / "workflows")
-        runner = KaziAsyncRunner(store)
+        runner = WorkerAsyncRunner(store)
 
-        _kw = dict(title="A", task_kind="agent", agent_type="kazi", prompt="")
+        _kw = dict(title="A", task_kind="agent", agent_type="worker", prompt="")
 
         # No log path set.
         assert runner.recover_result(Task(task_id="t1", workflow_id="wf1", label="a", **_kw)) is None
@@ -425,8 +425,8 @@ class TestHandleLoss:
             log_stdout_path=str(bad_log), **_kw,
         )) is None
 
-    def test_kazi_task_completes_without_handle_loss(self, tmp_path):
-        """Kazi agent task started and completed on the same scheduler has no handle loss."""
+    def test_worker_task_completes_without_handle_loss(self, tmp_path):
+        """Worker agent task started and completed on the same scheduler has no handle loss."""
         store = WorkflowStore(root=tmp_path / "workflows")
         runner = MockRunner()
         scheduler = Scheduler(store, runner, auto_tick=False)
@@ -478,17 +478,17 @@ class TestHandleLoss:
         assert wf.tasks[a_id].status is TaskStatus.SUCCEEDED
         assert wf.tasks[a_id].result_summary == "mock recovered"
 
-    @patch("mr1.kazi_runner.subprocess.Popen")
-    def test_kazi_fast_exit_finalized_in_launch_tick(self, mock_popen, tmp_path):
-        """A fast-exiting real Kazi subprocess is finalized on the launch tick."""
+    @patch("mr1.worker_runner.subprocess.Popen")
+    def test_worker_fast_exit_finalized_in_launch_tick(self, mock_popen, tmp_path):
+        """A fast-exiting real Worker subprocess is finalized on the launch tick."""
         store = WorkflowStore(root=tmp_path / "workflows")
         logger = Logger(tasks_dir=str(tmp_path / "task-logs"))
-        runner = KaziAsyncRunner(store, logger=logger)
+        runner = WorkerAsyncRunner(store, logger=logger)
         scheduler = Scheduler(store, runner, auto_tick=False, logger=logger)
         single_task_spec = {
             "title": "single",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
             ],
         }
 
@@ -529,20 +529,20 @@ class TestHandleLoss:
         assert "handle_removed" in scheduler_actions
         assert "handle_missing" not in scheduler_actions
 
-        kazi_actions = [entry["action"] for entry in logger.read_logs(a_id, "kazi")]
-        assert "spawn" in kazi_actions
-        assert "exit" in kazi_actions
+        worker_actions = [entry["action"] for entry in logger.read_logs(a_id, "worker")]
+        assert "spawn" in worker_actions
+        assert "exit" in worker_actions
         scheduler.shutdown()
 
-    @patch("mr1.kazi_runner.subprocess.Popen")
-    def test_fast_exit_kazi_result_survives_restart_without_handle_loss(self, mock_popen, tmp_path):
+    @patch("mr1.worker_runner.subprocess.Popen")
+    def test_fast_exit_worker_result_survives_restart_without_handle_loss(self, mock_popen, tmp_path):
         """A fast-exit task persists its terminal result before any restart can lose the handle."""
         store = WorkflowStore(root=tmp_path / "workflows")
         logger = Logger(tasks_dir=str(tmp_path / "task-logs"))
         single_task_spec = {
             "title": "single",
             "tasks": [
-                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
+                {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
             ],
         }
 
@@ -562,7 +562,7 @@ class TestHandleLoss:
 
         mock_popen.side_effect = _fake_popen
 
-        runner1 = KaziAsyncRunner(store, logger=logger)
+        runner1 = WorkerAsyncRunner(store, logger=logger)
         sched1 = Scheduler(store, runner1, auto_tick=False, logger=logger)
         wf_id = sched1.submit_workflow(single_task_spec, Provenance(type="agent", id="MR1"))
         sched1.tick()

@@ -19,7 +19,7 @@ from mr1.clock import VirtualClock
 from mr1.event_log import EventLog
 from mr1.inbox_triage import InboxTriagePolicy, InboxTriageResult
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 class FakeTriageRunner:
@@ -47,7 +47,7 @@ class Fixture:
     def __init__(self, tmp_path, *, runner=None, limits=None):
         self.clock = VirtualClock(start=datetime(2026, 1, 1, tzinfo=timezone.utc))
         self.runtime_root = tmp_path / "runtime"
-        self.agents = PersistentAgentStore(root=self.runtime_root / "agents")
+        self.agents = AgentStore(root=self.runtime_root / "agents")
         self.messages = MessageStore(
             root=self.runtime_root / "messages",
             scoped_agent_store=self.agents,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler
 from mr1.tools import ToolConfigError, default_tool_registry
 from mr1.workflow_models import Provenance, TaskStatus

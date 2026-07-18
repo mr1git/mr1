@@ -18,12 +18,12 @@ from mr1.memory_graph import (
     workflow_template_node_id,
 )
 from mr1.memory_retrieval import RetrievalStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -135,7 +135,7 @@ def _seed_events(tmp_path):
     log.emit(
         event_type="workflow_completed",
         actor_id="scheduler",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="wf-1",
         target_type="workflow",
         status="succeeded",

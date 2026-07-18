@@ -11,7 +11,7 @@ def dispatcher():
 
 class TestValidateAgent:
     def test_known_agents_pass(self, dispatcher):
-        for agent in ("mr1", "mr2", "mr3", "kazi", "mem_dltr", "mem_rtvr", "ctx_pkgr", "com_smrzr"):
+        for agent in ("mr1", "mr2", "mr3", "worker", "mem_dltr", "mem_rtvr", "ctx_pkgr", "com_smrzr"):
             assert dispatcher.validate_agent(agent) is True
 
     def test_unknown_agent_raises(self, dispatcher):
@@ -31,21 +31,21 @@ class TestValidateAgent:
 
 class TestValidateCliFlags:
     def test_allowed_flags_pass(self, dispatcher):
-        assert dispatcher.validate_cli_flags("kazi", ["-p", "--model", "--output-format"]) is True
+        assert dispatcher.validate_cli_flags("worker", ["-p", "--model", "--output-format"]) is True
 
     def test_disallowed_flag_raises(self, dispatcher):
         with pytest.raises(PermissionDenied, match="cli flag not allowed"):
-            dispatcher.validate_cli_flags("kazi", ["-p", "--evil-flag"])
+            dispatcher.validate_cli_flags("worker", ["-p", "--evil-flag"])
 
     def test_value_tokens_not_checked(self, dispatcher):
         # Non-flag tokens (values) should be ignored.
-        assert dispatcher.validate_cli_flags("kazi", ["-p", "some prompt text"]) is True
+        assert dispatcher.validate_cli_flags("worker", ["-p", "some prompt text"]) is True
 
     def test_agent_specific_flags(self, dispatcher):
-        # mr1 has --append-system-prompt, kazi does not.
+        # mr1 has --append-system-prompt, worker does not.
         assert dispatcher.validate_cli_flags("mr1", ["--append-system-prompt"]) is True
         with pytest.raises(PermissionDenied):
-            dispatcher.validate_cli_flags("kazi", ["--append-system-prompt"])
+            dispatcher.validate_cli_flags("worker", ["--append-system-prompt"])
 
     def test_mr2_has_bare_and_skip_permissions(self, dispatcher):
         assert dispatcher.validate_cli_flags(
@@ -60,34 +60,34 @@ class TestValidateCliFlags:
 
 class TestValidateShellCommand:
     def test_allowed_command_passes(self, dispatcher):
-        assert dispatcher.validate_shell_command("kazi", "ls -la /tmp") is True
+        assert dispatcher.validate_shell_command("worker", "ls -la /tmp") is True
 
     def test_disallowed_command_raises(self, dispatcher):
         with pytest.raises(PermissionDenied, match="shell command not allowed"):
-            dispatcher.validate_shell_command("kazi", "rm -rf /")
+            dispatcher.validate_shell_command("worker", "rm -rf /")
 
     def test_shell_operators_rejected(self, dispatcher):
         for op_cmd in ("ls; rm", "cat file | grep x", "ls && echo done", "echo $(whoami)"):
             with pytest.raises(PermissionDenied, match="shell operator"):
-                dispatcher.validate_shell_command("kazi", op_cmd)
+                dispatcher.validate_shell_command("worker", op_cmd)
 
     def test_empty_command_rejected(self, dispatcher):
         with pytest.raises(PermissionDenied, match="empty command"):
-            dispatcher.validate_shell_command("kazi", "   ")
+            dispatcher.validate_shell_command("worker", "   ")
 
-    def test_git_allowed_for_mr2_not_kazi(self, dispatcher):
+    def test_git_allowed_for_mr2_not_worker(self, dispatcher):
         assert dispatcher.validate_shell_command("mr2", "git status") is True
         with pytest.raises(PermissionDenied):
-            dispatcher.validate_shell_command("kazi", "git status")
+            dispatcher.validate_shell_command("worker", "git status")
 
 
 class TestValidateTools:
     def test_allowed_tools_pass(self, dispatcher):
-        assert dispatcher.validate_tools("kazi", ["Read", "Glob"]) is True
+        assert dispatcher.validate_tools("worker", ["Read", "Glob"]) is True
 
     def test_disallowed_tool_raises(self, dispatcher):
         with pytest.raises(PermissionDenied, match="tool not allowed"):
-            dispatcher.validate_tools("kazi", ["Read", "Agent"])
+            dispatcher.validate_tools("worker", ["Read", "Agent"])
 
     def test_agent_tool_only_for_mr1(self, dispatcher):
         assert dispatcher.validate_tools("mr1", ["Agent"]) is True
@@ -98,24 +98,24 @@ class TestValidateTools:
 class TestValidateFullSpawn:
     def test_valid_spawn_passes(self, dispatcher):
         assert dispatcher.validate_full_spawn(
-            "kazi",
+            "worker",
             ["-p", "--model", "--output-format"],
             ["Read", "Glob"],
         ) is True
 
     def test_invalid_flag_rejects_spawn(self, dispatcher):
         with pytest.raises(PermissionDenied):
-            dispatcher.validate_full_spawn("kazi", ["--evil"], ["Read"])
+            dispatcher.validate_full_spawn("worker", ["--evil"], ["Read"])
 
     def test_invalid_tool_rejects_spawn(self, dispatcher):
         with pytest.raises(PermissionDenied):
-            dispatcher.validate_full_spawn("kazi", ["-p"], ["Agent"])
+            dispatcher.validate_full_spawn("worker", ["-p"], ["Agent"])
 
 
 class TestValidateSpawnLevel:
-    def test_kazi_always_allowed(self, dispatcher):
-        assert dispatcher.validate_spawn_level(1, "kazi") is True
-        assert dispatcher.validate_spawn_level(4, "kazi") is True
+    def test_worker_always_allowed(self, dispatcher):
+        assert dispatcher.validate_spawn_level(1, "worker") is True
+        assert dispatcher.validate_spawn_level(4, "worker") is True
 
     def test_valid_mr_spawn(self, dispatcher):
         assert dispatcher.validate_spawn_level(1, "mr2") is True
@@ -161,7 +161,7 @@ class TestHeightLimit:
 
 class TestAccessors:
     def test_get_allowed_tools(self, dispatcher):
-        tools = dispatcher.get_allowed_tools("kazi")
+        tools = dispatcher.get_allowed_tools("worker")
         assert "Read" in tools
         assert "Agent" not in tools
 

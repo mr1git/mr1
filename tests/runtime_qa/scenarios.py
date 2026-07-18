@@ -268,7 +268,7 @@ def _routing_signals_must_be_visible(idx: int) -> Check:
         if not any(signals.get(key) for key in (
             "matched_operational_verbs",
             "matched_inspection_phrases",
-            "matched_persistent_agent_patterns",
+            "matched_orchestrator_ownership_patterns",
             "matched_workflow_patterns",
         )):
             return [
@@ -331,7 +331,7 @@ SCENARIOS: List[Scenario] = [
     Scenario(
         name="nl_create_agent_simple",
         category="routing",
-        description="Direct delegation request should create a persistent agent",
+        description="Direct delegation request should create an orchestrator",
         turns=["create an agent that watches my downloads folder and summarizes new files weekly"],
         checks=[_no_unexpected_errors(), _must_create_agent(0)],
     ),
@@ -400,9 +400,9 @@ SCENARIOS: List[Scenario] = [
 
     # ----- Category: delegation -----
     Scenario(
-        name="deleg_persistent_then_message",
+        name="deleg_orchestrator_then_message",
         category="delegation",
-        description="Create persistent agent then send it a message",
+        description="Create an orchestrator then send it a message",
         turns=[
             "create a persistent agent called 'librarian' that catalogs my notes",
             "tell librarian to summarize last week's notes",
@@ -432,7 +432,7 @@ SCENARIOS: List[Scenario] = [
 
     # ----- Category: approval -----
     Scenario(
-        name="approval_kill_persistent",
+        name="approval_kill_orchestrator",
         category="approval",
         description="After creating an agent, asking to delete it should likely require approval",
         turns=[
@@ -623,9 +623,9 @@ SCENARIOS: List[Scenario] = [
     Scenario(
         name="obs_timeline_on_delegation",
         category="observability",
-        description="A persistent_delegation turn should emit a runtime decision event",
+        description="An orchestrator_ownership turn should emit a runtime decision event",
         turns=["create an agent called Indexer that catalogs photos"],
-        checks=[_no_unexpected_errors(), _turn_must_emit_runtime_turn_event(0, final_action="persistent_agent"), _routing_signals_must_be_visible(0)],
+        checks=[_no_unexpected_errors(), _turn_must_emit_runtime_turn_event(0, final_action="orchestrator_ownership"), _routing_signals_must_be_visible(0)],
     ),
     Scenario(
         name="obs_timeline_on_direct_answer",
@@ -665,7 +665,7 @@ SCENARIOS: List[Scenario] = [
         ],
         checks=[
             _no_unexpected_errors(),
-            _turn_must_emit_runtime_turn_event(0, final_action="persistent_agent"),
+            _turn_must_emit_runtime_turn_event(0, final_action="orchestrator_ownership"),
             _turn_must_emit_runtime_turn_event(1, final_action="ask_clarification"),
             _override_reason_must_include(1, "concrete target or command detail"),
         ],
@@ -688,7 +688,7 @@ SCENARIOS: List[Scenario] = [
     Scenario(
         name="fanout_duplicate_title",
         category="identity",
-        description="Duplicate persistent agent titles must be rejected case-insensitively at creation time",
+        description="Duplicate agent titles must be rejected case-insensitively at creation time",
         turns=[
             "/agent create Alpha",
             "/agent create alpha",

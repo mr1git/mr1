@@ -1,9 +1,10 @@
 """
-Bounded persistent MRn step execution.
+Bounded MRn step execution.
 
 This module implements a single deterministic reasoning/action cycle
-for one persistent scoped MRn agent. It does not run autonomous loops,
-recursive delegation, or messaging delivery.
+for one orchestrator-role agent record (role="orchestrator") at any
+MR level. It does not run autonomous loops, recursive delegation, or
+messaging delivery.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from mr1.capability_runner import CapabilityResult, CapabilityRunner
 from mr1.brain_tools import governed_brain_tools
 from mr1.core import Dispatcher, PermissionDenied
 from mr1.event_log import EventLog, bind_correlation_id, mrn_step_correlation_id
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.messages import ALLOWED_MESSAGE_KINDS, MessageStore, normalize_message_kind
 from mr1.orchestrator.loop.actions import (
     ACTION_DEFAULT_STATUS as _ACTION_DEFAULT_STATUS,
@@ -46,8 +47,8 @@ from mr1.orchestrator.identity import (
 from mr1.orchestrator.prompts import MRN_SYSTEM_PROMPT as _SYSTEM_PROMPT
 from mr1.scoped_agents import (
     AgentScopeError,
-    PersistentAgent,
-    PersistentAgentStore,
+    AgentRecord,
+    AgentStore,
     is_agent_terminal,
 )
 from mr1.scheduler import Scheduler, WorkflowSpecError
@@ -65,7 +66,7 @@ _ALLOWED_MESSAGE_KIND_TEXT = " | ".join(f'"{kind}"' for kind in sorted(ALLOWED_M
 _ALLOWED_ACTIONS = ALLOWED_MRN_ACTIONS
 
 
-ReasonerFn = Callable[[PersistentAgent, str, str], str]
+ReasonerFn = Callable[[AgentRecord, str, str], str]
 
 
 @dataclass(frozen=True)
@@ -132,16 +133,16 @@ def _model_for_level(config: dict[str, Any], level: int) -> str:
     return level_models.get(level, config.get("default_model", "haiku"))
 
 
-def run_mrn_step_agent(agent: PersistentAgent, system_prompt: str, prompt: str) -> str:
+def run_mrn_step_agent(agent: AgentRecord, system_prompt: str, prompt: str) -> str:
     config = _load_mrn_config()
-    model = _model_for_level(config, agent.tree_level)
+    model = _model_for_level(config, agent.mr_level)
     allowed_tools = governed_brain_tools(config.get("allowed_tools", []))
     cmd = ["claude", "-p", f"{system_prompt}\n\n{prompt}", "--model", model, "--output-format", "json"]
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
     cli_flags = [token for token in cmd[1:] if token.startswith("-")]
     dispatcher = Dispatcher()
-    agent_type = _runtime_agent_type_for_level(agent.tree_level)
+    agent_type = _runtime_agent_type_for_level(agent.mr_level)
     try:
         dispatcher.validate_full_spawn(agent_type, cli_flags, allowed_tools)
     except PermissionDenied as exc:
@@ -176,7 +177,7 @@ class MRnStepRunner:
         self,
         *,
         workflow_store: Optional[WorkflowStore] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         workflow_authoring_service: Optional[WorkflowAuthoringService] = None,
         workflow_compiler_client: Optional[WorkflowCompilerClient] = None,
         workflow_compiler: Optional[Callable[[str, str], str]] = None,
@@ -191,7 +192,7 @@ class MRnStepRunner:
         capability_runner: Optional[CapabilityRunner] = None,
     ):
         self._workflow_store = workflow_store or WorkflowStore()
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+        self._scoped_agents = scoped_agent_store or AgentStore(
             root=self._workflow_store.root.parent / "agents"
         )
         self._workflow_compiler = workflow_compiler
@@ -269,7 +270,7 @@ class MRnStepRunner:
         self._event_log.emit(
             event_type="mrn_step_started",
             actor_id=agent.agent_id,
-            actor_type=agent.agent_type,
+            actor_type=agent.actor_category,
             target_id=agent.agent_id,
             target_type="agent",
             status="started",
@@ -326,7 +327,7 @@ class MRnStepRunner:
                     prompt_artifact_path=str(prompt_artifact_path),
                 )
 
-    def _build_step_prompt(self, agent: PersistentAgent) -> str:
+    def _build_step_prompt(self, agent: AgentRecord) -> str:
         parts = [
             "Mission:",
             agent.mission or "",
@@ -343,7 +344,7 @@ class MRnStepRunner:
         ])
         return "\n\n".join(parts)
 
-    def _build_assignment_prompt(self, agent: PersistentAgent) -> str:
+    def _build_assignment_prompt(self, agent: AgentRecord) -> str:
         assignment = (
             agent.assignment_packet
             if isinstance(agent.assignment_packet, dict) else None
@@ -390,12 +391,12 @@ class MRnStepRunner:
         )
         return "\n".join(lines)
 
-    def _build_scoped_context(self, agent: PersistentAgent) -> str:
+    def _build_scoped_context(self, agent: AgentRecord) -> str:
         payload = {
             "agent": {
                 "agent_id": agent.agent_id,
                 "title": agent.title,
-                "tree_level": agent.tree_level,
+                "mr_level": agent.mr_level,
                 "mission": agent.mission,
                 "security_clearance": agent.security_clearance,
                 "mode": agent.mode,
@@ -416,7 +417,7 @@ class MRnStepRunner:
         }
         return _json_dumps(payload)
 
-    def _workflow_summaries(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+    def _workflow_summaries(self, agent: AgentRecord) -> list[dict[str, Any]]:
         visible: list[dict[str, Any]] = []
         for workflow in self._workflow_store.list_workflows():
             workflow = self._scoped_agents.normalize_workflow_ownership(workflow)
@@ -440,7 +441,7 @@ class MRnStepRunner:
         visible.sort(key=lambda item: item["workflow_id"], reverse=True)
         return visible[:10]
 
-    def _recent_reports(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+    def _recent_reports(self, agent: AgentRecord) -> list[dict[str, Any]]:
         reports = []
         for path in self._scoped_agents.list_reports(agent.agent_id)[:5]:
             try:
@@ -453,7 +454,7 @@ class MRnStepRunner:
             })
         return reports
 
-    def _recent_events(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+    def _recent_events(self, agent: AgentRecord) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         for workflow in self._workflow_store.list_workflows():
             workflow = self._scoped_agents.normalize_workflow_ownership(workflow)
@@ -491,7 +492,7 @@ class MRnStepRunner:
             payload["body_excerpt"] = _compact(message.body, limit=160)
         return payload
 
-    def _inbox_messages(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+    def _inbox_messages(self, agent: AgentRecord) -> list[dict[str, Any]]:
         messages = [
             self._message_summary(message, include_body=True)
             for message in self._message_store.list_inbox(agent.agent_id)
@@ -499,13 +500,13 @@ class MRnStepRunner:
         ]
         return messages[:5]
 
-    def _outbox_messages(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+    def _outbox_messages(self, agent: AgentRecord) -> list[dict[str, Any]]:
         return [
             self._message_summary(message)
             for message in self._message_store.list_outbox(agent.agent_id)[:5]
         ]
 
-    def _parent_messages(self, agent: PersistentAgent) -> list[dict[str, Any]]:
+    def _parent_messages(self, agent: AgentRecord) -> list[dict[str, Any]]:
         parent_id = agent.parent_agent_id
         if not parent_id:
             return []
@@ -557,7 +558,7 @@ class MRnStepRunner:
 
     def _write_prompt_artifact(
         self,
-        agent: PersistentAgent,
+        agent: AgentRecord,
         *,
         step_id: str,
         run_id: Optional[str],
@@ -568,9 +569,9 @@ class MRnStepRunner:
     ) -> Path:
         payload = {
             "agent_id": agent.agent_id,
-            "agent_type": agent.agent_type,
+            "role": agent.role,
             "agent_title": agent.title,
-            "tree_level": agent.tree_level,
+            "mr_level": agent.mr_level,
             "parent_agent_id": agent.parent_agent_id,
             "caller_agent_id": caller_agent_id,
             "run_id": run_id,
@@ -601,7 +602,7 @@ class MRnStepRunner:
 
     def _execute_action(
         self,
-        agent: PersistentAgent,
+        agent: AgentRecord,
         action: dict[str, Any],
         step_call_count: list[int],
         *,
@@ -617,7 +618,7 @@ class MRnStepRunner:
 
     def _persist_step(
         self,
-        agent: PersistentAgent,
+        agent: AgentRecord,
         *,
         action: dict[str, Any],
         status_after: str,
@@ -704,7 +705,7 @@ class MRnStepRunner:
         self._event_log.emit(
             event_type="mrn_step_completed",
             actor_id=updated.agent_id,
-            actor_type=updated.agent_type,
+            actor_type=updated.actor_category,
             target_id=updated.agent_id,
             target_type="agent",
             status=status_after,
@@ -747,7 +748,7 @@ class MRnStepRunner:
 
     def _send_agent_message(
         self,
-        agent: PersistentAgent,
+        agent: AgentRecord,
         *,
         kind: str,
         subject: str,
@@ -774,7 +775,7 @@ class MRnStepRunner:
 
     def _persist_blocked_step(
         self,
-        agent: PersistentAgent,
+        agent: AgentRecord,
         *,
         reason: str,
         raw_action: str,
@@ -795,13 +796,13 @@ class MRnStepRunner:
             prompt_artifact_path=prompt_artifact_path,
         )
 
-    def _emit_mrn_reported(self, agent: PersistentAgent, result: MRnStepResult) -> None:
+    def _emit_mrn_reported(self, agent: AgentRecord, result: MRnStepResult) -> None:
         if not result.report_path:
             return
         self._event_log.emit(
             event_type="mrn_reported",
             actor_id=agent.agent_id,
-            actor_type=agent.agent_type,
+            actor_type=agent.actor_category,
             target_id=agent.agent_id,
             target_type="agent",
             status="reported",

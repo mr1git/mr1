@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from mr1 import workflow_events as ev
 from mr1.capability_policy import CapabilityApprovalStore
-from mr1.scoped_agents import PersistentAgentStore, is_agent_terminal
+from mr1.scoped_agents import AgentStore, is_agent_terminal
 from mr1.workflow_models import Task, TaskStatus, Workflow
 
 
@@ -125,7 +125,7 @@ class SemanticValidator:
         *,
         workspace_root: Path,
         approval_store: CapabilityApprovalStore,
-        scoped_agents: PersistentAgentStore,
+        scoped_agents: AgentStore,
     ) -> None:
         self._workspace_root = workspace_root
         self._approval_store = approval_store

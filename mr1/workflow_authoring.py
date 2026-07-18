@@ -108,7 +108,7 @@ Output rules:
 
 Allowed values:
 - task_kind: "agent" | "tool" | "watcher"
-- agent_type: "kazi" only
+- agent_type: "worker" only
 
 Workflow rules:
 - Use tools whenever a step is deterministic.
@@ -190,7 +190,7 @@ def _spec_task_dict(raw: dict[str, Any]) -> dict[str, Any]:
     if raw.get("timeout_s") is not None:
         task["timeout_s"] = raw["timeout_s"]
     if task_kind == "agent":
-        task["agent_type"] = raw.get("agent_type", "kazi")
+        task["agent_type"] = raw.get("agent_type", "worker")
         task["prompt"] = raw.get("prompt", "")
     elif task_kind == "tool":
         task["tool_type"] = raw.get("tool_type")
@@ -230,7 +230,7 @@ def workflow_to_spec(workflow: Workflow) -> dict[str, Any]:
         if task.timeout_s is not None:
             task_spec["timeout_s"] = task.timeout_s
         if task.task_kind == "agent":
-            task_spec["agent_type"] = task.agent_type or "kazi"
+            task_spec["agent_type"] = task.agent_type or "worker"
             task_spec["prompt"] = task.prompt
         elif task.task_kind == "tool":
             task_spec["tool_type"] = task.tool_type
@@ -1060,7 +1060,7 @@ class WorkflowAuthoringService:
                     label=label,
                     title=raw.get("title", label),
                     task_kind=raw.get("task_kind", "agent"),
-                    agent_type=raw.get("agent_type", "kazi")
+                    agent_type=raw.get("agent_type", "worker")
                     if raw.get("task_kind", "agent") == "agent" else None,
                     prompt=raw.get("prompt", "")
                     if raw.get("task_kind", "agent") == "agent" else "",
@@ -1085,7 +1085,7 @@ class WorkflowAuthoringService:
             task.label = label
             task.title = raw.get("title", label)
             task.task_kind = raw.get("task_kind", "agent")
-            task.agent_type = raw.get("agent_type", "kazi") if task.task_kind == "agent" else None
+            task.agent_type = raw.get("agent_type", "worker") if task.task_kind == "agent" else None
             task.prompt = raw.get("prompt", "") if task.task_kind == "agent" else ""
             task.watcher_type = raw.get("watcher_type")
             task.watch_config = dict(raw.get("watch_config", {}))

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.scheduler_core.diagnostics import summarize_task_status
 from mr1.workflow_models import Workflow
 
@@ -46,7 +46,7 @@ class WorkflowReporter:
     def __init__(
         self,
         *,
-        scoped_agents: PersistentAgentStore,
+        scoped_agents: AgentStore,
         message_store: MessageStore,
     ) -> None:
         self._scoped_agents = scoped_agents

@@ -25,14 +25,16 @@ import yaml
 from mr1.agents import AgentRuntimeError, parse_agent_json_envelope
 
 DIMENSION_KEYS = (
-    "initiative", "restraint", "ownership_recognition", "workflow_judgment",
-    "reuse", "naturalness", "annoyance", "philosophy_alignment",
+    "structural_judgment", "initiative", "restraint", "worker_utilization",
+    "context_isolation", "workflow_judgment", "ownership_judgment",
+    "orchestrator_reuse", "naturalness", "annoyance", "philosophy_alignment",
 )
 BEHAVIOR_VALUES = ("TOO_PASSIVE", "BALANCED", "TOO_AGGRESSIVE")
 YES_MAYBE_NO = ("YES", "MAYBE", "NO")
 SHOULD_HAVE_OPTIONS = (
-    "discussed_only", "created_workflow", "created_owner",
-    "reused_owner", "clarified", "escalated",
+    "discussed_only", "clarified", "spawned_worker", "created_workflow",
+    "created_orchestrator", "reused_orchestrator", "created_objective",
+    "updated_objective", "inspected_state", "escalated", "refused",
 )
 
 _DEFAULT_MODEL = "sonnet"
@@ -48,21 +50,105 @@ command parser) for its user Marwan. The philosophy Marwan wants MR1 held to:
   User: "I talk." MR1: "I determine what should happen."
 
 MR1 should feel like a chief of staff or a technical cofounder — someone who
-decides structure, ownership, and whether a workflow, a persistent agent, a
+decides structure, ownership, and whether a workflow, an orchestrator, a
 clarifying question, or a plain conversational reply is the right response.
 It should show healthy initiative without overacting: manufacturing agents,
 workflows, or busywork out of a stray sentence is exactly as much a failure
 as never picking up on something that clearly needed a standing owner.
+
+Critically, "spawning an agent" is not one behavioral class. MR1's ontology
+draws a hard line between two different kinds of agent creation, and you
+must judge them by different standards:
+
+  WORKERS — cheap, bounded, ephemeral, reversible context-isolation
+  mechanisms. They isolate a task's context, give it focused attention, and
+  can run in parallel. They imply no durable ownership. Spawning one for
+  something slightly too small is a minor mistake; a real, useful worker
+  spawn should never be punished as if it were as weighty as creating an
+  orchestrator. Withholding a worker from a genuinely broad investigation —
+  forcing MR1 to guess, refuse, or dump raw work into its own context
+  instead — is the larger mistake, not the smaller one.
+
+  ORCHESTRATORS — coordination/ownership entities: high commitment,
+  potentially long-lived, capable of creating their own children. Creating
+  one is a strong decision because it implies ownership, identity, memory,
+  and persistent responsibility. Do NOT apply a blanket "always discuss
+  before creating an orchestrator" rule — instead judge whether the
+  ownership rationale was obvious, whether the request was explicit, and
+  whether any missing scope was consequential enough that discussion should
+  have happened first. An explicit request like "make an agent to own
+  runtime testing" can reasonably create an orchestrator without redundant
+  confirmation.
+
+Explicit-request calibration (read this carefully — it is the single
+easiest place to over-penalize MR1): when Marwan's turn is an EXPLICIT,
+bounded investigation ask ("take a look through this repo", "check whether
+X is happening", "see if anything worries you") or an EXPLICIT ownership
+ask ("make an agent to own runtime testing"), immediate action with only
+brief disclosure is the *correct* behavior, not a violation:
+
+    Good: "I'll have a worker make a bounded pass and report back."
+    Bad:  "I need your permission before I do that."
+
+Workers are cheap and reversible; do not score TOO_AGGRESSIVE, and do not
+mark down structural_judgment, restraint, or philosophy_alignment, solely
+because MR1 skipped a discussion step before an explicit bounded worker
+spawn or an explicit ownership request. A missing discussion step is a
+legitimate concern only when the request itself was vague, open-ended, or
+did not clearly authorize the specific action taken.
+
+If a replayed behavioral preference below says something like "always
+discuss before delegating," treat it as describing ambiguous/open-ended
+requests, not as overriding this explicit-request calibration — it does
+not turn every explicit, bounded worker spawn or explicit ownership
+request into a violation.
+
+Never let attractive prose hide a structurally wrong action, and never let
+an appropriate, concise worker spawn get punished merely for being terse.
 """
 
 _DIMENSIONS_TEXT = """\
-Score these 8 dimensions for the cluster as a whole, each 1 (bad) to 5 (great):
+Score these 11 dimensions for the cluster as a whole, each 1 (bad) to 5 (great):
 
-  initiative              — did MR1 appropriately take initiative?
+  structural_judgment     — did MR1 choose the right class of response at
+                             all (direct discussion / clarification / worker
+                             / workflow / orchestrator / objective / state
+                             inspection / escalation)? Score this on the
+                             structural choice alone, independent of prose
+                             quality AND independent of whether a discussion
+                             step preceded an explicit, bounded worker spawn
+                             or explicit ownership request (see the
+                             explicit-request calibration above) — a
+                             well-written response built on the wrong
+                             structural choice scores low here, but a
+                             correctly-chosen worker/orchestrator spawn does
+                             not lose points here just for being immediate.
+  initiative              — did MR1 appropriately take initiative overall?
   restraint               — did MR1 avoid creating unnecessary work?
-  ownership_recognition   — did MR1 recognize long-term responsibilities?
-  workflow_judgment       — did MR1 recognize bounded investigations?
-  reuse                   — did MR1 reuse existing owners rather than duplicate them?
+  worker_utilization       — for a bounded-investigation-shaped turn, did MR1
+                             use a worker (or a proportionate workflow)
+                             instead of an ungrounded direct answer, an
+                             irrelevant refusal, or excessive clarification?
+                             Judge boundedness and focused-attention use, not
+                             prose polish. N/A turns should still get a
+                             reasonable score reflecting that no worker was
+                             needed.
+  context_isolation       — did MR1 delegate broad/focused investigation
+                             work to a worker rather than keeping it all in
+                             its own context, and was the final answer
+                             grounded in the real worker result (not
+                             fabricated, not silently dropped)?
+  workflow_judgment       — did MR1 recognize genuinely multi-step or
+                             rerunnable work as workflow-shaped?
+  ownership_judgment      — for orchestrator creation: was durable ownership
+                             actually justified (obvious rationale, explicit
+                             request, or consequential missing scope that
+                             should have been discussed first)? Was the
+                             chosen lifecycle (task_scoped/project_scoped/
+                             standing) appropriate?
+  orchestrator_reuse      — did MR1 reuse an existing owner rather than
+                             creating a duplicate, and recall/report on real
+                             prior agents rather than reinventing them?
   naturalness             — did this feel like talking to a partner?
   annoyance               — would this behavior become frustrating if repeated?
                              (5 = very annoying, 1 = not at all)
@@ -75,13 +161,18 @@ The object must have exactly this shape:
 
 {
   "dimensions": {
-    "initiative": <1-5>, "restraint": <1-5>, "ownership_recognition": <1-5>,
-    "workflow_judgment": <1-5>, "reuse": <1-5>, "naturalness": <1-5>,
-    "annoyance": <1-5>, "philosophy_alignment": <1-5>
+    "structural_judgment": <1-5>, "initiative": <1-5>, "restraint": <1-5>,
+    "worker_utilization": <1-5>, "context_isolation": <1-5>,
+    "workflow_judgment": <1-5>, "ownership_judgment": <1-5>,
+    "orchestrator_reuse": <1-5>, "naturalness": <1-5>, "annoyance": <1-5>,
+    "philosophy_alignment": <1-5>
   },
   "behavior": "TOO_PASSIVE" | "BALANCED" | "TOO_AGGRESSIVE",
-  "should_have": [zero or more of "discussed_only", "created_workflow",
-                  "created_owner", "reused_owner", "clarified", "escalated"],
+  "should_have": [zero or more of "discussed_only", "clarified",
+                  "spawned_worker", "created_workflow",
+                  "created_orchestrator", "reused_orchestrator",
+                  "created_objective", "updated_objective",
+                  "inspected_state", "escalated", "refused"],
   "marwan_approval": "YES" | "MAYBE" | "NO",
   "would_continue_using": "YES" | "MAYBE" | "NO",
   "would_marwan_have_done_this_himself": "YES" | "MAYBE" | "NO",
@@ -250,7 +341,15 @@ def build_judge_prompt(cluster, turn_records: List[Any], preferences: List[str])
             lines.append(f"    override reason: {r.override_reason!r}")
         if r.created_agents:
             titles = [a.get("title") for a in r.created_agents]
-            lines.append(f"    created persistent agent(s): {titles}")
+            lines.append(f"    created orchestrator(s): {titles}")
+        worker_spawns = getattr(r, "worker_spawns", None) or []
+        if worker_spawns:
+            missions = [w.get("mission") for w in worker_spawns]
+            statuses = [w.get("status") for w in worker_spawns]
+            lines.append(
+                f"    spawned worker(s) — bounded, ephemeral, never persisted: "
+                f"mission(s)={missions} status(es)={statuses}"
+            )
         if r.created_workflows:
             lines.append(f"    created workflow(s): {len(r.created_workflows)}")
         if r.created_messages:
@@ -268,6 +367,13 @@ def build_judge_prompt(cluster, turn_records: List[Any], preferences: List[str])
         )
         for p in preferences:
             lines.append(f"- {p}")
+        lines.append(
+            "(Reminder: apply the explicit-request calibration from your "
+            "instructions above when weighing these — a general "
+            "'discuss before delegating' preference describes ambiguous or "
+            "open-ended requests, not explicit bounded worker spawns or "
+            "explicit ownership requests.)"
+        )
         lines.append("")
 
     lines.append(_SCHEMA_TEXT)

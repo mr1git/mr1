@@ -12,7 +12,7 @@ from mr1.runtime_observation import (
     parse_observation_request,
 )
 from mr1.scoped_agents import (
-    PersistentAgentStore,
+    AgentStore,
     build_assignment_packet,
     render_assignment_mission,
 )
@@ -27,7 +27,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -46,7 +46,7 @@ def runtime_access(workflow_store, agent_store, message_store):
 
 def _seed_runtime_detail(
     workflow_store: WorkflowStore,
-    agent_store: PersistentAgentStore,
+    agent_store: AgentStore,
     message_store: MessageStore,
 ):
     root = agent_store.ensure_root_agent()
@@ -81,7 +81,7 @@ def _seed_runtime_detail(
         label="inspect",
         title="Inspect",
         task_kind="agent",
-        agent_type="kazi",
+        agent_type="worker",
         prompt="Inspect the runtime detail.",
         status=TaskStatus.FAILED,
         last_error="Detailed failure " * 40,

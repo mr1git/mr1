@@ -5,7 +5,7 @@ This package drives the *real* MR1 natural-language runtime path
 (`MR1.step(...)` via the same session shape the runtime-QA runner uses)
 across a long, stateful, Marwan-style conversation, and asserts that MR1
 makes sensible orchestration decisions — respond, clarify, create a
-workflow, create/reuse a persistent agent, delegate hierarchically,
+workflow, create/reuse an orchestrator, delegate hierarchically,
 message collaborators, recover, escalate — without runaway hierarchy or
 degraded runtime health.
 

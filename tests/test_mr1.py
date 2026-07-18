@@ -14,8 +14,8 @@ from mr1.capability_policy import (
     build_scope_context,
 )
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
-from mr1.kazi_runner import RunStatus
-from mr1.scoped_agents import PersistentAgent, new_agent_id
+from mr1.worker_runner import RunStatus
+from mr1.scoped_agents import AgentRecord, new_agent_id
 from mr1.workflow_models import TaskStatus, WorkflowStatus
 from mr1.mr1 import (
     MR1,
@@ -26,7 +26,7 @@ from mr1.mr1 import (
     _load_agent_config,
     _generate_task_id,
 )
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.mrn_run import MRnRunResult
 from mr1.orchestrator import state as orchestrator_state
 from mr1.workflow_store import WorkflowStore
@@ -51,13 +51,13 @@ def _seed_legacy_agent(
     title: str,
     status: str = "active",
     run_status: str = "idle",
-) -> PersistentAgent:
+) -> AgentRecord:
     parent = mr1_instance._scoped_agents.require_agent(parent_agent_id)
-    agent = PersistentAgent(
+    agent = AgentRecord(
         agent_id=new_agent_id(),
-        agent_type="mrn",
+        role="orchestrator",
         title=title,
-        tree_level=parent.tree_level + 1,
+        mr_level=parent.mr_level + 1,
         parent_agent_id=parent_agent_id,
         status=status,
         run_status=run_status,
@@ -79,7 +79,7 @@ class TestStateManager:
         assert len(state_mgr.active_tasks) == 0
 
     def test_add_and_complete_task(self, state_mgr):
-        state_mgr.add_task("t1", "kazi", "test task", 123)
+        state_mgr.add_task("t1", "worker", "test task", 123)
         assert "t1" in state_mgr.active_tasks
 
         state_mgr.complete_task("t1", "completed")
@@ -99,7 +99,7 @@ class TestStateManager:
     def test_save_and_reload(self, tmp_path):
         state_path = tmp_path / "mr1_state.json"
         mgr1 = StateManager(state_path=state_path)
-        mgr1.add_task("t1", "kazi", "task one", 100)
+        mgr1.add_task("t1", "worker", "task one", 100)
         mgr1.save()
 
         mgr2 = StateManager(state_path=state_path)
@@ -131,10 +131,10 @@ class TestStateManager:
 
     def test_format_tasks(self, state_mgr):
         assert state_mgr.format_tasks() == "No tasks."
-        state_mgr.add_task("t1", "kazi", "test", 100)
+        state_mgr.add_task("t1", "worker", "test", 100)
         formatted = state_mgr.format_tasks()
         assert "t1" in formatted
-        assert "kazi" in formatted
+        assert "worker" in formatted
 
     def test_format_for_prompt_empty(self, state_mgr):
         assert state_mgr.format_for_prompt() == "No active tasks."
@@ -155,7 +155,7 @@ class TestStateManager:
         assert state_mgr._state["agent_pids"] == [200]
 
     def test_active_tasks_returns_detached_snapshot(self, state_mgr):
-        state_mgr.add_task("t1", "kazi", "test task", 123)
+        state_mgr.add_task("t1", "worker", "test task", 123)
 
         active = state_mgr.active_tasks
         active["t1"]["status"] = "completed"
@@ -263,18 +263,25 @@ class TestParseResponse:
         assert text == "Just a normal answer."
         assert directive is None
 
-    def test_delegation_directive_kazi(self):
-        raw = 'I will handle this. [DELEGATE]{"agent": "kazi", "task": "read file", "context": "none"}[/DELEGATE]'
+    def test_delegation_directive_worker(self):
+        raw = 'I will handle this. [DELEGATE]{"agent": "worker", "task": "read file", "context": "none"}[/DELEGATE]'
         text, directive = MR1._parse_response(raw)
         assert text == "I will handle this."
-        assert directive["agent"] == "kazi"
+        assert directive["agent"] == "worker"
         assert directive["task"] == "read file"
 
-    def test_delegation_directive_mr2(self):
-        raw = 'Working on it. [DELEGATE]{"agent": "mr2", "task": "refactor code", "context": "src/"}[/DELEGATE]'
+    def test_delegation_directive_orchestrator(self):
+        raw = 'Working on it. [DELEGATE]{"agent": "orchestrator", "task": "refactor code", "context": "src/"}[/DELEGATE]'
         text, directive = MR1._parse_response(raw)
         assert text == "Working on it."
-        assert directive["agent"] == "mr2"
+        assert directive["agent"] == "orchestrator"
+
+    def test_legacy_mr2_token_no_longer_accepted(self):
+        # Pre-ontology-refactor directive token ("mr2") is no longer a valid
+        # role token — only "orchestrator" and "worker" are accepted.
+        raw = '[DELEGATE]{"agent": "mr2", "task": "legacy level token"}[/DELEGATE]'
+        _, directive = MR1._parse_response(raw)
+        assert directive is None
 
     def test_invalid_json_in_directive(self):
         raw = "text [DELEGATE]{broken json[/DELEGATE]"
@@ -370,13 +377,13 @@ class TestBuiltinCommands:
         assert "runtime_activity: no active jobs" in result
         assert "has_running_processes: no" in result
 
-    def test_kill_builtin_clarifies_persistent_agents_are_not_affected(self, mr1_instance):
+    def test_kill_builtin_clarifies_orchestrator_agents_are_not_affected(self, mr1_instance):
         with patch.object(mr1_instance, "_running_test_agent_count", return_value=0):
             with patch.object(mr1_instance._spawner, "kill_all", return_value=0):
                 with patch.object(mr1_instance, "kill_test_agents", return_value="No synthetic test agents are running."):
                     result = mr1_instance._handle_builtin("/kill")
 
-        assert "Persistent agents are not affected." in result
+        assert "Orchestrator agents are not affected." in result
         assert "/agent kill <ag-id>" in result
 
     def test_memdltr_is_recognized(self, mr1_instance):
@@ -618,7 +625,7 @@ class TestWorkflowBuiltinCommands:
                 "label": "a",
                 "title": "A2",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "replacement",
             }]
         }), encoding="utf-8")
@@ -674,7 +681,7 @@ class TestWorkflowBuiltinCommands:
                 "label": "c",
                 "title": "Task C",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "Do C",
             }],
         )
@@ -699,7 +706,7 @@ class TestWorkflowBuiltinCommands:
                 "label": "x",
                 "title": "Task X",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "Do X",
             }],
         )
@@ -724,7 +731,7 @@ class TestWorkflowBuiltinCommands:
                 "label": "a",
                 "title": "Task A Replacement",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "Replacement",
             }],
         )
@@ -888,14 +895,14 @@ class TestStep:
                     "label": "analyze",
                     "title": "Analyze",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Analyze the request",
                 },
                 {
                     "label": "synthesize_findings",
                     "title": "Synthesize Findings",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "Summarize findings",
                     "depends_on": ["analyze"],
                 },
@@ -1033,7 +1040,7 @@ class TestStep:
         "brain_reply",
         [
             "Got it-renaming Librarian to PaperLibrarian now.",
-            "PaperLibrarian is paused.",
+            "PaperLibrarian is paused now.",
             "Created a new agent called Archivist.",
             "Deleted the Archivist agent.",
         ],
@@ -1074,14 +1081,90 @@ class TestStep:
     def test_direct_answer_preserves_honest_negated_mutation_mentions(self, mr1_with_mock_process, brain_reply):
         # Regression: the old guard matched mutation words anywhere in the
         # text and nuked the whole response, even an honest disclaimer that
-        # correctly said nothing happened — exactly the "investigate this
-        # repository" failure, where the brain's own honest hedge got
-        # replaced by an unrelated canned line. A negation-aware check must
-        # leave real, honest text alone.
+        # correctly said nothing happened. A negation-aware check must leave
+        # real, honest text alone. ("Investigate this repository." — the
+        # original repro case — now routes to `bounded_investigation` (a
+        # worker delegation) rather than a direct answer at all; a plain
+        # question keeps this test on the direct-answer path it's meant to
+        # cover.)
         mr1_instance, mock_process = mr1_with_mock_process
         mock_process.send.return_value = brain_reply
 
-        result = mr1_instance.step("Investigate this repository.")
+        result = mr1_instance.step("what is 2+2?")
+
+        assert result == brain_reply
+
+    @pytest.mark.parametrize(
+        "brain_reply",
+        [
+            "I created the agent.",
+            "I've paused that workflow.",
+            "The task is deleted now.",
+            "I renamed the orchestrator for you.",
+        ],
+    )
+    def test_direct_answer_blocks_first_person_and_current_turn_mutation_claims(
+        self, mr1_with_mock_process, brain_reply,
+    ):
+        mr1_instance, mock_process = mr1_with_mock_process
+        mock_process.send.return_value = brain_reply
+
+        result = mr1_instance.step("what is 2+2?")
+
+        assert result == (
+            "I haven't actually done that — nothing was created, renamed, paused, "
+            "or deleted this turn. Tell me exactly what you want me to execute."
+        )
+
+    @pytest.mark.parametrize(
+        "brain_reply",
+        [
+            "That's worth pausing on.",
+            "The agent was already created.",
+            "The existing workflow is paused.",
+            "We could create an orchestrator.",
+            "If we renamed it, the title would be clearer.",
+            "The worker said the task was deleted previously.",
+            "Nothing was created this turn.",
+            # The real, real-planner recurrence-escalation transcript this
+            # fast-follow exists for (Phase D corpus run,
+            # worker_to_orchestrator_escalation, turn [1]) — "worth pausing
+            # on" previously nuked this entire good response.
+            (
+                "That's the pattern worth pausing on. A weekly recurrence plus a "
+                "timed-out one-off check suggests standing ownership might serve "
+                "you better than rediscovering this each week.\n\n"
+                "Rather than another bounded investigation that may hit timeout "
+                "again, consider whether a dedicated agent scoped to scheduler "
+                "health — one that runs continuously and alerts when tick drops "
+                "are detected — would save you from the weekly revisit cycle. "
+                "It could surface the pattern, track whether it correlates with "
+                "load, workload churn, or something else, and give you "
+                "actionable telemetry instead of \"we ran out of time before "
+                "finding it.\"\n\n"
+                "I can't set that up from here, but if you want to move from "
+                "\"check weekly\" to \"it's owned,\" that's the structural "
+                "change that makes sense."
+            ),
+            # A second real-planner false positive found while validating this
+            # fast-follow (Phase D corpus rerun, runtime_nervousness turn
+            # [2]): a distant, unrelated "I" earlier in a long sentence must
+            # not license a mutation word in a later, unrelated clause of
+            # that same sentence — the first-person check has to be close to
+            # the verb, not just present anywhere in the sentence.
+            (
+                "Or is it a combo—like \"I need to understand the permission "
+                "model *and* see how agent spawning actually bottlenecks\"?"
+            ),
+        ],
+    )
+    def test_direct_answer_preserves_descriptive_historical_and_hypothetical_mutation_language(
+        self, mr1_with_mock_process, brain_reply,
+    ):
+        mr1_instance, mock_process = mr1_with_mock_process
+        mock_process.send.return_value = brain_reply
+
+        result = mr1_instance.step("what is 2+2?")
 
         assert result == brain_reply
 
@@ -1361,7 +1444,7 @@ class TestStep:
         assert submit_result.startswith("submitted: wf-")
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
-            actor_type="mrn",
+            actor_type="orchestrator",
             actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
@@ -1498,10 +1581,10 @@ class TestStep:
             "let that agent propose/create/test three tools",
         ],
     )
-    def test_persistent_delegation_requests_are_classified(self, mr1_with_mock_process, user_text):
+    def test_orchestrator_delegation_requests_are_classified(self, mr1_with_mock_process, user_text):
         mr1_instance, _mock_process = mr1_with_mock_process
 
-        assert mr1_instance._classify_turn_route(user_text, None) == "persistent_delegation"
+        assert mr1_instance._classify_turn_route(user_text, None) == "orchestrator_delegation"
 
     def test_non_ownership_requests_preserve_existing_routing(self, mr1_with_mock_process):
         mr1_instance, _mock_process = mr1_with_mock_process
@@ -1524,11 +1607,11 @@ class TestStep:
             ),
             ("when would you create an agent?", "direct_answer"),
             ("compare tools vs workflows vs agents", "direct_answer"),
-            ("create an agent responsible for X", "persistent_delegation"),
-            ("I want you to create an owner agent for X", "persistent_delegation"),
+            ("create an agent responsible for X", "orchestrator_delegation"),
+            ("I want you to create an owner agent for X", "orchestrator_delegation"),
         ],
     )
-    def test_meta_policy_questions_do_not_trigger_persistent_delegation(
+    def test_meta_policy_questions_do_not_trigger_orchestrator_delegation(
         self,
         mr1_with_mock_process,
         user_text,
@@ -1578,7 +1661,7 @@ class TestStep:
         ) == "Sentinel"
 
     @patch("mr1.mr1.MRnRunRunner.run")
-    def test_persistent_delegation_creates_child_and_runs_persistent_mrn(self, mock_run, tmp_path):
+    def test_orchestrator_delegation_creates_child_and_runs_orchestrator_mrn(self, mock_run, tmp_path):
         compiler = MagicMock()
         mr1_instance = MR1(
             workflow_store=WorkflowStore(root=tmp_path / "workflows"),
@@ -1614,7 +1697,7 @@ class TestStep:
         request = "create a child responsible for tool creation and let that agent propose/create/test"
         response = mr1_instance.step(request)
 
-        assert response.startswith("delegated to persistent agent: ag-")
+        assert response.startswith("delegated to orchestrator: ag-")
         assert "run_id=run-1" in response
         assert "workflows_created=1" in response
         assert mock_run.call_count == 1
@@ -1639,7 +1722,7 @@ class TestStep:
         assert mr1_instance._process.send.call_count == 1
 
     @patch("mr1.mr1.MRnRunRunner.run")
-    def test_persistent_delegation_does_not_create_agent_when_brain_asks_for_clarification(
+    def test_orchestrator_delegation_does_not_create_agent_when_brain_asks_for_clarification(
         self, mock_run, tmp_path,
     ):
         # Observed live: an ambiguous request ("make another agent, but not for
@@ -1672,7 +1755,7 @@ class TestStep:
         assert mock_run.call_count == 0  # no child run was ever launched
 
     @patch("mr1.mr1.MRnRunRunner.run")
-    def test_persistent_delegation_uses_requested_child_title(self, mock_run, tmp_path):
+    def test_orchestrator_delegation_uses_requested_child_title(self, mock_run, tmp_path):
         mr1_instance = MR1(
             workflow_store=WorkflowStore(root=tmp_path / "workflows"),
             workflow_runner=MockRunner(),
@@ -1704,7 +1787,7 @@ class TestStep:
             "Create a child of yours, MR3, responsible for README inspection.",
         )
 
-        assert response.startswith("delegated to persistent agent: ag-")
+        assert response.startswith("delegated to orchestrator: ag-")
         child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
         assert child.title == "MR3"
         assert "README inspection" in (child.mission or "")
@@ -1712,7 +1795,7 @@ class TestStep:
         assert child.assignment_packet["child_level"] == 2
 
     @patch("mr1.mr1.MRnRunRunner.run")
-    def test_persistent_delegation_prefers_explicit_user_title_over_brain_title(self, mock_run, tmp_path):
+    def test_orchestrator_delegation_prefers_explicit_user_title_over_brain_title(self, mock_run, tmp_path):
         mr1_instance = MR1(
             workflow_store=WorkflowStore(root=tmp_path / "workflows"),
             workflow_runner=MockRunner(),
@@ -1744,12 +1827,12 @@ class TestStep:
             "Create a persistent agent called archivist to own my research notes.",
         )
 
-        assert response.startswith("delegated to persistent agent: ag-")
+        assert response.startswith("delegated to orchestrator: ag-")
         child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
         assert child.title == "archivist"
 
     @patch("mr1.mr1.MRnRunRunner.run")
-    def test_persistent_delegation_overrides_generic_brain_title_when_unnamed(self, mock_run, tmp_path):
+    def test_orchestrator_delegation_overrides_generic_brain_title_when_unnamed(self, mock_run, tmp_path):
         # Regression: an unnamed ownership request ("own runtime testing",
         # "keep an eye on this codebase") frequently got named "MR2" because
         # the design brain itself defaulted to that generic label. Preserve
@@ -1786,13 +1869,13 @@ class TestStep:
             "I want somebody to own runtime testing. Make an agent for that.",
         )
 
-        assert response.startswith("delegated to persistent agent: ag-")
+        assert response.startswith("delegated to orchestrator: ag-")
         child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
         assert child.title != "MR2"
         assert "Own runtime testing" in (child.mission or "")
 
     @patch("mr1.mr1.MRnRunRunner.run")
-    def test_persistent_delegation_named_agent_routes_without_workflow_authoring(self, mock_run, tmp_path):
+    def test_orchestrator_delegation_named_agent_routes_without_workflow_authoring(self, mock_run, tmp_path):
         compiler = MagicMock()
         mr1_instance = MR1(
             workflow_store=WorkflowStore(root=tmp_path / "workflows"),
@@ -1825,7 +1908,7 @@ class TestStep:
             "Create a persistent agent named Sage to own self-evolution.",
         )
 
-        assert response.startswith("delegated to persistent agent: ag-")
+        assert response.startswith("delegated to orchestrator: ag-")
         child = mr1_instance._scoped_agents.require_agent(mock_run.call_args.args[0])
         assert child.title == "Sage"
         assert "self-evolution" in (child.mission or "")
@@ -1833,7 +1916,7 @@ class TestStep:
         assert mr1_instance._process.send.call_count == 1
 
     @patch("mr1.mr1.MRnRunRunner.run")
-    def test_persistent_delegation_rejects_duplicate_existing_title(self, mock_run, tmp_path):
+    def test_orchestrator_delegation_rejects_duplicate_existing_title(self, mock_run, tmp_path):
         mr1_instance = MR1(
             workflow_store=WorkflowStore(root=tmp_path / "workflows"),
             workflow_runner=MockRunner(),
@@ -2043,7 +2126,7 @@ class TestStep:
         child = mr1_instance._scoped_agents.create_child_agent(mr1_instance._root_agent_id, "research")
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
-            actor_type="mrn",
+            actor_type="orchestrator",
             actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
@@ -2310,7 +2393,7 @@ class TestRuntimeReferenceResolution:
         child = mr1_instance._scoped_agents.create_child_agent(mr1_instance._root_agent_id, "research")
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
-            actor_type="mrn",
+            actor_type="orchestrator",
             actor_clearance=child.security_clearance,
             invocation_mode="direct",
             capability_name="read_file",
@@ -2358,9 +2441,9 @@ class TestRuntimeReferenceResolution:
         inbox = mr1_instance._message_store.list_inbox(child.agent_id)
         assert inbox[0].subject == "Capability approval approved: read_file"
 
-    def test_orchestrator_prompt_includes_mr2_ownership_guidance(self):
-        assert "PERSISTENT DELEGATION / OWNERSHIP" in _ORCHESTRATOR_PROMPT
-        assert '{"agent": "mr2"' in _ORCHESTRATOR_PROMPT
+    def test_orchestrator_prompt_includes_orchestrator_ownership_guidance(self):
+        assert "ORCHESTRATOR DELEGATION / OWNERSHIP" in _ORCHESTRATOR_PROMPT
+        assert '{"agent": "orchestrator"' in _ORCHESTRATOR_PROMPT
         assert "If the user wants an agent to own an area" in _ORCHESTRATOR_PROMPT
         assert "INTERNAL OBSERVATIONS" in _ORCHESTRATOR_PROMPT
         assert '[OBSERVE]' in _ORCHESTRATOR_PROMPT
@@ -2390,7 +2473,7 @@ class TestRuntimeReferenceResolution:
                             "label": "summarize",
                             "title": "Summarize",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "depends_on": ["read_notes", "python_version"],
                             "inputs": [
                                 {"name": "notes", "from": "read_notes.result.text"},
@@ -2442,7 +2525,7 @@ class TestRuntimeReferenceResolution:
                             "label": "summarize",
                             "title": "Summarize",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "depends_on": ["read_notes", "python_version"],
                             "inputs": [
                                 {"name": "notes", "from": "read_notes.result.text"},
@@ -2506,7 +2589,7 @@ class TestRuntimeReferenceResolution:
                             "label": "summarize",
                             "title": "Summarize",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "depends_on": ["read_notes"],
                             "inputs": [{"name": "notes", "from": "read_notes.result.text"}],
                             "prompt": "Summarize the notes.",
@@ -2554,7 +2637,7 @@ class TestRuntimeReferenceResolution:
                             "label": "summarize",
                             "title": "Summarize",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "depends_on": ["read_notes"],
                             "inputs": [{"name": "notes", "from": "read_notes.result.text"}],
                             "prompt": "Summarize the notes.",
@@ -2624,7 +2707,7 @@ class TestRuntimeReferenceResolution:
                             "label": "summarize",
                             "title": "Summarize",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "depends_on": ["read_notes", "python_version"],
                             "inputs": [
                                 {"name": "notes", "from": "read_notes.result.text"},
@@ -2689,7 +2772,7 @@ class TestRuntimeReferenceResolution:
                             "label": "summarize",
                             "title": "Summarize",
                             "task_kind": "agent",
-                            "agent_type": "kazi",
+                            "agent_type": "worker",
                             "depends_on": ["read_notes", "python_version"],
                             "inputs": [
                                 {"name": "notes", "from": "read_notes.result.text"},
@@ -2741,7 +2824,7 @@ class TestRuntimeReferenceResolution:
                                 "label": "summarize",
                                 "title": "Summarize",
                                 "task_kind": "agent",
-                                "agent_type": "kazi",
+                                "agent_type": "worker",
                                 "depends_on": ["read_notes"],
                                 "inputs": [
                                     {"name": "notes", "from": "read_notes.result.text"},

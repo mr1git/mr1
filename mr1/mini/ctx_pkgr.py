@@ -3,7 +3,7 @@ ctx_pkgr — Context Packager
 =============================
 Takes a task description, calls mem_rtvr to pull relevant memory,
 then trims and formats the results into a tight context package dict
-ready for a Kazi.
+ready for a worker.
 
 Ruthlessly minimal. Every token in the package must earn its place.
 """
@@ -15,7 +15,7 @@ from mr1.mini import mem_rtvr
 
 
 # ---------------------------------------------------------------------------
-# Limits — keep context packages small so Kazis have room to work.
+# Limits — keep context packages small so workers have room to work.
 # ---------------------------------------------------------------------------
 
 # Maximum characters in the memory context section.
@@ -45,13 +45,13 @@ def package(
     logger: Optional[Logger] = None,
 ) -> dict[str, Any]:
     """
-    Build a context package for a Kazi.
+    Build a context package for a worker.
 
     1. Query mem_rtvr with the task description
     2. Filter and trim results
-    3. Assemble into a context dict matching kazi.run()'s expected format
+    3. Assemble into a context dict matching worker.run()'s expected format
 
-    Returns a dict ready to be passed directly to kazi.run().
+    Returns a dict ready to be passed directly to worker.run().
     """
     if logger is None:
         logger = Logger()
@@ -145,7 +145,7 @@ def _retrieve_and_trim(
 
 def _format_memory_block(chunks: list[dict[str, Any]]) -> str:
     """
-    Format memory chunks into a compact text block for the Kazi prompt.
+    Format memory chunks into a compact text block for the worker prompt.
 
     No fluff. Just the content and its source.
     """

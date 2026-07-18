@@ -68,7 +68,7 @@ class HierarchyLimits:
 # ----------------------------------------------------------------------
 
 def check_hierarchy(agents: List[Any], root_id: str, limits: HierarchyLimits) -> List[Finding]:
-    """`agents` is a list of PersistentAgent (from `store.list_agents()`)."""
+    """`agents` is a list of AgentRecord (from `store.list_agents()`)."""
     findings: List[Finding] = []
     by_id: Dict[str, Any] = {a.agent_id: a for a in agents}
     non_root = [a for a in agents if a.agent_id != root_id]
@@ -76,8 +76,8 @@ def check_hierarchy(agents: List[Any], root_id: str, limits: HierarchyLimits) ->
     # -- total count ceiling
     if len(non_root) > limits.max_total_agents:
         findings.append((
-            "high", "Too many persistent agents",
-            f"{len(non_root)} persistent agents exceeds ceiling {limits.max_total_agents}",
+            "high", "Too many orchestrator agents",
+            f"{len(non_root)} orchestrator agents exceeds ceiling {limits.max_total_agents}",
         ))
 
     # -- duplicate titles (case-insensitive), across live agents

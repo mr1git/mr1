@@ -12,9 +12,9 @@ from mr1.capability_runner import CapabilityRunner
 from mr1.event_log import EventLog, SystemEvent, _MAX_CACHE_EVENTS
 from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.scheduler import Scheduler
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.workflow_models import Provenance
 from mr1.workflow_store import WorkflowStore
 
@@ -75,7 +75,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -202,7 +202,7 @@ def test_parent_event_must_exist(event_log: EventLog):
             event_type="message_read",
             event_kind="communication",
             actor_id="ag-1",
-            actor_type="mrn",
+            actor_type="orchestrator",
             target_id="msg-1",
             target_type="message",
             status="read",
@@ -223,7 +223,7 @@ def test_invalid_kind_and_severity_are_rejected():
             event_type="message_read",
             event_kind="bad",
             actor_id="ag-1",
-            actor_type="mrn",
+            actor_type="orchestrator",
             target_id="msg-1",
             target_type="message",
             status="read",
@@ -240,7 +240,7 @@ def test_invalid_kind_and_severity_are_rejected():
             event_type="message_read",
             event_kind="communication",
             actor_id="ag-1",
-            actor_type="mrn",
+            actor_type="orchestrator",
             target_id="msg-1",
             target_type="message",
             status="read",
@@ -346,7 +346,7 @@ def test_workflow_lifecycle_events_emit(workflow_store, agent_store):
                 "label": "a",
                 "title": "A",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "x",
             }
         ],

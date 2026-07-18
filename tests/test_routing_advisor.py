@@ -60,22 +60,22 @@ def test_recent_agent_block_question_routes_to_inspection():
     assert advice.route == "inspect_existing_state"
 
 
-def test_named_persistent_agent_routes_correctly():
+def test_named_orchestrator_routes_correctly():
     advice = build_route_advice(
         "create a persistent agent named Sage to own self-evolution",
         runtime_grounding=_runtime_grounding(),
     )
 
-    assert advice.route == "persistent_agent"
+    assert advice.route == "orchestrator_ownership"
 
 
-def test_self_evolving_aspect_routes_to_persistent_agent():
+def test_self_evolving_aspect_routes_to_orchestrator_ownership():
     advice = build_route_advice(
         "self-evolving aspect not handled by MR1 directly",
         runtime_grounding=_runtime_grounding(),
     )
 
-    assert advice.route == "persistent_agent"
+    assert advice.route == "orchestrator_ownership"
 
 
 def test_create_workflow_routes_correctly():
@@ -213,13 +213,13 @@ def test_execution_tokens_without_operational_intent_routes_direct_response():
     assert advice.route == "direct_response"
 
 
-def test_create_descriptive_agent_routes_to_persistent_agent():
+def test_create_descriptive_agent_routes_to_orchestrator_ownership():
     advice = build_route_advice(
         "create a new self evolution agent named evangelion",
         runtime_grounding=_runtime_grounding(),
     )
 
-    assert advice.route == "persistent_agent"
+    assert advice.route == "orchestrator_ownership"
 
 
 def test_why_did_you_create_question_routes_direct_response():
@@ -266,8 +266,8 @@ def test_conflicting_create_then_destroy_routes_to_clarification(user_text):
         ("show me pending approvals", "inspect_existing_state"),
         ("list all workflows", "inspect_existing_state"),
         ("list approvals", "inspect_existing_state"),
-        ("spawn twenty agents that each watch a different file", "persistent_agent"),
-        ("spawn an agent for me", "persistent_agent"),
+        ("spawn twenty agents that each watch a different file", "orchestrator_ownership"),
+        ("spawn an agent for me", "orchestrator_ownership"),
         ("kill the archivist permanently", "run_commands"),
         ("kill the archivist agent permanently", "run_commands"),
         ("tell librarian to summarize last week's notes", "run_commands"),
@@ -307,7 +307,7 @@ def test_route_advice_exposes_operational_and_inspection_signals():
     assert advice.signals["matched_operational_verbs"] == []
 
 
-def test_route_advice_exposes_persistent_and_workflow_signals():
+def test_route_advice_exposes_orchestrator_ownership_and_workflow_signals():
     persistent = build_route_advice(
         "spawn an agent for me",
         runtime_grounding=_runtime_grounding(),
@@ -317,7 +317,7 @@ def test_route_advice_exposes_persistent_and_workflow_signals():
         runtime_grounding=_runtime_grounding(),
     )
 
-    assert "spawn/make/add/start agent imperative" in persistent.signals["matched_persistent_agent_patterns"]
+    assert "spawn/make/add/start agent imperative" in persistent.signals["matched_orchestrator_ownership_patterns"]
     assert any(
         item.startswith("workflow create marker:")
         for item in workflow.signals["matched_workflow_patterns"]

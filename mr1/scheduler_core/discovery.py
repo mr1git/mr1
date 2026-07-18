@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Task, Workflow
 from mr1.workflow_store import WorkflowStore
 
@@ -16,7 +16,7 @@ class WorkflowQueryService:
         self,
         *,
         store: WorkflowStore,
-        scoped_agents: PersistentAgentStore,
+        scoped_agents: AgentStore,
     ) -> None:
         self._store = store
         self._scoped_agents = scoped_agents

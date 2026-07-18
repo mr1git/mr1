@@ -215,7 +215,7 @@ def _build_confirmation_report(
     risks: list[str],
 ) -> str:
     lines = [
-        f"# MRn Workflow Preview for {agent.title}",
+        f"# Workflow Preview — {agent.title} (MR{agent.mr_level})",
         "",
         f"- agent_id: {agent.agent_id}",
         f"- mission: {_compact(agent.mission, limit=240)}",

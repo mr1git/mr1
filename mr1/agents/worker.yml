@@ -1,7 +1,7 @@
-# Kazi — Task worker
+# Worker — role=worker
 # Executes scoped, well-defined units of work. No delegation capability.
 
-name: kazi
+name: worker
 model: haiku
 allowed_tools:
   - Read
@@ -9,5 +9,5 @@ allowed_tools:
   - Edit
   - Glob
   - Grep
-lifetime: ephemeral     # Spawned per-task, exits when done.
+lifecycle: ephemeral    # Spawned per-task, exits when done.
 memory_access: rag_only # Can query memory via RAG but cannot write to it.

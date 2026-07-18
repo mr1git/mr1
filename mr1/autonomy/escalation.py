@@ -34,7 +34,7 @@ from mr1.autonomy.notify import Notification
 from mr1.clock import Clock, default_clock
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 # Why a human is needed. Each maps to a different ask.
@@ -139,7 +139,7 @@ class Escalator:
         *,
         objective_store: ObjectiveStore,
         message_store: MessageStore,
-        scoped_agent_store: PersistentAgentStore,
+        scoped_agent_store: AgentStore,
         clock: Optional[Clock] = None,
         event_log: Optional[EventLog] = None,
         notifier: Optional[Any] = None,
@@ -371,7 +371,7 @@ class Escalator:
             self._event_log.emit(
                 event_type="escalation_raised",
                 actor_id=objective.owner_agent_id or self._scoped_agents.root_agent_id,
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id=objective.objective_id,
                 target_type="objective",
                 status=target_status,

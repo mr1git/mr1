@@ -1,7 +1,7 @@
 {
   "category": "observability",
-  "description": "A persistent_delegation turn should emit a runtime decision event",
-  "elapsed_s": 30.79,
+  "description": "An orchestrator_ownership turn should emit a runtime decision event",
+  "elapsed_s": 34.98,
   "findings": [],
   "scenario": "obs_timeline_on_delegation",
   "session_error": null,

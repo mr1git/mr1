@@ -8,7 +8,7 @@ clock skew, no real disk. Those are exactly the things that kill a long-running
 process, and none of them can be simulated away.
 
 So this is a separate tool, and it is honest about what it does. It runs a
-**real** supervisor — real `SystemClock`, real scheduler, real `KaziAsyncRunner`
+**real** supervisor — real `SystemClock`, real scheduler, real `WorkerAsyncRunner`
 spawning real subprocesses, real consent grants, real capability audit, real
 disk — for however long you ask, sampling the whole time. The only thing it will
 stub is the brain, and only if you tell it to:
@@ -57,7 +57,7 @@ from mr1.autonomy.service import Supervisor, SupervisorConfig
 from mr1.autonomy.status import collect_status
 from mr1.clock import SystemClock
 from mr1.event_log import EventLog
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 SAMPLES_NAME = "samples.jsonl"
@@ -287,7 +287,7 @@ class SoakHarness:
 
     def prepare(self) -> None:
         self.runtime_root.mkdir(parents=True, exist_ok=True)
-        agents = PersistentAgentStore(root=self.runtime_root / "agents")
+        agents = AgentStore(root=self.runtime_root / "agents")
         objectives = ObjectiveStore(self.runtime_root, clock=self.clock)
         consent = ConsentGrantStore(
             self.runtime_root,

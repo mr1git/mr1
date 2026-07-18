@@ -18,7 +18,7 @@ from typing import Any, Optional
 import pytest
 
 from tests.soak.hierarchical import invariants as inv
-from tests.soak.hierarchical.driver import RunLayout
+from tests.soak.hierarchical.driver import HierarchicalSession, RunLayout, _make_paths
 from tests.soak.hierarchical.fakes import (
     FakeBrainProcess,
     _next_unique_title,
@@ -32,7 +32,11 @@ from tests.soak.hierarchical.outcomes import (
     ERROR,
     MESSAGE,
     NO_ACTION,
-    PERSISTENT_AGENT,
+    OBJECTIVE_CREATED,
+    OBJECTIVE_UPDATED,
+    ORCHESTRATOR_CREATED,
+    ORCHESTRATOR_REUSED,
+    WORKER_SPAWN,
     WORKFLOW,
     Turn,
     classify,
@@ -71,7 +75,7 @@ class TestClassify:
             agents={"created": [{"agent_id": "ag-1"}], "updated": []},
             turn_artifacts=[{"route": "direct_answer"}],
         )
-        assert classify(p) == PERSISTENT_AGENT
+        assert classify(p) == ORCHESTRATOR_CREATED
 
     def test_workflow_creation_wins_over_route(self):
         p = _payload(
@@ -80,12 +84,59 @@ class TestClassify:
         )
         assert classify(p) == WORKFLOW
 
-    def test_message_creation_wins_over_route(self):
+    def test_message_creation_with_no_agent_created_is_orchestrator_reuse(self):
+        # A message with no agent created in the same turn is a
+        # reuse-of-existing-owner act (only role=orchestrator agents are
+        # ever persisted/messageable — AGENT_ONTOLOGY.md §2) — distinct from
+        # the generic MESSAGE outcome.
         p = _payload(
             messages={"created": [{"message_id": "msg-1"}], "updated": []},
             turn_artifacts=[{"route": "run_commands"}],
         )
-        assert classify(p) == MESSAGE
+        assert classify(p) == ORCHESTRATOR_REUSED
+
+    def test_agent_creation_wins_over_message_creation(self):
+        p = _payload(
+            agents={"created": [{"agent_id": "ag-1"}], "updated": []},
+            messages={"created": [{"message_id": "msg-1"}], "updated": []},
+            turn_artifacts=[{"route": "run_commands"}],
+        )
+        assert classify(p) == ORCHESTRATOR_CREATED
+
+    def test_worker_spawn_decision_wins_over_direct_text(self):
+        p = _payload(
+            response_text="Here's a natural summary of what the worker found.",
+            decisions=[{"timestamp": "t1", "action": "spawn_worker", "task_id": "task-1"}],
+            turn_artifacts=[{"route": "worker_delegation"}],
+        )
+        assert classify(p) == WORKER_SPAWN
+
+    def test_worker_spawn_recorded_even_without_route_mapping(self):
+        # A worker spawn must classify correctly even when the only visible
+        # signal is the decision log (no agent/workflow/message diff, and no
+        # route in `_ROUTE_CLASS` at all).
+        p = _payload(
+            response_text="summary text",
+            decisions=[{"timestamp": "t1", "action": "spawn_worker", "task_id": "task-1"}],
+            turn_artifacts=[],
+        )
+        assert classify(p) == WORKER_SPAWN
+
+    def test_direct_response_with_no_worker_decision_stays_direct(self):
+        p = _payload(response_text="Sure, here's a plain answer.")
+        assert classify(p) == DIRECT
+
+    def test_objective_created_and_updated_are_real_but_currently_inert(self):
+        # No harness path populates payload["objectives"] today (objectives
+        # aren't wired into conversational MR1) — this proves the detection
+        # code is real (fires on a real diff shape) rather than a fake enum.
+        created = _payload(objectives={"created": [{"objective_id": "obj-1"}], "updated": []})
+        assert classify(created) == OBJECTIVE_CREATED
+        updated = _payload(objectives={"created": [], "updated": [{"objective_id": "obj-1"}]})
+        assert classify(updated) == OBJECTIVE_UPDATED
+        untouched = _payload()
+        assert classify(untouched) != OBJECTIVE_CREATED
+        assert classify(untouched) != OBJECTIVE_UPDATED
 
     def test_route_maps_to_class(self):
         p = _payload(turn_artifacts=[{"route": "ask_clarification"}])
@@ -110,7 +161,7 @@ class TestClassify:
     def test_persistent_delegation_route_without_created_agent_is_not_trusted(self):
         # Observed live: a "persistent_delegation" route with no agent actually
         # created (the design brain asked a clarifying question instead).
-        # The route label alone must not be trusted into PERSISTENT_AGENT —
+        # The route label alone must not be trusted into ORCHESTRATOR_CREATED —
         # unlike a workflow preview, a real agent creation is always
         # diff-visible, so "no agent created" here means it didn't happen.
         p = _payload(
@@ -119,13 +170,13 @@ class TestClassify:
         )
         assert classify(p) == CLARIFY
 
-    def test_persistent_delegation_route_with_created_agent_is_persistent_agent(self):
+    def test_orchestrator_ownership_route_with_created_agent_is_orchestrator_created(self):
         p = _payload(
             turn_artifacts=[{"route": "persistent_delegation"}],
             agents={"created": [{"agent_id": "ag-1", "title": "Sentinel"}], "updated": []},
-            response_text="delegated to persistent agent: ag-1 (Sentinel)",
+            response_text="delegated to orchestrator: ag-1 (Sentinel)",
         )
-        assert classify(p) == PERSISTENT_AGENT
+        assert classify(p) == ORCHESTRATOR_CREATED
 
 
 class TestMutationClaim:
@@ -147,6 +198,72 @@ class TestMutationClaim:
         )
         assert not response_claims_mutation(_payload(response_text=text))
 
+    # Phase D fast-follow: a bare mutation verb needs positive evidence
+    # (first-person subject or a completion/current-turn marker) and must not
+    # carry hypothetical/historical framing, mirroring root.py's tightened guard.
+
+    def test_detects_current_turn_claim_without_first_person_subject(self):
+        assert response_claims_mutation(_payload(response_text="The task is deleted now."))
+
+    def test_detects_first_person_claim_with_contraction(self):
+        assert response_claims_mutation(_payload(response_text="I've paused that workflow."))
+
+    def test_no_false_positive_on_idiomatic_gerund_use(self):
+        assert not response_claims_mutation(_payload(response_text="That's worth pausing on."))
+
+    def test_no_false_positive_on_already_established_state(self):
+        assert not response_claims_mutation(
+            _payload(response_text="The agent was already created.")
+        )
+
+    def test_no_false_positive_on_existing_state_description(self):
+        assert not response_claims_mutation(
+            _payload(response_text="The existing workflow is paused.")
+        )
+
+    def test_no_false_positive_on_hypothetical_conditional(self):
+        assert not response_claims_mutation(
+            _payload(response_text="If we renamed it, the title would be clearer.")
+        )
+
+    def test_no_false_positive_on_reported_historical_fact(self):
+        assert not response_claims_mutation(
+            _payload(response_text="The worker said the task was deleted previously.")
+        )
+
+    def test_no_false_positive_on_real_recurrence_escalation_transcript(self):
+        # The real, real-planner transcript this fast-follow exists for
+        # (Phase D corpus run, worker_to_orchestrator_escalation, turn [1]).
+        text = (
+            "That's the pattern worth pausing on. A weekly recurrence plus a "
+            "timed-out one-off check suggests standing ownership might serve "
+            "you better than rediscovering this each week.\n\n"
+            "Rather than another bounded investigation that may hit timeout "
+            "again, consider whether a dedicated agent scoped to scheduler "
+            "health — one that runs continuously and alerts when tick drops "
+            "are detected — would save you from the weekly revisit cycle. "
+            "It could surface the pattern, track whether it correlates with "
+            "load, workload churn, or something else, and give you "
+            "actionable telemetry instead of \"we ran out of time before "
+            "finding it.\"\n\n"
+            "I can't set that up from here, but if you want to move from "
+            "\"check weekly\" to \"it's owned,\" that's the structural "
+            "change that makes sense."
+        )
+        assert not response_claims_mutation(_payload(response_text=text))
+
+    def test_no_false_positive_on_distant_unrelated_first_person(self):
+        # A second real-planner false positive found while validating this
+        # fast-follow (Phase D corpus rerun, runtime_nervousness turn [2]):
+        # a distant, unrelated "I" earlier in a long sentence must not
+        # license a mutation word in a later, unrelated clause of that same
+        # sentence.
+        text = (
+            "Or is it a combo—like \"I need to understand the permission "
+            "model *and* see how agent spawning actually bottlenecks\"?"
+        )
+        assert not response_claims_mutation(_payload(response_text=text))
+
 
 class TestEvaluateTurn:
     def test_pass_when_outcome_allowed(self):
@@ -161,10 +278,10 @@ class TestEvaluateTurn:
         assert findings and findings[0][0] == "high"
 
     def test_forbid_agent_flags_creation(self):
-        turn = Turn(text="just discussing", allow=(DIRECT, PERSISTENT_AGENT), forbid_agent=True)
+        turn = Turn(text="just discussing", allow=(DIRECT, ORCHESTRATOR_CREATED), forbid_agent=True)
         p = _payload(agents={"created": [{"agent_id": "ag-1"}], "updated": []})
         findings = evaluate_turn(turn, 0, p)
-        assert any("Unexpected persistent agent" in f[2] for f in findings)
+        assert any("Unexpected orchestrator" in f[2] for f in findings)
 
     def test_forbid_mutation_claim_flags_lying_direct_answer(self):
         turn = Turn(text="did you pause it?", allow=(DIRECT,), forbid_mutation_claim=True)
@@ -173,10 +290,10 @@ class TestEvaluateTurn:
         assert any("claims an unverified mutation" in f[2] for f in findings)
 
     def test_expect_agent_flags_missing_creation(self):
-        turn = Turn(text="make an owner", allow=(PERSISTENT_AGENT,), expect_agent=True)
+        turn = Turn(text="make an owner", allow=(ORCHESTRATOR_CREATED,), expect_agent=True)
         p = _payload(turn_artifacts=[{"route": "direct_answer"}], response_text="ok")
         findings = evaluate_turn(turn, 0, p)
-        assert any("Expected a persistent agent" in f[2] for f in findings)
+        assert any("Expected an orchestrator" in f[2] for f in findings)
 
     def test_expect_reuse_flags_duplicate_agent(self):
         turn = Turn(text="tell the steward", allow=(COMMAND, MESSAGE), expect_reuse=True)
@@ -217,7 +334,7 @@ class _Agent:
     agent_id: str
     title: str
     parent_agent_id: Optional[str]
-    tree_level: int
+    mr_level: int
     status: str = "active"
     mission: Optional[str] = "own something"
     parent_request: Optional[str] = None
@@ -297,7 +414,7 @@ class TestHierarchyInvariants:
         children = [_Agent(f"c{i}", f"Child{i}", "root", 1) for i in range(5)]
         limits = inv.HierarchyLimits(max_total_agents=3, max_children_per_agent=10)
         findings = inv.check_hierarchy([root, *children], "root", limits)
-        assert any("Too many persistent agents" in f[1] for f in findings)
+        assert any("Too many orchestrator agents" in f[1] for f in findings)
 
     def test_detects_orphan_child(self):
         root = _Agent("root", "MR1", None, 0)
@@ -553,3 +670,32 @@ class TestSoakEndToEnd:
         ]
         assert highs == [], highs
         assert result["passed"] is True
+
+
+class TestFakeWorkerSpawnPlumbing:
+    """A bounded-investigation turn under `--planner fake` must be exercised
+    deterministically, without ever spawning a real `claude` subprocess
+    (HARNESS ROBUSTNESS requirement) — `fake_worker_run` patches
+    `mr1.worker.run` the same way `fake_mrn_reasoner` patches the MRn
+    reasoner."""
+
+    def test_bounded_investigation_spawns_a_fake_worker_deterministically(self, tmp_path):
+        fixture = tmp_path / "fixture"
+        build_fixture_repo(fixture)
+        paths = _make_paths(tmp_path / "runtime")
+        session = HierarchicalSession(paths, planner="fake", fixture_repo=fixture)
+        try:
+            payload = session.handle_turn(
+                "Take a look through this repo.", index=0, drain_ticks=1,
+            )
+        finally:
+            session.shutdown()
+
+        assert payload["ok"] is True
+        assert classify(payload) == WORKER_SPAWN
+        spawn_decisions = [
+            d for d in payload.get("decisions") or [] if d.get("action") == "spawn_worker"
+        ]
+        assert len(spawn_decisions) == 1
+        # never persisted as an AgentRecord
+        assert payload["agents"]["created"] == []

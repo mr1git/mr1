@@ -629,7 +629,7 @@ class RetentionManager:
             self._events.emit(
                 event_type="retention_run",
                 actor_id="retention",
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id="runtime",
                 target_type="runtime",
                 status="dry_run" if report.dry_run else ("ok" if not report.errors else "error"),

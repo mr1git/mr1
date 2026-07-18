@@ -10,6 +10,14 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from tests.behavior_qa.judge import DIMENSION_KEYS
+from tests.soak.hierarchical.outcomes import (
+    OBJECTIVE_CREATED,
+    OBJECTIVE_UPDATED,
+    ORCHESTRATOR_CREATED,
+    ORCHESTRATOR_REUSED,
+    WORKER_SPAWN,
+    WORKFLOW,
+)
 
 
 def render_report(result: Dict[str, Any]) -> str:
@@ -62,7 +70,9 @@ def render_report(result: Dict[str, Any]) -> str:
 
     _render_transcript(w, clusters)
     _render_actions(w, clusters)
+    _render_worker_and_ownership_decisions(w, clusters, result)
     _render_judge_report(w, clusters, result)
+    _render_initiative_by_action_class(w, result)
     _render_examples(w, clusters)
     _render_recommendations(w, result)
     _render_closing(w, result)
@@ -114,23 +124,142 @@ def _render_transcript(w, clusters: List[Dict[str, Any]]) -> None:
 def _render_actions(w, clusters: List[Dict[str, Any]]) -> None:
     w("## 2. Actions taken")
     w("")
-    w("| cluster | agents created | workflows created | messages sent | approvals raised |")
-    w("|---|---|---|---|---|")
+    w("_Workers spawned and orchestrators created/reused are reported in "
+      "separate columns on purpose — a worker spawn is never the same "
+      "behavioral class as creating (or reusing) a durable orchestrator._")
+    w("")
+    w("| cluster | workers spawned | orchestrators created | orchestrators "
+      "reused | workflows created | messages sent | approvals raised |")
+    w("|---|---|---|---|---|---|---|")
     any_action = False
     for c in clusters:
-        agents = [
-            a.get("title") for t in c.get("turns") or [] for a in t.get("created_agents") or []
+        turns = c.get("turns") or []
+        workers = sum(len(t.get("worker_spawns") or []) for t in turns)
+        orchestrators_created = [
+            a.get("title") for t in turns for a in t.get("created_agents") or []
         ]
-        workflows = sum(len(t.get("created_workflows") or []) for t in c.get("turns") or [])
-        messages = sum(len(t.get("created_messages") or []) for t in c.get("turns") or [])
-        approvals = sum(len(t.get("approval_ids") or []) for t in c.get("turns") or [])
-        if agents or workflows or messages or approvals:
+        orchestrators_reused = sum(1 for t in turns if t.get("outcome") == ORCHESTRATOR_REUSED)
+        workflows = sum(len(t.get("created_workflows") or []) for t in turns)
+        messages = sum(len(t.get("created_messages") or []) for t in turns)
+        approvals = sum(len(t.get("approval_ids") or []) for t in turns)
+        if workers or orchestrators_created or orchestrators_reused or workflows or messages or approvals:
             any_action = True
-        w(f"| {c.get('name')} | {', '.join(agents) or '—'} | {workflows or '—'} | "
+        w(f"| {c.get('name')} | {workers or '—'} | "
+          f"{', '.join(orchestrators_created) or '—'} | "
+          f"{orchestrators_reused or '—'} | {workflows or '—'} | "
           f"{messages or '—'} | {approvals or '—'} |")
     w("")
     if not any_action:
-        w("_No agents, workflows, messages, or approvals were created across the corpus._")
+        w("_No workers, orchestrators, workflows, messages, or approvals "
+          "were created across the corpus._")
+        w("")
+
+
+# ---------------------------------------------------------------------
+# 2b. worker & ownership decisions
+# ---------------------------------------------------------------------
+
+def _render_worker_and_ownership_decisions(
+    w, clusters: List[Dict[str, Any]], result: Dict[str, Any],
+) -> None:
+    w("## Worker & ownership decisions")
+    w("")
+    metrics = result.get("metrics") or {}
+
+    wu = metrics.get("worker_utilization")
+    w("**Worker utilization** — among bounded-investigation-shaped turns, "
+      "how often MR1 used a worker or a proportionate workflow instead of "
+      "an ungrounded direct answer, refusal, or excessive clarification:")
+    if wu:
+        w(f"- {wu['numerator']}/{wu['denominator']} = **{wu['score']}**")
+    else:
+        w("- _no bounded-investigation-shaped turns in this run_")
+    w("")
+
+    ci = metrics.get("context_isolation")
+    w("**Context isolation** — among worker spawns with a follow-up turn, "
+      "how often the follow-up read as grounded recall rather than MR1 "
+      "redoing the investigation inline in its own context:")
+    if ci:
+        w(f"- {ci['numerator']}/{ci['denominator']} = **{ci['score']}**")
+    else:
+        w("- _no worker spawns with a following turn in this run_")
+    w("")
+
+    w("**Worker vs. workflow decisions** — clusters where a "
+      "bounded-investigation-shaped turn resolved to a worker spawn or a "
+      "workflow:")
+    w("")
+    w("| cluster | outcome |")
+    w("|---|---|")
+    any_wf_wk = False
+    for c in clusters:
+        for t in c.get("turns") or []:
+            if t.get("outcome") in (WORKER_SPAWN, WORKFLOW):
+                any_wf_wk = True
+                w(f"| {c.get('name')} [{t.get('index')}] | {t.get('outcome')} |")
+    if not any_wf_wk:
+        w("| _none_ | — |")
+    w("")
+
+    w("**Orchestrator ownership decisions** — clusters where an "
+      "orchestrator was created or reused:")
+    w("")
+    w("| cluster | outcome | title(s) |")
+    w("|---|---|---|")
+    any_owner = False
+    for c in clusters:
+        for t in c.get("turns") or []:
+            if t.get("outcome") == ORCHESTRATOR_CREATED:
+                any_owner = True
+                titles = [a.get("title") for a in t.get("created_agents") or []]
+                w(f"| {c.get('name')} [{t.get('index')}] | created | {', '.join(titles) or '—'} |")
+            elif t.get("outcome") == ORCHESTRATOR_REUSED:
+                any_owner = True
+                w(f"| {c.get('name')} [{t.get('index')}] | reused | — |")
+    if not any_owner:
+        w("| _none_ | — | — |")
+    w("")
+
+    oc = metrics.get("orchestrator_creation")
+    oj = metrics.get("ownership_judgment")
+    if oc:
+        w(f"- orchestrator creation score (ownership_judgment + "
+          f"orchestrator_reuse, normalized, averaged): **{oc['score']}** "
+          f"across {oc['clusters']} cluster(s)")
+    if oj:
+        detail_parts = ", ".join(
+            f"{k}={v}" for k, v in oj.items() if k != "score"
+        )
+        w(f"- ownership judgment composite: **{oj['score']}** ({detail_parts})")
+    w("")
+
+    escalation = next(
+        (c for c in clusters if c.get("name") == "worker_to_orchestrator_escalation"), None,
+    )
+    if escalation:
+        w("**Worker-to-orchestrator escalation case** — bounded probe -> "
+          "repeated responsibility -> durable owner:")
+        w("")
+        for t in escalation.get("turns") or []:
+            w(f"- [{t.get('index')}] {t.get('text')!r} -> outcome=`{t.get('outcome')}`")
+        w("")
+
+    objective_turns = [
+        (c.get("name"), t)
+        for c in clusters
+        for t in c.get("turns") or []
+        if t.get("outcome") in (OBJECTIVE_CREATED, OBJECTIVE_UPDATED)
+    ]
+    if objective_turns:
+        w("**Objective creation/update:**")
+        for name, t in objective_turns:
+            w(f"- {name} [{t.get('index')}] -> `{t.get('outcome')}`")
+        w("")
+    else:
+        w("_No objective was created or updated this run — objectives "
+          "are not currently reachable from the conversational MR1 "
+          "path the harness drives (see deliverable notes)._")
         w("")
 
 
@@ -196,6 +325,31 @@ def _render_judge_report(w, clusters: List[Dict[str, Any]], result: Dict[str, An
             parts.append(f"unnatural: {comments['unnatural']}")
         if parts:
             w(f"- **{c.get('name')}** — " + "; ".join(parts))
+    w("")
+
+
+# ---------------------------------------------------------------------
+# 3b. initiative calibration by action class
+# ---------------------------------------------------------------------
+
+def _render_initiative_by_action_class(w, result: Dict[str, Any]) -> None:
+    w("## Initiative calibration by action class")
+    w("")
+    w("_Reported separately per class so aggressive orchestrator creation "
+      "can never hide behind conservative worker behavior in one overall "
+      "number. A cluster's class is its dominant outcome across turns._")
+    w("")
+    by_class = (result.get("metrics") or {}).get(
+        "initiative_calibration_by_action_class"
+    ) or {}
+    w("| class | clusters | calibration (0=balanced, +over-acting, -under-acting) |")
+    w("|---|---|---|")
+    for cls in ("worker", "workflow", "orchestrator", "objective"):
+        entry = by_class.get(cls)
+        if entry:
+            w(f"| {cls} | {entry['clusters']} | {entry['calibration']:+.2f} |")
+        else:
+            w(f"| {cls} | 0 | n/a |")
     w("")
 
 
@@ -309,4 +463,8 @@ def _render_closing(w, result: Dict[str, Any]) -> None:
     w(f"- **Initiative calibration:** {rollup.get('initiative_calibration')} "
       "(0 = balanced, positive = over-acting, negative = under-acting)")
     w(f"- **Behavior distribution:** {rollup.get('behavior_distribution')}")
+    twin = (result.get("metrics") or {}).get("digital_twin")
+    if twin:
+        w(f"- **Digital twin score:** {twin['score']} across {twin['clusters']} "
+          f"judged clusters — formula: {twin['formula']}")
     w("")

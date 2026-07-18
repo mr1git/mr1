@@ -1,7 +1,7 @@
 {
   "category": "observability",
   "description": "A direct_answer turn should emit a runtime decision event",
-  "elapsed_s": 3.23,
+  "elapsed_s": 3.27,
   "findings": [],
   "scenario": "obs_timeline_on_direct_answer",
   "session_error": null,

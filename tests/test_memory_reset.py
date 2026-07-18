@@ -7,7 +7,7 @@ import pytest
 
 from mr1 import workflow_cli
 from mr1.memory_reset import MemoryResetResult, reset_memory
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_store import WorkflowStore
 
 
@@ -273,7 +273,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "memory" / "agents")
+    return AgentStore(root=tmp_path / "memory" / "agents")
 
 
 def test_memory_reset_cli_active(tmp_path, store, agent_store, capsys):

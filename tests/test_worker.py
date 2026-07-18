@@ -1,4 +1,4 @@
-"""Tests for mr1.kazi"""
+"""Tests for mr1.worker"""
 
 import json
 from unittest.mock import patch, MagicMock
@@ -7,7 +7,7 @@ import pytest
 from mr1.core.logger import Logger
 from mr1.core.spawner import Spawner
 from mr1.core.dispatcher import Dispatcher
-from mr1.kazi import run, KaziResult, _extract_output, _detect_context_exceeded
+from mr1.worker import run, WorkerResult, _extract_output, _detect_context_exceeded
 
 
 @pytest.fixture
@@ -20,15 +20,15 @@ def spawner(tmp_logger):
     return Spawner(dispatcher=Dispatcher(), logger=tmp_logger)
 
 
-class TestKaziResult:
+class TestWorkerResult:
     def test_ok_property(self):
-        r = KaziResult("t1", "completed", "out", None, 1.0, 100)
+        r = WorkerResult("t1", "completed", "out", None, 1.0, 100)
         assert r.ok is True
-        r2 = KaziResult("t1", "failed", "", "err", 1.0, 100)
+        r2 = WorkerResult("t1", "failed", "", "err", 1.0, 100)
         assert r2.ok is False
 
     def test_to_dict(self):
-        r = KaziResult("t1", "completed", "out", None, 1.234, 100)
+        r = WorkerResult("t1", "completed", "out", None, 1.234, 100)
         d = r.to_dict()
         assert d["task_id"] == "t1"
         assert d["duration_s"] == 1.23
@@ -150,7 +150,7 @@ class TestRun:
         assert result.error_type == "parse_error"
 
     def test_denied_by_dispatcher(self, spawner, tmp_logger):
-        # Kazi can't use Agent tool — dispatcher should reject.
+        # Worker can't use Agent tool — dispatcher should reject.
         result = run(
             {"task_id": "t1", "instructions": "test", "allowed_tools": ["Agent"]},
             spawner=spawner,

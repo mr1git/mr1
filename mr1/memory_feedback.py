@@ -17,7 +17,7 @@ from mr1.memory_curator import (
 )
 from mr1.memory_graph import MemoryGraphStore, capability_node_id, update_graph_from_events
 from mr1.memory_curator import run_memory_curation
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Provenance, Workflow
 from mr1.workflow_store import WorkflowStore
 
@@ -463,11 +463,11 @@ def build_memory_maintenance_spec() -> dict[str, Any]:
 def submit_memory_maintenance_workflow(
     store: WorkflowStore,
     *,
-    scoped_agent_store: Optional[PersistentAgentStore] = None,
+    scoped_agent_store: Optional[AgentStore] = None,
 ) -> str:
     from mr1.scheduler import submit_spec_to_disk
 
-    scoped_agents = scoped_agent_store or PersistentAgentStore(root=store.root.parent / "agents")
+    scoped_agents = scoped_agent_store or AgentStore(root=store.root.parent / "agents")
     root_agent_id = scoped_agents.root_agent_id
     return submit_spec_to_disk(
         build_memory_maintenance_spec(),

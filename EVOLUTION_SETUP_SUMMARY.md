@@ -151,7 +151,7 @@ After 2-3 manual runs, enable autonomous scheduling:
 
 ### 1. Create the Evolution Agent
 
-Route to an existing persistent agent (like MR2) or create a new one:
+Route to an existing orchestrator agent (e.g. at MR2) or create a new one:
 
 ```
 Mission: You are the Evolution Agent for MR1. Own the continuous tool evolution 

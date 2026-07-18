@@ -1,7 +1,7 @@
 """
 The conversation corpus: stateful, Marwan-style project arcs.
 
-These are not robotic commands ("spawn persistent agent"). They are the way
+These are not robotic commands ("spawn orchestrator"). They are the way
 Marwan actually talks to MR1 — informal, with follow-up references, changes
 of mind, and questions mixed with operational asks. Each turn declares an
 *allowed outcome class* (see `outcomes.Turn`), never brittle exact text.
@@ -30,7 +30,7 @@ from tests.soak.hierarchical.outcomes import (
     INSPECTION,
     MESSAGE,
     NO_ACTION,
-    PERSISTENT_AGENT,
+    ORCHESTRATOR_CREATED,
     WORKFLOW,
     Turn,
 )
@@ -49,7 +49,7 @@ def _talk(text: str, note: str = "") -> Turn:
     return Turn(
         text=text,
         allow=(DIRECT, INSPECTION, CLARIFY, NO_ACTION),
-        forbid=(PERSISTENT_AGENT, WORKFLOW),
+        forbid=(ORCHESTRATOR_CREATED, WORKFLOW),
         forbid_agent=True,
         forbid_workflow=True,
         forbid_mutation_claim=True,
@@ -84,7 +84,7 @@ ARCS: List[Arc] = [
             Turn(
                 text="ok, this is too much for one pass. make an agent whose job "
                      "is to own the testing side of this repo.",
-                allow=(PERSISTENT_AGENT, CLARIFY),
+                allow=(ORCHESTRATOR_CREATED, CLARIFY),
                 expect_agent=True,
                 note="broad long-lived responsibility -> persistent owner",
             ),
@@ -116,7 +116,7 @@ ARCS: List[Arc] = [
                 allow=(WORKFLOW, CLARIFY),
                 expect_workflow=True,
                 forbid_agent=True,
-                note="bounded task -> workflow preview, not a persistent agent",
+                note="bounded task -> workflow preview, not an orchestrator",
             ),
             Turn(
                 text="show me the plan first.",
@@ -160,7 +160,7 @@ ARCS: List[Arc] = [
             Turn(
                 text="we need security covered too — make an agent to own "
                      "security review.",
-                allow=(PERSISTENT_AGENT, CLARIFY),
+                allow=(ORCHESTRATOR_CREATED, CLARIFY),
                 expect_agent=True,
                 note="genuinely different responsibility -> a second agent is right",
             ),
@@ -182,14 +182,14 @@ ARCS: List[Arc] = [
         turns=[
             Turn(
                 text="make an agent to own the overall code review for this repo.",
-                allow=(PERSISTENT_AGENT, CLARIFY),
+                allow=(ORCHESTRATOR_CREATED, CLARIFY),
                 expect_agent=True,
                 note="a broad review mission gets a persistent owner",
             ),
             Turn(
                 text="that's a lot — create a child agent to own just the "
                      "persistence review under it.",
-                allow=(PERSISTENT_AGENT, CLARIFY),
+                allow=(ORCHESTRATOR_CREATED, CLARIFY),
                 expect_agent=True,
                 references=("it",),
                 note="justified sub-owner -> one child; depth/breadth bounded",
@@ -256,7 +256,7 @@ ARCS: List[Arc] = [
             Turn(
                 text="make another agent, but not for the same thing as the "
                      "testing one.",
-                allow=(PERSISTENT_AGENT, CLARIFY),
+                allow=(ORCHESTRATOR_CREATED, CLARIFY),
                 note="a distinct new responsibility is allowed",
             ),
         ],

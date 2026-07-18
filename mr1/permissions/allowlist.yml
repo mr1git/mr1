@@ -6,7 +6,7 @@
 
 agents:
   mr1:
-    description: "Top-level orchestrator — can spawn mr2, kazi"
+    description: "Top-level orchestrator — can spawn mr2, worker"
     cli_flags:
       - "-p"
       - "--allowedTools"
@@ -29,7 +29,7 @@ agents:
       - "Agent"
 
   mr2:
-    description: "Job orchestrator — can spawn mr3, kazi"
+    description: "Job orchestrator — can spawn mr3, worker"
     cli_flags:
       - "-p"
       - "--allowedTools"
@@ -55,7 +55,7 @@ agents:
       - "Grep"
 
   mr3:
-    description: "Task executor — can spawn kazi, mr4+ if height allows"
+    description: "Task executor — can spawn worker, mr4+ if height allows"
     cli_flags:
       - "-p"
       - "--allowedTools"
@@ -80,7 +80,7 @@ agents:
       - "Glob"
       - "Grep"
 
-  kazi:
+  worker:
     description: "Task worker — scoped to file operations and search"
     cli_flags:
       - "-p"

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler, validate_spec
 from mr1.workflow_authoring import WorkflowAuthoringService
 from mr1.workflow_store import WorkflowStore
@@ -51,7 +51,7 @@ def _single_branch_spec() -> dict:
                 "label": "success_path",
                 "title": "Success path",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["check"],
                 "run_if": {
                     "ref": "check.result.text",
@@ -64,7 +64,7 @@ def _single_branch_spec() -> dict:
                 "label": "final",
                 "title": "Final",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["success_path"],
                 "prompt": "Summarize the branch result.",
             },
@@ -87,7 +87,7 @@ def _join_spec() -> dict:
                 "label": "success_path",
                 "title": "Success path",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["check"],
                 "run_if": {
                     "ref": "check.result.text",
@@ -100,7 +100,7 @@ def _join_spec() -> dict:
                 "label": "failure_path",
                 "title": "Failure path",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["check"],
                 "run_if": {
                     "ref": "check.result.text",
@@ -112,7 +112,7 @@ def _join_spec() -> dict:
                 "label": "final",
                 "title": "Final",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["success_path", "failure_path"],
                 "dependency_policy": "any_succeeded",
                 "inputs": [
@@ -145,7 +145,7 @@ def _collision_spec() -> dict:
                 "label": "check-contains-one",
                 "title": "Dash label",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["source"],
                 "run_if": {
                     "ref": "source.result.text",
@@ -158,7 +158,7 @@ def _collision_spec() -> dict:
                 "label": "check_contains_one",
                 "title": "Snake label",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["source"],
                 "run_if": {
                     "ref": "source.result.text",
@@ -171,7 +171,7 @@ def _collision_spec() -> dict:
                 "label": "final",
                 "title": "Final",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["check-contains-one", "check_contains_one"],
                 "dependency_policy": "any_succeeded",
                 "prompt": "final",
@@ -195,7 +195,7 @@ def _plain_spec() -> dict:
                 "label": "summarize",
                 "title": "Summarize",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["read_notes"],
                 "inputs": [{"name": "notes", "from": "read_notes.result.text"}],
                 "prompt": "Summarize the notes.",

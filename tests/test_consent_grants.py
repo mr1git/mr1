@@ -15,7 +15,7 @@ from mr1.capability_policy import (
 )
 from mr1.clock import VirtualClock
 from mr1.event_log import EventLog
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 OBJECTIVE = "obj-genesis"
@@ -25,7 +25,7 @@ OTHER_OBJECTIVE = "obj-somethingelse"
 def _fixture(tmp_path):
     clock = VirtualClock(start=datetime(2026, 1, 1, tzinfo=timezone.utc))
     runtime_root = tmp_path / "runtime"
-    agents = PersistentAgentStore(root=runtime_root / "agents")
+    agents = AgentStore(root=runtime_root / "agents")
     store = ConsentGrantStore(runtime_root, clock=clock, scoped_agent_store=agents)
     return clock, runtime_root, agents, store
 
@@ -33,7 +33,7 @@ def _fixture(tmp_path):
 def _shell_request(tmp_path, *, objective_id=OBJECTIVE, argv=None, cwd=None):
     return CapabilityRequest(
         actor_id="agent-1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         actor_clearance=0.99,
         invocation_mode="workflow",
         capability_name="shell_command",
@@ -386,7 +386,7 @@ def test_a_grant_does_not_authorize_direct_invocation(tmp_path):
     metadata = metadata_for_capability("shell_command", "tool")
     direct = CapabilityRequest(
         actor_id="agent-1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         actor_clearance=0.99,
         invocation_mode="direct",
         capability_name="shell_command",
@@ -416,7 +416,7 @@ def test_a_grant_overrides_actor_scope_only_within_its_own_roots(tmp_path):
 
     request = CapabilityRequest(
         actor_id="agent-1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         actor_clearance=0.99,
         invocation_mode="workflow",
         capability_name="shell_command",

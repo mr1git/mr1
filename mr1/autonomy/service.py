@@ -97,10 +97,10 @@ from mr1.inbox_triage import InboxTriagePolicy
 from mr1.capability_policy import CapabilityApprovalStore
 from mr1.clock import Clock, default_clock, parse_iso
 from mr1.event_log import EventLog
-from mr1.kazi_runner import KaziAsyncRunner, Runner
+from mr1.worker_runner import WorkerAsyncRunner, Runner
 from mr1.messages import MessageStore
 from mr1.scheduler import Scheduler, WorkflowSpecError, validate_spec
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.watchers import default_watcher_registry
 from mr1.workflow_models import Provenance, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
@@ -163,7 +163,7 @@ class Supervisor:
         runner: Optional[Runner] = None,
         scheduler: Optional[Scheduler] = None,
         workflow_store: Optional[WorkflowStore] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         message_store: Optional[MessageStore] = None,
         approval_store: Optional[CapabilityApprovalStore] = None,
         control_plane: Optional[ControlPlane] = None,
@@ -191,7 +191,7 @@ class Supervisor:
         self._workspace_root = Path(workspace_root) if workspace_root else Path.cwd()
 
         self._store = workflow_store or WorkflowStore(root=self._runtime_root / "workflows")
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+        self._scoped_agents = scoped_agent_store or AgentStore(
             root=self._runtime_root / "agents"
         )
         self._message_store = message_store or MessageStore(
@@ -273,7 +273,7 @@ class Supervisor:
         self._last_retention_at: Optional[float] = None
         self._scheduler = scheduler or Scheduler(
             self._store,
-            runner or KaziAsyncRunner(self._store),
+            runner or WorkerAsyncRunner(self._store),
             concurrency=self._config.scheduler_concurrency,
             auto_tick=auto_scheduler_tick,
             tick_interval_s=self._config.scheduler_tick_interval_s,
@@ -1405,7 +1405,7 @@ class Supervisor:
             self._timeline.emit(
                 event_type=event_type,
                 actor_id=objective.owner_agent_id or self._root_agent_id,
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id=objective.objective_id,
                 target_type="objective",
                 status=status,
@@ -1580,7 +1580,7 @@ class Supervisor:
             self._timeline.emit(
                 event_type=event_type,
                 actor_id=self._root_agent_id,
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id="supervisor",
                 target_type="supervisor",
                 status=status,

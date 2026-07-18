@@ -27,7 +27,7 @@ class TestSpawn:
         mock_popen.return_value = mock_proc
 
         record = spawner.spawn(
-            agent_type="kazi",
+            agent_type="worker",
             task_id="task-001",
             prompt="test prompt",
             model="haiku",
@@ -36,7 +36,7 @@ class TestSpawn:
 
         assert isinstance(record, ProcessRecord)
         assert record.pid == 12345
-        assert record.agent_type == "kazi"
+        assert record.agent_type == "worker"
         assert record.task_id == "task-001"
 
     @patch("mr1.core.spawner.subprocess.Popen")
@@ -46,7 +46,7 @@ class TestSpawn:
         mock_popen.return_value = mock_proc
 
         spawner.spawn(
-            agent_type="kazi",
+            agent_type="worker",
             task_id="task-001",
             prompt="do stuff",
             model="haiku",
@@ -65,10 +65,10 @@ class TestSpawn:
     def test_spawn_denied_by_dispatcher(self, spawner):
         with pytest.raises(PermissionDenied):
             spawner.spawn(
-                agent_type="kazi",
+                agent_type="worker",
                 task_id="task-001",
                 prompt="test",
-                tools=["Agent"],  # Kazi can't use Agent
+                tools=["Agent"],  # Worker can't use Agent
             )
 
 
@@ -80,7 +80,7 @@ class TestKill:
         mock_proc.poll.return_value = -15
         mock_popen.return_value = mock_proc
 
-        record = spawner.spawn("kazi", "task-001", "test", tools=["Read"])
+        record = spawner.spawn("worker", "task-001", "test", tools=["Read"])
         assert spawner.kill_by_pid(100) is True
         mock_proc.terminate.assert_called_once()
 
@@ -91,7 +91,7 @@ class TestKill:
         mock_proc.poll.return_value = -15
         mock_popen.return_value = mock_proc
 
-        spawner.spawn("kazi", "task-001", "test", tools=["Read"])
+        spawner.spawn("worker", "task-001", "test", tools=["Read"])
         killed = spawner.kill_by_task("task-001")
         assert killed == 1
 
@@ -105,7 +105,7 @@ class TestKill:
             mock_proc.pid = 100 + i
             mock_proc.poll.return_value = -15
             mock_popen.return_value = mock_proc
-            spawner.spawn("kazi", f"task-{i}", "test", tools=["Read"])
+            spawner.spawn("worker", f"task-{i}", "test", tools=["Read"])
 
         killed = spawner.kill_all()
         assert killed == 3
@@ -119,7 +119,7 @@ class TestStatus:
         mock_proc.poll.return_value = None  # Still running
         mock_popen.return_value = mock_proc
 
-        spawner.spawn("kazi", "task-001", "test", tools=["Read"])
+        spawner.spawn("worker", "task-001", "test", tools=["Read"])
         active = spawner.list_active()
         assert len(active) == 1
         assert active[0]["pid"] == 100
@@ -132,7 +132,7 @@ class TestStatus:
         mock_proc.poll.return_value = None
         mock_popen.return_value = mock_proc
 
-        spawner.spawn("kazi", "task-001", "test", tools=["Read"])
+        spawner.spawn("worker", "task-001", "test", tools=["Read"])
         assert spawner.is_alive(100) is True
         assert spawner.is_alive(999) is False
 
@@ -150,7 +150,7 @@ class TestGetResultCleanup:
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc
 
-        spawner.spawn("kazi", "task-001", "test", tools=["Read"])
+        spawner.spawn("worker", "task-001", "test", tools=["Read"])
 
         # Process is tracked.
         assert 100 in spawner._by_pid
@@ -174,7 +174,7 @@ class TestGetResultCleanup:
         mock_proc.poll.return_value = None  # Still running
         mock_popen.return_value = mock_proc
 
-        spawner.spawn("kazi", "task-002", "test", tools=["Read"])
+        spawner.spawn("worker", "task-002", "test", tools=["Read"])
         result = spawner.get_result(200)
         assert result is None
 
@@ -192,7 +192,7 @@ class TestGetResultCleanup:
             mock_proc.returncode = 0
             mock_popen.return_value = mock_proc
 
-            spawner.spawn("kazi", f"task-{i:03d}", "test", tools=["Read"])
+            spawner.spawn("worker", f"task-{i:03d}", "test", tools=["Read"])
             spawner.get_result(1000 + i)
 
         # All cleaned up.

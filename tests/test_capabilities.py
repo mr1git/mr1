@@ -8,7 +8,7 @@ import pytest
 
 from mr1 import workflow_cli
 from mr1.capabilities import CapabilityRegistry, default_capability_registry
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.mr1 import MR1, StateManager
 from mr1.scheduler import validate_spec
 from mr1.tools import default_tool_registry
@@ -39,7 +39,7 @@ class TestCapabilityRegistry:
 
         assert "shell_command" in names
         assert "manual_event" in names
-        assert "kazi" in names
+        assert "worker" in names
         assert "workflow_compiler" in names
         assert names == sorted(names)
 
@@ -169,7 +169,7 @@ class TestCapabilityCli:
         out = capsys.readouterr().out
         assert "shell_command" in out
         assert "manual_event" in out
-        assert "kazi" in out
+        assert "worker" in out
         assert "workflow_compiler" in out
 
     def test_cli_unknown_tool_error_is_deterministic(self, store, capsys):
@@ -192,7 +192,7 @@ class TestCapabilityCli:
         f.write_text("hello", encoding="utf-8")
         config_path = tmp_path / "cfg.json"
         config_path.write_text(json.dumps({"path": str(f)}), encoding="utf-8")
-        scoped = __import__("mr1.scoped_agents", fromlist=["PersistentAgentStore"]).PersistentAgentStore(
+        scoped = __import__("mr1.scoped_agents", fromlist=["AgentStore"]).AgentStore(
             root=tmp_path / "agents"
         )
 
@@ -211,7 +211,7 @@ class TestCapabilityCli:
     def test_capability_call_cli_disallowed_raises_error(self, tmp_path, store, capsys):
         config_path = tmp_path / "cfg.json"
         config_path.write_text(json.dumps({"path": "/tmp/x", "content": "x"}), encoding="utf-8")
-        scoped = __import__("mr1.scoped_agents", fromlist=["PersistentAgentStore"]).PersistentAgentStore(
+        scoped = __import__("mr1.scoped_agents", fromlist=["AgentStore"]).AgentStore(
             root=tmp_path / "agents"
         )
 
@@ -228,7 +228,7 @@ class TestCapabilityCli:
     def test_capability_call_cli_memory_search_smoke(self, tmp_path, store, capsys):
         config_path = tmp_path / "cfg.json"
         config_path.write_text(json.dumps({"query": "file access", "limit": 5}), encoding="utf-8")
-        scoped = __import__("mr1.scoped_agents", fromlist=["PersistentAgentStore"]).PersistentAgentStore(
+        scoped = __import__("mr1.scoped_agents", fromlist=["AgentStore"]).AgentStore(
             root=tmp_path / "agents"
         )
 
@@ -262,7 +262,7 @@ class TestCapabilityBuiltins:
 
         assert "shell_command" in output
         assert "manual_event" in output
-        assert "kazi" in output
+        assert "worker" in output
         assert "workflow_compiler" in output
 
     def test_mr1_capability_json_builtin(self, tmp_path):

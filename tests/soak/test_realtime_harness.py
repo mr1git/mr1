@@ -161,7 +161,7 @@ def test_a_duplicate_launch_is_caught(tmp_path):
         log.emit(
             event_type="workflow_created",
             actor_id="MR1",
-            actor_type="mr1",
+            actor_type="root_orchestrator",
             target_id=f"wf-{i}",
             target_type="workflow",
             status="pending",
@@ -196,7 +196,7 @@ def test_archived_workflows_do_not_read_as_a_duplicate_launch(tmp_path):
         log.emit(
             event_type="workflow_created",
             actor_id="MR1",
-            actor_type="mr1",
+            actor_type="root_orchestrator",
             target_id=f"wf-{i}",
             target_type="workflow",
             status="pending",
@@ -206,7 +206,7 @@ def test_archived_workflows_do_not_read_as_a_duplicate_launch(tmp_path):
         log.emit(
             event_type="workflow_task_started",
             actor_id="MR1",
-            actor_type="mr1",
+            actor_type="root_orchestrator",
             target_id=f"tk-{i}",
             target_type="task",
             status="running",
@@ -257,7 +257,7 @@ def test_authority_used_outside_consent_is_caught(tmp_path):
     log.emit(
         event_type="capability_requested",
         actor_id="MR1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="shell_command",
         target_type="capability",
         status="requested",
@@ -268,7 +268,7 @@ def test_authority_used_outside_consent_is_caught(tmp_path):
     log.emit(
         event_type="capability_allowed",
         actor_id="MR1",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="shell_command",
         target_type="capability",
         status="allowed",
@@ -369,7 +369,7 @@ def test_the_soak_grant_admits_read_only_git_and_refuses_everything_else(tmp_pat
     Widening it must not widen it into a write. That is the whole test.
     """
     from mr1.autonomy.consent import ConsentGrantStore
-    from mr1.scoped_agents import PersistentAgentStore
+    from mr1.scoped_agents import AgentStore
     from tests.soak.realtime import SoakHarness
 
     runtime = tmp_path / "soak"
@@ -388,7 +388,7 @@ def test_the_soak_grant_admits_read_only_git_and_refuses_everything_else(tmp_pat
     try:
         grants = ConsentGrantStore(
             harness.runtime_root,
-            scoped_agent_store=PersistentAgentStore(root=harness.runtime_root / "agents"),
+            scoped_agent_store=AgentStore(root=harness.runtime_root / "agents"),
         )
         predicate = grants.require(harness._grant_id).arg_predicate
     finally:

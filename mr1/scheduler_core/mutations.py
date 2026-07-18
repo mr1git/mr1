@@ -49,7 +49,7 @@ def task_spec_for_workflow(workflow: Workflow, task: Task) -> dict[str, Any]:
     if task.timeout_s is not None:
         task_spec["timeout_s"] = task.timeout_s
     if task.task_kind == "agent":
-        task_spec["agent_type"] = task.agent_type or "kazi"
+        task_spec["agent_type"] = task.agent_type or "worker"
         task_spec["prompt"] = task.prompt
     elif task.task_kind == "tool":
         task_spec["tool_type"] = task.tool_type
@@ -87,7 +87,7 @@ def new_task_from_spec(
         label=raw["label"],
         title=raw.get("title", raw["label"]),
         task_kind=raw.get("task_kind", "agent"),
-        agent_type=raw.get("agent_type", "kazi")
+        agent_type=raw.get("agent_type", "worker")
         if raw.get("task_kind", "agent") == "agent" else None,
         prompt=raw.get("prompt", "")
         if raw.get("task_kind", "agent") == "agent" else "",
@@ -515,7 +515,7 @@ class WorkflowMutationEngine:
             self._validate_spec(merged)
             task.title = raw.get("title", raw["label"])
             task.task_kind = raw.get("task_kind", "agent")
-            task.agent_type = raw.get("agent_type", "kazi") if task.task_kind == "agent" else None
+            task.agent_type = raw.get("agent_type", "worker") if task.task_kind == "agent" else None
             task.prompt = raw.get("prompt", "") if task.task_kind == "agent" else ""
             task.watcher_type = raw.get("watcher_type")
             task.watch_config = dict(raw.get("watch_config", {}))

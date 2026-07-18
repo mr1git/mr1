@@ -28,7 +28,7 @@ from mr1.capability_policy import (
     PolicyEngine,
     build_scope_context,
 )
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_store import WorkflowStore
 
 
@@ -83,7 +83,7 @@ def preflight_authority(
     objective: Objective,
     *,
     workflow_store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     consent_store: Any,
     workspace_root: Path,
     policy_engine: Optional[PolicyEngine] = None,
@@ -125,7 +125,7 @@ def preflight_authority(
         args = dict(task.get("tool_config") or task.get("watch_config") or {})
         request = CapabilityRequest(
             actor_id=owner_id,
-            actor_type="mr1" if owner.agent_type == "mr1" else "mrn",
+            actor_type=owner.actor_category,
             actor_clearance=float(owner.security_clearance),
             invocation_mode="workflow",
             capability_name=capability_name,

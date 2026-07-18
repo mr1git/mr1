@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from mr1.kazi_runner import MockRunner, RunResult, RunStatus
+from mr1.worker_runner import MockRunner, RunResult, RunStatus
 from mr1.mr1 import MR1, StateManager
 from mr1.workflow_store import WorkflowStore
 
@@ -46,10 +46,12 @@ from mr1.runtime_test_cli import (
 from tests.soak.realtime import _open_fds, _rss_bytes
 
 import mr1.mrn_loop as mrn_loop
+import mr1.worker as worker_module
 
 from tests.soak.hierarchical.fakes import (
     FakeBrainProcess,
     fake_mrn_reasoner,
+    fake_worker_run,
     make_fake_compiler,
 )
 from tests.soak.hierarchical.fixture import build_fixture_repo
@@ -99,6 +101,16 @@ class Sample:
         return asdict(self)
 
 
+def _decision_map(decisions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """StateManager decisions have no natural id — key by a synthetic
+    composite (unique in practice: `task_id` is generated fresh per
+    delegation, and two decisions can't share a timestamp+action+task_id)."""
+    return {
+        f"{d.get('timestamp')}|{d.get('action')}|{d.get('task_id')}": d
+        for d in decisions
+    }
+
+
 def _make_paths(runtime_root: Path) -> RuntimePaths:
     return RuntimePaths(
         isolated=True,
@@ -127,6 +139,7 @@ class HierarchicalSession:
         self._started = False
         self._brain: Optional[_CountingBrain] = None
         self._original_mrn_reasoner = mrn_loop.run_mrn_step_agent
+        self._original_worker_run = worker_module.run
         self._mr1 = self._build_mr1()
 
     # -- construction --------------------------------------------------
@@ -165,11 +178,16 @@ class HierarchicalSession:
             # brain never proposes a title that already exists post-restart.
             fake._used_titles.update(a.title for a in self._mr1._scoped_agents.list_agents())
             self._mr1._process = fake
-            # A newly-created persistent agent runs its own first step through
+            # A newly-created orchestrator runs its own first step through
             # MRnStepRunner, whose default reasoner spawns a *real* `claude`
             # subprocess independent of MR1's own `_process`. Patch it too, or
             # "fake mode" still makes real LLM calls the moment an agent is born.
             mrn_loop.run_mrn_step_agent = fake_mrn_reasoner
+            # A bounded-investigation turn (root.py's _route_bounded_investigation)
+            # calls the real mr1.worker.run(), which spawns a real `claude`
+            # subprocess — patch it too, or "fake mode" still makes a real LLM
+            # call the moment MR1 delegates to a worker.
+            worker_module.run = fake_worker_run
         else:
             self._mr1.start()
         # wrap whatever process now exists, for brain-call counting
@@ -194,6 +212,7 @@ class HierarchicalSession:
         except Exception:
             pass
         mrn_loop.run_mrn_step_agent = self._original_mrn_reasoner
+        worker_module.run = self._original_worker_run
 
     # -- snapshotting --------------------------------------------------
     def _snapshot(self) -> Dict[str, Dict[str, Any]]:
@@ -212,6 +231,14 @@ class HierarchicalSession:
             },
             "events": _event_map(events),
             "turn_artifacts": _load_turn_artifacts(self._paths.state_path),
+            "decisions": _decision_map(self._mr1._state.decisions),
+            # StateManager stores tasks keyed by task_id but doesn't embed
+            # the id into the value itself — add it so downstream diff
+            # consumers (behavior_qa's worker_spawns) can match by task_id.
+            "tasks": {
+                task_id: {**task, "task_id": task_id}
+                for task_id, task in self._mr1._state.tasks.items()
+            },
             "_max_event_index": max((e.event_index for e in events), default=None),
         }
 
@@ -254,6 +281,8 @@ class HierarchicalSession:
             before["turn_artifacts"], after["turn_artifacts"], sort_key="timestamp"
         )
         approvals_required = _new_items(before["approvals"], after["approvals"], sort_key="created_at")
+        new_decisions = _new_items(before["decisions"], after["decisions"], sort_key="timestamp")
+        created_tasks, updated_tasks = _diff_entities(before["tasks"], after["tasks"])
 
         return {
             "ok": ok,
@@ -263,9 +292,11 @@ class HierarchicalSession:
             "agents": {"created": created_agents, "updated": updated_agents},
             "workflows": {"created": created_workflows, "updated": updated_workflows},
             "messages": {"created": created_messages, "updated": updated_messages},
+            "tasks": {"created": created_tasks, "updated": updated_tasks},
             "approvals_required": approvals_required,
             "timeline": {"events": new_events, "max_event_index": after["_max_event_index"]},
             "turn_artifacts": new_turn_artifacts,
+            "decisions": new_decisions,
             "errors": errors,
             "idle_brain_calls": idle_brain_calls,
         }

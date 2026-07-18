@@ -29,9 +29,27 @@ from tests.behavior_qa.judge import (
     load_marwan_preferences,
     parse_judge_output,
 )
+from tests.behavior_qa.metrics import (
+    compute_metrics,
+    context_isolation,
+    digital_twin_score,
+    initiative_calibration_by_action_class,
+    ownership_judgment_score,
+    orchestrator_creation_score,
+    worker_utilization,
+)
 from tests.behavior_qa.report import render_report
 from tests.behavior_qa.runner import BehaviorQAConfig, _execution_waves, run_corpus
-from tests.soak.hierarchical.outcomes import ALL_OUTCOMES, CLARIFY, DIRECT, Turn
+from tests.soak.hierarchical.outcomes import (
+    ALL_OUTCOMES,
+    CLARIFY,
+    DIRECT,
+    ORCHESTRATOR_CREATED,
+    ORCHESTRATOR_REUSED,
+    WORKER_SPAWN,
+    WORKFLOW,
+    Turn,
+)
 
 
 # ---------------------------------------------------------------------
@@ -142,6 +160,43 @@ class TestJudgePrompt:
         prompt = build_judge_prompt(cluster, [_turn_record()], [])
         assert "c1" in prompt
         assert "continues" in prompt
+
+
+class TestJudgeExplicitRequestCalibration:
+    """Phase D.3 follow-up: the real bare_bounded_inspection/own_runtime_testing
+    smoke runs were judged TOO_AGGRESSIVE purely for lacking upfront
+    discussion — even though both were explicit, bounded requests where the
+    desired philosophy says immediate action is correct. Root cause: a
+    replayed 'always discuss before delegating' preference memory (predating
+    the worker/orchestrator ontology split) was left free to override the
+    asymmetric guidance. These tests pin the calibration language that fixes
+    this, so it can't silently regress."""
+
+    def test_system_prompt_states_explicit_bounded_requests_need_no_discussion(self):
+        prompt = judge_mod.JUDGE_SYSTEM_PROMPT
+        assert "I'll have a worker make a bounded pass and report back." in prompt
+        assert "I need your permission before I do that." in prompt
+        assert "explicit-request calibration" in prompt.lower()
+
+    def test_system_prompt_tells_judge_not_to_let_preferences_override_calibration(self):
+        normalized = " ".join(judge_mod.JUDGE_SYSTEM_PROMPT.split())
+        assert "does not turn every explicit, bounded worker spawn" in normalized
+
+    def test_structural_judgment_dimension_excludes_discussion_timing(self):
+        normalized = " ".join(judge_mod.JUDGE_SYSTEM_PROMPT.split())
+        assert "independent of whether a discussion" in normalized
+
+    def test_replayed_preference_gets_an_adjacent_precedence_reminder(self):
+        cluster = EpisodicCluster(
+            name="c", category="A", topic="t", goal="g",
+            turns=[ConversationTurn(Turn(text="t", allow=(DIRECT, CLARIFY)))],
+        )
+        prompt = build_judge_prompt(
+            cluster, [_turn_record()],
+            ["Always talk through the problem with Marwan before delegating to Kamis or Kazis."],
+        )
+        assert "Always talk through the problem" in prompt
+        assert "explicit bounded worker spawns or" in prompt
 
 
 # ---------------------------------------------------------------------
@@ -290,6 +345,153 @@ class TestJudgeClusterDegradation:
 
 
 # ---------------------------------------------------------------------
+# ontology-aware metrics
+# ---------------------------------------------------------------------
+
+def _turn(index, outcome, response_text="some text", **overrides):
+    base = dict(
+        index=index, text="t", note="", soft_expectations=[],
+        response_text=response_text, route="", route_advice={}, override_reason="",
+        final_action=None, created_agents=[], created_workflows=[], created_messages=[],
+        approval_ids=[], ok=True, errors=[], outcome=outcome, findings=[], worker_spawns=[],
+    )
+    base.update(overrides)
+    return base
+
+
+def _result(name, category, turns, judge=None, resumes_from=None):
+    return {
+        "name": name, "category": category, "topic": "t", "goal": "g",
+        "resumes_from": resumes_from, "turns": turns,
+        "judge": judge or {"dimensions": {}, "behavior": "BALANCED"},
+    }
+
+
+class TestMetrics:
+    def test_worker_utilization_counts_only_category_a_bounded_turns(self):
+        by_name = {c.name: c for c in CLUSTERS}
+        results = [
+            _result("investigate_repo", "A", [_turn(0, WORKER_SPAWN)]),
+            # Category B turns nominally "allow" everything (including
+            # WORKER_SPAWN) but must not count as bounded-investigation-shaped.
+            _result("drone_backend", "B", [_turn(0, WORKER_SPAWN)]),
+        ]
+        score = worker_utilization(list(by_name.values()), results)
+        assert score == {"numerator": 1, "denominator": 1, "score": 1.0}
+
+    def test_worker_utilization_counts_workflow_as_good_too(self):
+        by_name = {c.name: c for c in CLUSTERS}
+        results = [_result("investigate_flaky_tests", "A", [_turn(0, WORKFLOW)])]
+        score = worker_utilization(list(by_name.values()), results)
+        assert score == {"numerator": 1, "denominator": 1, "score": 1.0}
+
+    def test_worker_utilization_direct_response_counts_against(self):
+        by_name = {c.name: c for c in CLUSTERS}
+        results = [_result("bare_bounded_inspection", "A", [_turn(0, DIRECT)])]
+        score = worker_utilization(list(by_name.values()), results)
+        assert score == {"numerator": 0, "denominator": 1, "score": 0.0}
+
+    def test_worker_utilization_none_when_no_bounded_turns_present(self):
+        by_name = {c.name: c for c in CLUSTERS}
+        results = [_result("fashion_project", "B", [_turn(0, DIRECT)])]
+        assert worker_utilization(list(by_name.values()), results) is None
+
+    def test_context_isolation_grounded_followup(self):
+        results = [_result("c", "A", [
+            _turn(0, WORKER_SPAWN),
+            _turn(1, DIRECT, response_text="here is what the worker found"),
+        ])]
+        assert context_isolation(results) == {"numerator": 1, "denominator": 1, "score": 1.0}
+
+    def test_context_isolation_followup_that_respawns_a_worker_is_not_isolated(self):
+        results = [_result("c", "A", [
+            _turn(0, WORKER_SPAWN),
+            _turn(1, WORKER_SPAWN, response_text="spawned again"),
+        ])]
+        assert context_isolation(results) == {"numerator": 0, "denominator": 1, "score": 0.0}
+
+    def test_context_isolation_no_followup_turn_is_excluded(self):
+        results = [_result("c", "A", [_turn(0, WORKER_SPAWN)])]
+        assert context_isolation(results) is None
+
+    def test_orchestrator_creation_score_normalizes_dimensions(self):
+        results = [_result(
+            "c", "A", [_turn(0, ORCHESTRATOR_CREATED)],
+            judge={"dimensions": {"ownership_judgment": 5, "orchestrator_reuse": 3}},
+        )]
+        # (5-1)/4 = 1.0, (3-1)/4 = 0.5 -> mean 0.75
+        assert orchestrator_creation_score(results) == {"clusters": 1, "score": 0.75}
+
+    def test_orchestrator_creation_score_none_without_creation(self):
+        results = [_result("c", "A", [_turn(0, DIRECT)])]
+        assert orchestrator_creation_score(results) is None
+
+    def test_ownership_judgment_score_combines_subscores(self):
+        results = [
+            _result(
+                "own", "A", [_turn(0, ORCHESTRATOR_CREATED)],
+                judge={"dimensions": {"ownership_judgment": 5, "orchestrator_reuse": 5}},
+            ),
+            _result(
+                "reuse", "A", [_turn(0, ORCHESTRATOR_REUSED)],
+                judge={"marwan_approval": "YES"},
+            ),
+        ]
+        score = ownership_judgment_score(results)
+        assert score["creation_quality"] == 1.0
+        assert score["reuse_quality"] == 1.0
+        assert score["duplicate_avoidance"] == 1.0
+        assert score["score"] == 1.0
+
+    def test_ownership_judgment_flags_duplicate_finding(self):
+        results = [_result(
+            "own", "A", [_turn(0, ORCHESTRATOR_CREATED, findings=[
+                ("high", 0, "Reuse expected but a new agent was created", "detail"),
+            ])],
+            judge={"dimensions": {"ownership_judgment": 3, "orchestrator_reuse": 3}},
+        )]
+        score = ownership_judgment_score(results)
+        assert score["duplicate_avoidance"] == 0.0
+
+    def test_initiative_calibration_by_action_class_splits_correctly(self):
+        results = [
+            _result("w1", "A", [_turn(0, WORKER_SPAWN)], judge={"behavior": "TOO_AGGRESSIVE"}),
+            _result("o1", "A", [_turn(0, ORCHESTRATOR_CREATED)], judge={"behavior": "TOO_PASSIVE"}),
+            _result("disc", "B", [_turn(0, DIRECT)], judge={"behavior": "BALANCED"}),
+        ]
+        by_class = initiative_calibration_by_action_class(results)
+        assert by_class["worker"] == {"clusters": 1, "calibration": 1.0}
+        assert by_class["orchestrator"] == {"clusters": 1, "calibration": -1.0}
+        assert by_class["workflow"] is None
+        assert by_class["objective"] is None
+
+    def test_digital_twin_score_formula(self):
+        results = [_result(
+            "c", "A", [_turn(0, DIRECT)],
+            judge={
+                "would_marwan_have_done_this_himself": "YES",
+                "would_continue_using": "YES",
+                "dimensions": {"structural_judgment": 5, "naturalness": 5},
+            },
+        )]
+        # all four normalized components are 1.0 -> mean 1.0
+        result = digital_twin_score(results)
+        assert result["score"] == 1.0
+        assert "formula" in result
+
+    def test_compute_metrics_returns_all_expected_keys(self):
+        by_name = {c.name: c for c in CLUSTERS}
+        results = [_result("investigate_repo", "A", [_turn(0, WORKER_SPAWN)],
+                            judge={"behavior": "BALANCED"})]
+        metrics = compute_metrics(list(by_name.values()), results)
+        assert set(metrics) == {
+            "worker_utilization", "context_isolation", "orchestrator_creation",
+            "ownership_judgment", "initiative_calibration_by_action_class",
+            "digital_twin",
+        }
+
+
+# ---------------------------------------------------------------------
 # execution waves
 # ---------------------------------------------------------------------
 
@@ -342,15 +544,45 @@ class TestReportRendering:
                     "response_text": "That's a good project to talk through.",
                     "outcome": "direct_response", "findings": [],
                     "created_agents": [], "created_workflows": [],
+                    "created_messages": [], "approval_ids": [], "worker_spawns": [],
+                },
+            ],
+            "judge": judge,
+        }
+        worker_cluster = {
+            "name": "bare_bounded_inspection", "category": "A", "topic": "bounded inspection",
+            "goal": "test goal", "resumes_from": None,
+            "turns": [
+                {
+                    "index": 0, "text": "Take a look through this repo.",
+                    "soft_expectations": [],
+                    "response_text": "Delegated a worker to look through the repo.",
+                    "outcome": "worker_spawn", "findings": [],
+                    "created_agents": [], "created_workflows": [],
                     "created_messages": [], "approval_ids": [],
+                    "worker_spawns": [{"task_id": "task-1", "mission": "look through the repo",
+                                        "status": "completed"}],
                 },
             ],
             "judge": judge,
         }
         return {
             "planner": "real", "judge_model": "sonnet",
-            "clusters": [cluster],
-            "counts": {"clusters": 1, "judged_clusters": 1, "turns": 1},
+            "clusters": [cluster, worker_cluster],
+            "counts": {"clusters": 2, "judged_clusters": 2, "turns": 2},
+            "metrics": {
+                "worker_utilization": {"numerator": 1, "denominator": 1, "score": 1.0},
+                "context_isolation": None,
+                "orchestrator_creation": None,
+                "ownership_judgment": None,
+                "initiative_calibration_by_action_class": {
+                    "worker": {"clusters": 1, "calibration": 0.0},
+                    "workflow": None, "orchestrator": None, "objective": None,
+                },
+                "digital_twin": {
+                    "clusters": 2, "score": 0.8, "formula": "test formula",
+                },
+            },
             "rollup": {
                 "overall": {
                     "judged_clusters": 1, "mean_partner_score": 7.0,
@@ -391,6 +623,26 @@ class TestReportRendering:
         assert "initiative calibration" in text.lower()
         assert "would continue using" in text.lower()
         assert "Always discuss before delegating." in text
+
+    def test_worker_and_orchestrator_columns_never_conflated(self):
+        text = render_report(self._fake_result())
+        assert "## Worker & ownership decisions" in text
+        assert "workers spawned" in text
+        assert "orchestrators created" in text
+        assert "orchestrators reused" in text
+        # the worker-spawn cluster shows up in the actions table with a
+        # worker count and no orchestrator title
+        assert "| bare_bounded_inspection | 1 |" in text
+
+    def test_initiative_by_action_class_section_present(self):
+        text = render_report(self._fake_result())
+        assert "## Initiative calibration by action class" in text
+        assert "| worker | 1 | +0.00 |" in text
+
+    def test_digital_twin_score_in_closing(self):
+        text = render_report(self._fake_result())
+        assert "Digital twin score:** 0.8" in text
+        assert "test formula" in text
 
     def test_dry_run_banner_shown_for_fake_planner(self):
         result = self._fake_result()

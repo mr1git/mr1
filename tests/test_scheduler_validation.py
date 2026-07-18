@@ -15,7 +15,7 @@ from mr1.workflow_store import WorkflowStore
 PROV = Provenance(type="user", id="cli")
 
 
-def _base_task(label, deps=None, task_kind="agent", agent_type="kazi"):
+def _base_task(label, deps=None, task_kind="agent", agent_type="worker"):
     task = {
         "label": label,
         "title": label.upper(),

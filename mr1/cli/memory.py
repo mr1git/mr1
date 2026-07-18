@@ -59,7 +59,7 @@ from mr1.memory_queries import (
 from mr1.memory_reset import MemoryResetResult, reset_memory
 from mr1.memory_retrieval import RetrievalStore, update_memory_retrieval
 from mr1.scheduler import WorkflowSpecError
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore, migrate_agent_store_ontology
 from mr1.workflow_models import Provenance
 from mr1.workflow_store import WorkflowStore
 
@@ -458,7 +458,7 @@ def _cmd_memory_reset(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     memory_root = _runtime_root_for(store)
@@ -492,7 +492,7 @@ def _cmd_memory_update(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -507,7 +507,7 @@ def _cmd_memory_stats(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -522,7 +522,7 @@ def _cmd_memory_graph_show(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -538,7 +538,7 @@ def _cmd_memory_top_workflows(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -553,7 +553,7 @@ def _cmd_memory_capabilities(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -568,7 +568,7 @@ def _cmd_memory_failures(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -583,7 +583,7 @@ def _cmd_memory_agent(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     if not scoped_agents.is_visible(caller_agent_id, args.agent_id):
         print("error: access denied: agent not in scope", file=sys.stderr)
@@ -603,7 +603,7 @@ def _cmd_memory_project(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -619,7 +619,7 @@ def _cmd_memory_file(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -635,7 +635,7 @@ def _cmd_memory_workflow_template(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -651,7 +651,7 @@ def _cmd_memory_curation_due(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -669,7 +669,7 @@ def _cmd_memory_curate(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -702,7 +702,7 @@ def _cmd_memory_insights_list(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -717,7 +717,7 @@ def _cmd_memory_insights_show(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -736,7 +736,7 @@ def _cmd_memory_insights_recommendations(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -754,7 +754,7 @@ def _cmd_memory_insights_friction(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -772,7 +772,7 @@ def _cmd_memory_insights_failures(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -790,7 +790,7 @@ def _cmd_memory_insights_effectiveness(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -805,7 +805,7 @@ def _cmd_memory_curation_runs(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -820,7 +820,7 @@ def _cmd_memory_feedback_due(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -839,7 +839,7 @@ def _cmd_memory_feedback_update(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -858,7 +858,7 @@ def _cmd_memory_retrieval_update(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -873,7 +873,7 @@ def _cmd_memory_retrieval_stats(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     retrieval_store = RetrievalStore(store.root.parent)
@@ -910,7 +910,7 @@ def _cmd_memory_retrieval_search(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -930,7 +930,7 @@ def _cmd_memory_feedback_list(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -945,7 +945,7 @@ def _cmd_memory_feedback_insight(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -960,7 +960,7 @@ def _cmd_doctor(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -975,7 +975,7 @@ def _cmd_snapshot_create(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -996,7 +996,7 @@ def _cmd_snapshot_list(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del args, caller_agent_id, scoped_agents
     print(_format_snapshot_list(list_snapshots(_runtime_root_for(store))))
@@ -1006,7 +1006,7 @@ def _cmd_snapshot_inspect(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     try:
@@ -1022,7 +1022,7 @@ def _cmd_repair_state(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     """Quarantine a corrupt MR1 state file so that MR1 can restart cleanly."""
     del caller_agent_id, scoped_agents
@@ -1040,11 +1040,33 @@ def _cmd_repair_state(
         print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
+def _cmd_migrate_ontology(
+    args: argparse.Namespace,
+    store: WorkflowStore,
+    caller_agent_id: str,
+    scoped_agents: AgentStore,
+) -> int:
+    """Migrate every agent JSON file to the current role/mr_level/lifecycle
+    schema. Idempotent — safe to run against a store that's already current,
+    or to re-run after a partial/interrupted migration."""
+    del caller_agent_id
+    report = migrate_agent_store_ontology(scoped_agents.root)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"root: {report['root']}")
+        print(f"migrated: {len(report['migrated'])}")
+        print(f"already current: {len(report['already_current'])}")
+        print(f"failed: {len(report['failed'])}")
+        for item in report["failed"]:
+            print(f"  {item['agent_id']}: {item['error']}")
+    return 2 if report["failed"] else 0
+
 def _cmd_memory_maintenance_spec(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, caller_agent_id, scoped_agents
     print(json.dumps(build_memory_maintenance_spec(), indent=2, sort_keys=True))
@@ -1054,7 +1076,7 @@ def _cmd_memory_maintenance_run(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id
     try:
@@ -1072,7 +1094,7 @@ def _cmd_memory_maintenance_status(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del caller_agent_id, scoped_agents
     print(_format_memory_detail(maintenance_status_payload(store), json_output=args.json))

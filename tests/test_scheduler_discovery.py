@@ -5,8 +5,8 @@ Scheduler discovers workflows written to disk by an external process
 
 import pytest
 
-from mr1.kazi_runner import MockRunner
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.worker_runner import MockRunner
+from mr1.scoped_agents import AgentStore
 from mr1.scheduler import Scheduler, submit_spec_to_disk
 from mr1.scheduler_core.discovery import WorkflowQueryService
 from mr1.workflow_models import Provenance, TaskStatus, WorkflowStatus
@@ -16,8 +16,8 @@ from mr1.workflow_store import WorkflowStore
 SPEC = {
     "title": "CLI-submitted workflow",
     "tasks": [
-        {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "kazi", "prompt": "x"},
-        {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "kazi",
+        {"label": "a", "title": "A", "task_kind": "agent", "agent_type": "worker", "prompt": "x"},
+        {"label": "b", "title": "B", "task_kind": "agent", "agent_type": "worker",
          "prompt": "x", "depends_on": ["a"]},
     ],
 }
@@ -78,7 +78,7 @@ def test_cli_can_submit_while_mr1_offline(tmp_path):
 
 def test_active_workflow_index_avoids_reloading_terminal_history(tmp_path, monkeypatch):
     store = WorkflowStore(root=tmp_path / "workflows")
-    agents = PersistentAgentStore(root=tmp_path / "agents")
+    agents = AgentStore(root=tmp_path / "agents")
     active_wf_id = submit_spec_to_disk(SPEC, Provenance(type="user", id="cli"), store)
 
     terminal_ids: list[str] = []

@@ -1,7 +1,7 @@
 {
   "category": "ambiguity",
   "description": "'delete the old one' with no agents must not delete MR1",
-  "elapsed_s": 0.06,
+  "elapsed_s": 0.07,
   "findings": [],
   "scenario": "ambig_delete_old_one",
   "session_error": null,

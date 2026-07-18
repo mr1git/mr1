@@ -33,6 +33,7 @@ from tests.behavior_qa.judge import (
     judge_cluster,
     load_marwan_preferences,
 )
+from tests.behavior_qa.metrics import compute_metrics
 from tests.soak.hierarchical.driver import _append_jsonl, _write_json, _read_jsonl
 from tests.soak.hierarchical.fixture import build_fixture_repo
 
@@ -467,4 +468,5 @@ def _assemble_result(
             "category_a": _rollup([r for r in judged if r["category"] == "A"]),
             "category_b": _rollup([r for r in judged if r["category"] == "B"]),
         },
+        "metrics": compute_metrics(all_clusters, judged),
     }

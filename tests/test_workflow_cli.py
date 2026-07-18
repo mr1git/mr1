@@ -20,13 +20,13 @@ from mr1 import workflow_cli
 from mr1.capability_policy import CapabilityApprovalRequest, CapabilityRequest, build_scope_context
 from mr1.capability_runner import CapabilityRunner
 from mr1.dataflow import Artifact, ResolvedTaskInput, TaskOutput
-from mr1.kazi_runner import MockRunner, RunStatus
+from mr1.worker_runner import MockRunner, RunStatus
 from mr1.memory_curator import EvidenceRef, InsightStore, MemoryInsight
 from mr1.memory_graph import MemoryGraph, MemoryGraphStore, MemoryNode, agent_node_id, capability_node_id
 from mr1.mrn_loop import MRnStepResult
 from mr1.mrn_run import MRnRunResult
 from mr1.scheduler import Scheduler, submit_spec_to_disk
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -35,9 +35,9 @@ SPEC = {
     "title": "CLI-submitted workflow",
     "tasks": [
         {"label": "a", "title": "A", "task_kind": "agent",
-         "agent_type": "kazi", "prompt": "x"},
+         "agent_type": "worker", "prompt": "x"},
         {"label": "b", "title": "B", "task_kind": "agent",
-         "agent_type": "kazi", "prompt": "x", "depends_on": ["a"]},
+         "agent_type": "worker", "prompt": "x", "depends_on": ["a"]},
     ],
 }
 
@@ -107,9 +107,9 @@ class TestSubmit:
 
     def test_invalid_spec_exits_non_zero(self, tmp_path, store, capsys):
         bad = {"tasks": [
-            {"label": "a", "task_kind": "agent", "agent_type": "kazi",
+            {"label": "a", "task_kind": "agent", "agent_type": "worker",
              "depends_on": ["b"]},
-            {"label": "b", "task_kind": "agent", "agent_type": "kazi",
+            {"label": "b", "task_kind": "agent", "agent_type": "worker",
              "depends_on": ["a"]},
         ]}
         path = _write_spec(tmp_path, bad)
@@ -350,7 +350,7 @@ class TestReadCommands:
 
 class TestAgentStepCommands:
     def test_agent_assign_persists_mission(self, tmp_path, store, capsys):
-        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        agent_store = AgentStore(root=tmp_path / "agents")
         root = agent_store.ensure_root_agent()
         child = agent_store.create_child_agent(root.agent_id, "research")
         mission_path = tmp_path / "mission.txt"
@@ -369,7 +369,7 @@ class TestAgentStepCommands:
         assert reloaded.current_iteration == 0
 
     def test_agent_step_command_formats_result(self, tmp_path, store, capsys):
-        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        agent_store = AgentStore(root=tmp_path / "agents")
         root = agent_store.ensure_root_agent()
         child = agent_store.create_child_agent(root.agent_id, "research")
         agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
@@ -396,7 +396,7 @@ class TestAgentStepCommands:
         assert f"agent_id={child.agent_id}" in out
 
     def test_agent_run_command_formats_result(self, tmp_path, store, capsys):
-        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        agent_store = AgentStore(root=tmp_path / "agents")
         root = agent_store.ensure_root_agent()
         child = agent_store.create_child_agent(root.agent_id, "research")
         agent_store.assign_mission(root.agent_id, child.agent_id, "Investigate")
@@ -545,7 +545,7 @@ class TestReplaceWorkflow:
                     "label": "a",
                     "title": "A2",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "replacement",
                 }]
             })
@@ -574,7 +574,7 @@ class TestReplaceWorkflow:
                     "label": "a",
                     "title": "A2",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "replacement",
                 }]
             })
@@ -616,7 +616,7 @@ class TestSubmitDoesNotStartScheduler:
 
 class TestApprovalAndAuditCli:
     def test_approvals_commands_and_agent_scopes(self, tmp_path, store, capsys):
-        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        agent_store = AgentStore(root=tmp_path / "agents")
         root = agent_store.ensure_root_agent()
         child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.1)
         target = tmp_path / "secret.txt"
@@ -665,12 +665,12 @@ class TestApprovalAndAuditCli:
         assert scopes_payload["scope_grants"][0]["granted_by"] == root.agent_id
 
     def test_approvals_approve_prints_rerun_guidance_and_single_use_note(self, tmp_path, store, capsys):
-        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        agent_store = AgentStore(root=tmp_path / "agents")
         root = agent_store.ensure_root_agent()
         child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.1)
         original_request = CapabilityRequest(
             actor_id=child.agent_id,
-            actor_type="mrn",
+            actor_type="orchestrator",
             actor_clearance=child.security_clearance,
             invocation_mode="workflow",
             capability_name="read_file",
@@ -715,7 +715,7 @@ class TestApprovalAndAuditCli:
         assert "Use --grant-scope to persist scope access if intended." in out
 
     def test_capability_audit_cli_lists_direct_and_workflow_audits(self, tmp_path, store, capsys):
-        agent_store = PersistentAgentStore(root=tmp_path / "agents")
+        agent_store = AgentStore(root=tmp_path / "agents")
         root = agent_store.ensure_root_agent()
         child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=0.1)
         runner = CapabilityRunner(scoped_agent_store=agent_store, workspace_root=tmp_path)

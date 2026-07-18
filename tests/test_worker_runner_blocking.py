@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Tests for the Runner adapters in mr1.kazi_runner."""
+"""Tests for the Runner adapters in mr1.worker_runner."""
 
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
@@ -8,9 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mr1.agents import AgentRuntimeError
-from mr1.kazi_runner import (
-    KaziAsyncRunner,
-    KaziBlockingRunner,
+from mr1.worker_runner import (
+    WorkerAsyncRunner,
+    WorkerBlockingRunner,
     MockRunner,
     RunStatus,
     _parse_claude_json_envelope,
@@ -20,7 +20,7 @@ from mr1.workflow_store import WorkflowStore
 
 
 @dataclass
-class _FakeKaziResult:
+class _FakeWorkerResult:
     task_id: str
     status: str
     output: str
@@ -42,7 +42,7 @@ def _task(task_id="tk-1", wf_id="wf-1", prompt="hello"):
         label="a",
         title="Task A",
         task_kind="agent",
-        agent_type="kazi",
+        agent_type="worker",
         prompt=prompt,
         status=TaskStatus.READY,
     )
@@ -99,10 +99,10 @@ class TestMockRunner:
         assert r.poll(handle) is None
 
 
-class TestKaziBlockingRunner:
+class TestWorkerBlockingRunner:
     def test_succeeded(self, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
-        fake_kazi_run = MagicMock(return_value=_FakeKaziResult(
+        fake_worker_run = MagicMock(return_value=_FakeWorkerResult(
             task_id="tk-1", status="completed", output="hello",
             error=None, duration_s=0.1, pid=42,
             payload={
@@ -114,7 +114,7 @@ class TestKaziBlockingRunner:
                 "pid": 42,
             },
         ))
-        runner = KaziBlockingRunner(store, kazi_run=fake_kazi_run)
+        runner = WorkerBlockingRunner(store, worker_run=fake_worker_run)
         handle = runner.start(_task())
         result = runner.poll(handle)
         assert result is not None
@@ -123,16 +123,16 @@ class TestKaziBlockingRunner:
         assert result.stdout_path.exists()
         assert result.result_payload["text"] == "hello"
         assert result.result_payload["metrics"]["usage"] == {"output_tokens": 2}
-        fake_kazi_run.assert_called_once()
+        fake_worker_run.assert_called_once()
 
     def test_failed_maps_to_failed_status(self, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
-        fake_kazi_run = MagicMock(return_value=_FakeKaziResult(
+        fake_worker_run = MagicMock(return_value=_FakeWorkerResult(
             task_id="tk-1", status="failed", output="",
             error="exit 1", duration_s=0.1, pid=42,
             error_type="cli_error",
         ))
-        runner = KaziBlockingRunner(store, kazi_run=fake_kazi_run)
+        runner = WorkerBlockingRunner(store, worker_run=fake_worker_run)
         handle = runner.start(_task())
         result = runner.poll(handle)
         assert result.status is RunStatus.FAILED
@@ -141,27 +141,27 @@ class TestKaziBlockingRunner:
 
     def test_timeout_maps_to_timed_out(self, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
-        fake_kazi_run = MagicMock(return_value=_FakeKaziResult(
+        fake_worker_run = MagicMock(return_value=_FakeWorkerResult(
             task_id="tk-1", status="timeout", output="",
             error="exceeded 10s", duration_s=10.0, pid=42,
             error_type="timeout",
         ))
-        runner = KaziBlockingRunner(store, kazi_run=fake_kazi_run)
+        runner = WorkerBlockingRunner(store, worker_run=fake_worker_run)
         handle = runner.start(_task())
         result = runner.poll(handle)
         assert result.status is RunStatus.TIMED_OUT
         assert result.error_type == "timeout"
 
 
-class TestKaziAsyncRunner:
-    @patch("mr1.kazi_runner.subprocess.Popen")
+class TestWorkerAsyncRunner:
+    @patch("mr1.worker_runner.subprocess.Popen")
     def test_successful_claude_run_parses_correctly(self, mock_popen, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
         proc = MagicMock()
         proc.pid = 321
         proc.poll.return_value = 0
         mock_popen.return_value = proc
-        runner = KaziAsyncRunner(store)
+        runner = WorkerAsyncRunner(store)
 
         handle = runner.start(_task())
         handle.payload["stdout_path"].write_text(
@@ -177,14 +177,14 @@ class TestKaziAsyncRunner:
         assert result.result_payload["data"]["raw"]["result"] == "hello"
         assert result.result_payload["metrics"]["usage"] == {"output_tokens": 4}
 
-    @patch("mr1.kazi_runner.subprocess.Popen")
+    @patch("mr1.worker_runner.subprocess.Popen")
     def test_is_error_true_triggers_failure(self, mock_popen, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
         proc = MagicMock()
         proc.pid = 322
         proc.poll.return_value = 0
         mock_popen.return_value = proc
-        runner = KaziAsyncRunner(store)
+        runner = WorkerAsyncRunner(store)
 
         handle = runner.start(_task())
         handle.payload["stdout_path"].write_text(
@@ -197,10 +197,10 @@ class TestKaziAsyncRunner:
         assert result.status is RunStatus.FAILED
         assert result.error_type == "auth_error"
 
-    @patch("mr1.kazi_runner.subprocess.Popen", side_effect=OSError("No such file or directory: claude"))
+    @patch("mr1.worker_runner.subprocess.Popen", side_effect=OSError("No such file or directory: claude"))
     def test_missing_binary_triggers_deterministic_cli_failure(self, _mock_popen, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
-        runner = KaziAsyncRunner(store)
+        runner = WorkerAsyncRunner(store)
 
         handle = runner.start(_task())
         result = runner.poll(handle)
@@ -210,14 +210,14 @@ class TestKaziAsyncRunner:
         assert result.error_type == "cli_error"
         assert "No such file or directory" in (result.error or "")
 
-    @patch("mr1.kazi_runner.subprocess.Popen")
+    @patch("mr1.worker_runner.subprocess.Popen")
     def test_invalid_json_triggers_parse_error(self, mock_popen, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
         proc = MagicMock()
         proc.pid = 323
         proc.poll.return_value = 0
         mock_popen.return_value = proc
-        runner = KaziAsyncRunner(store)
+        runner = WorkerAsyncRunner(store)
 
         handle = runner.start(_task())
         handle.payload["stdout_path"].write_text("not json", encoding="utf-8")
@@ -227,20 +227,20 @@ class TestKaziAsyncRunner:
         assert result.status is RunStatus.FAILED
         assert result.error_type == "parse_error"
 
-    @patch("mr1.kazi_runner.subprocess.Popen")
+    @patch("mr1.worker_runner.subprocess.Popen")
     def test_timeout_triggers_timeout_error_type(self, mock_popen, tmp_path):
         store = WorkflowStore(root=tmp_path / "workflows")
         proc = MagicMock()
         proc.pid = 324
         proc.poll.return_value = None
         mock_popen.return_value = proc
-        runner = KaziAsyncRunner(store)
+        runner = WorkerAsyncRunner(store)
 
         task = _task()
         task.timeout_s = 1
         handle = runner.start(task)
         handle.started_monotonic = 0.0
-        with patch("mr1.kazi_runner.time.monotonic", return_value=10.0):
+        with patch("mr1.worker_runner.time.monotonic", return_value=10.0):
             result = runner.poll(handle)
 
         assert result is not None

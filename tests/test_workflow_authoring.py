@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler, validate_spec
 from mr1.workflow_authoring import WorkflowAuthoringService
 from mr1.workflow_models import Provenance, TaskStatus
@@ -64,7 +64,7 @@ def _three_step_spec(tmp_path) -> dict:
                 "label": "summarize",
                 "title": "Summarize",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["read_notes", "python_version"],
                 "inputs": [
                     {"name": "notes", "from": "read_notes.result.text"},
@@ -98,7 +98,7 @@ def _complex_spec(tmp_path) -> dict:
                 "label": "summarize",
                 "title": "Summarize",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["read_notes", "python_version"],
                 "inputs": [
                     {"name": "notes", "from": "read_notes.result.text"},
@@ -309,7 +309,7 @@ class TestSubmissionAndRewrite:
                 "label": "final_summary",
                 "title": "Final summary",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["summarize"],
                 "inputs": [{"name": "summary", "from": "summarize.result.text"}],
                 "prompt": "Create a final summary.",

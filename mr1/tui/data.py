@@ -10,8 +10,8 @@ from mr1.event_log import EventLog, SystemEvent
 from mr1.messages import MessageStore
 from mr1.runtime_access import RuntimeAccess
 from mr1.scoped_agents import (
-    PersistentAgent,
-    PersistentAgentStore,
+    AgentRecord,
+    AgentStore,
     is_agent_live as scoped_agent_is_live,
     is_agent_terminal as scoped_agent_is_terminal,
 )
@@ -21,7 +21,7 @@ from mr1.workflow_store import WorkflowStore
 @dataclass(frozen=True)
 class AgentTreeModel:
     root_agent_id: str
-    nodes: dict[str, PersistentAgent]
+    nodes: dict[str, AgentRecord]
     children_by_parent: dict[str, tuple[str, ...]]
     previews: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -41,16 +41,16 @@ class RuntimeSnapshot:
         return sum(1 for agent in self.tree.nodes.values() if agent_is_terminal(agent))
 
 
-def agent_is_terminal(agent: PersistentAgent) -> bool:
+def agent_is_terminal(agent: AgentRecord) -> bool:
     return scoped_agent_is_terminal(agent)
 
 
-def agent_is_live(agent: PersistentAgent) -> bool:
+def agent_is_live(agent: AgentRecord) -> bool:
     return scoped_agent_is_live(agent)
 
 
 def build_agent_tree(
-    agents: list[PersistentAgent],
+    agents: list[AgentRecord],
     *,
     root_agent_id: str,
     previews: Optional[dict[str, dict[str, Any]]] = None,
@@ -131,7 +131,7 @@ def live_focus_agent_id(tree: AgentTreeModel, *, show_dead: bool) -> str:
     if not live_agents:
         return tree.root_agent_id
     live_agents.sort(
-        key=lambda agent: (agent.tree_level, agent.created_at, agent.agent_id),
+        key=lambda agent: (agent.mr_level, agent.created_at, agent.agent_id),
     )
     return live_agents[-1].agent_id
 
@@ -147,7 +147,7 @@ class RuntimeDataSource:
     def __init__(self, *, store_root: Optional[Path] = None):
         self.workflow_store = WorkflowStore(root=store_root)
         runtime_root = self.workflow_store.root.parent
-        self.agent_store = PersistentAgentStore(root=runtime_root / "agents")
+        self.agent_store = AgentStore(root=runtime_root / "agents")
         self.message_store = MessageStore(
             root=runtime_root / "messages",
             scoped_agent_store=self.agent_store,

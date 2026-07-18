@@ -11,7 +11,7 @@ from mr1.messages import MessageStore
 from mr1.mrn_loop import MRnStepRunner
 from mr1.scoped_agents import (
     AgentScopeError,
-    PersistentAgentStore,
+    AgentStore,
     build_assignment_packet,
     render_assignment_mission,
 )
@@ -29,7 +29,7 @@ SPEC = {
             "label": "a",
             "title": "Task A",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do it",
         }
     ],
@@ -109,7 +109,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture

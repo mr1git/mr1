@@ -39,9 +39,9 @@ from mr1.capability_policy import (
     metadata_for_capability,
 )
 from mr1.messages import MessageStore
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -56,14 +56,14 @@ SPEC = {
             "label": "blocked",
             "title": "Needs approval",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "the task an approval unblocks",
         },
         {
             "label": "other",
             "title": "Unrelated work",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "keeps the scheduler writing to this workflow",
         },
     ],
@@ -73,7 +73,7 @@ SPEC = {
 @pytest.fixture
 def runtime(tmp_path):
     store = WorkflowStore(root=tmp_path / "workflows")
-    agents = PersistentAgentStore(root=tmp_path / "agents")
+    agents = AgentStore(root=tmp_path / "agents")
     return tmp_path, store, agents
 
 
@@ -92,7 +92,7 @@ def _block_task(store: WorkflowStore, workflow_id: str, label: str) -> str:
 def _pending_approval(
     root: Path,
     approvals: CapabilityApprovalStore,
-    agents: PersistentAgentStore,
+    agents: AgentStore,
     workflow_id: str,
     task_id: str,
 ) -> str:
@@ -100,7 +100,7 @@ def _pending_approval(
     messages = MessageStore(root=root / "messages", scoped_agent_store=agents)
     request = CapabilityRequest(
         actor_id=agents.root_agent_id,
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         actor_clearance=0.99,
         invocation_mode="workflow",
         capability_name="shell_command",

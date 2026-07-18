@@ -30,7 +30,7 @@ from mr1.autonomy.objectives import KIND_ONCE, PARKED_STATUSES, TERMINAL_STATUSE
 from mr1.autonomy.service import Supervisor, SupervisorConfig
 from mr1.clock import VirtualClock
 from mr1.event_log import EventLog
-from mr1.kazi_runner import MockRunner, RunHandle, RunResult, RunStatus
+from mr1.worker_runner import MockRunner, RunHandle, RunResult, RunStatus
 from mr1.workflow_models import TaskStatus
 
 

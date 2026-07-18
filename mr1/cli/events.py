@@ -15,7 +15,7 @@ from typing import Any, Optional
 from mr1.event_log import SystemEvent
 from mr1.messages import MessageStore
 from mr1.scheduler import WorkflowSpecError
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentStore
 from mr1.workflow_store import WorkflowStore
 
 from mr1.cli.context import (
@@ -135,7 +135,7 @@ def _cmd_events(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
@@ -156,7 +156,7 @@ def _cmd_timeline_list(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     message_store = getattr(args, "message_store")
     events = _visible_timeline_events(
@@ -174,7 +174,7 @@ def _cmd_timeline_recent(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     message_store = getattr(args, "message_store")
     events = _visible_timeline_events(
@@ -192,7 +192,7 @@ def _cmd_timeline_show(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     message_store = getattr(args, "message_store")
     event = _timeline_for(store).get_event(args.event_id)
@@ -215,7 +215,7 @@ def _cmd_timeline_trace(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     message_store = getattr(args, "message_store")
     events = [
@@ -235,7 +235,7 @@ def _cmd_timeline_blocked(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     message_store = getattr(args, "message_store")
     events = [
@@ -255,7 +255,7 @@ def _cmd_timeline_approvals(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     message_store = getattr(args, "message_store")
     events = [
@@ -275,7 +275,7 @@ def _cmd_timeline_agent(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     message_store = getattr(args, "message_store")
     try:
@@ -300,7 +300,7 @@ def _cmd_timeline_workflow(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)

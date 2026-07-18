@@ -15,12 +15,12 @@ import yaml
 from mr1.agents import AgentRuntimeError, parse_agent_json_envelope
 from mr1.brain_tools import governed_brain_tools
 from mr1.core import Dispatcher, PermissionDenied
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.messages import MessageStore, PersistentMessage
 from mr1.mrn_loop import MRnStepRunner
 from mr1.mrn_run import MRnRunPolicy, MRnRunRunner
 from mr1.scheduler import Scheduler
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_authoring import PendingWorkflowDraft, WorkflowAuthoringService
 from mr1.workflow_compiler import WorkflowCompilerClient
 from mr1.workflow_models import Provenance
@@ -191,7 +191,7 @@ class InboxTriageRunner:
         self,
         *,
         workflow_store: Optional[WorkflowStore] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         message_store: Optional[MessageStore] = None,
         reasoner: Optional[ReasonerFn] = None,
         mrn_step_runner: Optional[MRnStepRunner] = None,
@@ -201,7 +201,7 @@ class InboxTriageRunner:
         pending_workflow_state: Optional[Any] = None,
     ):
         self._workflow_store = workflow_store or WorkflowStore()
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+        self._scoped_agents = scoped_agent_store or AgentStore(
             root=self._workflow_store.root.parent / "agents"
         )
         self._message_store = message_store or MessageStore(
@@ -403,7 +403,7 @@ class InboxTriageRunner:
         return {
             "agent_id": agent.agent_id,
             "title": agent.title,
-            "tree_level": agent.tree_level,
+            "mr_level": agent.mr_level,
             "status": agent.status,
             "mission": _compact(agent.mission, limit=240),
             "run_status": agent.run_status,

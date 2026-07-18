@@ -7,7 +7,7 @@ import pytest
 from mr1.capability_policy import CapabilityApprovalRequest, CapabilityApprovalStore
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgent, PersistentAgentStore
+from mr1.scoped_agents import AgentRecord, AgentStore
 from mr1.tui.app import main as tui_main
 from mr1.tui.colors import color_for_agent, depth_color
 from mr1.tui.data import (
@@ -32,18 +32,19 @@ def _agent(
     agent_id: str,
     *,
     title: str,
-    tree_level: int,
+    mr_level: int,
     parent_agent_id: str | None,
     created_at: str,
     status: str = "active",
     run_status: str = "idle",
-) -> PersistentAgent:
-    return PersistentAgent(
+) -> AgentRecord:
+    return AgentRecord(
         agent_id=agent_id,
-        agent_type="mr1" if tree_level == 1 else "mrn",
+        role="orchestrator",
         title=title,
-        tree_level=tree_level,
+        mr_level=mr_level,
         parent_agent_id=parent_agent_id,
+        lifecycle="standing" if mr_level == 1 else "project_scoped",
         created_at=created_at,
         status=status,
         run_status=run_status,
@@ -51,10 +52,10 @@ def _agent(
 
 
 def test_build_agent_tree_keeps_root_and_orders_siblings():
-    root = _agent("ag-root", title="MR1", tree_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
-    b = _agent("ag-b", title="B", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00")
-    a = _agent("ag-a", title="A", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00")
-    a2 = _agent("ag-a2", title="A2", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00")
+    root = _agent("ag-root", title="MR1", mr_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
+    b = _agent("ag-b", title="B", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00")
+    a = _agent("ag-a", title="A", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00")
+    a2 = _agent("ag-a2", title="A2", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00")
 
     tree = build_agent_tree([b, root, a2, a], root_agent_id="ag-root")
 
@@ -63,11 +64,11 @@ def test_build_agent_tree_keeps_root_and_orders_siblings():
 
 
 def test_navigation_left_right_up_down_uses_visible_tree():
-    root = _agent("ag-root", title="MR1", tree_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
-    left = _agent("ag-left", title="Left", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00")
-    middle = _agent("ag-middle", title="Middle", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00")
-    right = _agent("ag-right", title="Right", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:03+00:00")
-    child = _agent("ag-child", title="Child", tree_level=3, parent_agent_id="ag-middle", created_at="2026-05-01T00:00:04+00:00")
+    root = _agent("ag-root", title="MR1", mr_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
+    left = _agent("ag-left", title="Left", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00")
+    middle = _agent("ag-middle", title="Middle", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00")
+    right = _agent("ag-right", title="Right", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:03+00:00")
+    child = _agent("ag-child", title="Child", mr_level=3, parent_agent_id="ag-middle", created_at="2026-05-01T00:00:04+00:00")
     tree = build_agent_tree([root, left, middle, right, child], root_agent_id="ag-root")
 
     assert previous_sibling_agent_id(tree, "ag-middle", show_dead=True) == "ag-left"
@@ -77,11 +78,11 @@ def test_navigation_left_right_up_down_uses_visible_tree():
 
 
 def test_show_dead_hides_dead_leaf_but_preserves_dead_ancestor_for_live_descendant():
-    root = _agent("ag-root", title="MR1", tree_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
+    root = _agent("ag-root", title="MR1", mr_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
     terminated_branch = _agent(
         "ag-dead-parent",
         title="Dead Parent",
-        tree_level=2,
+        mr_level=2,
         parent_agent_id="ag-root",
         created_at="2026-05-01T00:00:01+00:00",
         status="terminated",
@@ -89,7 +90,7 @@ def test_show_dead_hides_dead_leaf_but_preserves_dead_ancestor_for_live_descenda
     live_child = _agent(
         "ag-live-child",
         title="Live Child",
-        tree_level=3,
+        mr_level=3,
         parent_agent_id="ag-dead-parent",
         created_at="2026-05-01T00:00:02+00:00",
         run_status="running",
@@ -97,7 +98,7 @@ def test_show_dead_hides_dead_leaf_but_preserves_dead_ancestor_for_live_descenda
     dead_leaf = _agent(
         "ag-dead-leaf",
         title="Dead Leaf",
-        tree_level=2,
+        mr_level=2,
         parent_agent_id="ag-root",
         created_at="2026-05-01T00:00:03+00:00",
         status="terminated",
@@ -125,19 +126,19 @@ def test_color_mapping_uses_depth_palette_and_dims_terminal_status():
 
 
 def test_live_focus_prefers_deepest_newest_visible_live_agent():
-    root = _agent("ag-root", title="MR1", tree_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
-    older = _agent("ag-older", title="Older", tree_level=3, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00", run_status="running")
-    newer = _agent("ag-newer", title="Newer", tree_level=3, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00", run_status="waiting")
-    done = _agent("ag-done", title="Done", tree_level=4, parent_agent_id="ag-newer", created_at="2026-05-01T00:00:03+00:00", status="terminated")
+    root = _agent("ag-root", title="MR1", mr_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
+    older = _agent("ag-older", title="Older", mr_level=3, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00", run_status="running")
+    newer = _agent("ag-newer", title="Newer", mr_level=3, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00", run_status="waiting")
+    done = _agent("ag-done", title="Done", mr_level=4, parent_agent_id="ag-newer", created_at="2026-05-01T00:00:03+00:00", status="terminated")
     tree = build_agent_tree([root, older, newer, done], root_agent_id="ag-root")
 
     assert live_focus_agent_id(tree, show_dead=True) == "ag-newer"
 
 
 def test_live_count_and_visibility_exclude_legacy_active_terminated_records():
-    root = _agent("ag-root", title="MR1", tree_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
-    live = _agent("ag-live", title="Live", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00", run_status="waiting")
-    legacy = _agent("ag-legacy", title="Legacy", tree_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00", status="active", run_status="terminated")
+    root = _agent("ag-root", title="MR1", mr_level=1, parent_agent_id=None, created_at="2026-05-01T00:00:00+00:00")
+    live = _agent("ag-live", title="Live", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:01+00:00", run_status="waiting")
+    legacy = _agent("ag-legacy", title="Legacy", mr_level=2, parent_agent_id="ag-root", created_at="2026-05-01T00:00:02+00:00", status="active", run_status="terminated")
     tree = build_agent_tree([root, live, legacy], root_agent_id="ag-root")
     snapshot = RuntimeSnapshot(tree=tree, events=(), refreshed_at="2026-05-01T00:00:03+00:00")
 
@@ -148,7 +149,7 @@ def test_live_count_and_visibility_exclude_legacy_active_terminated_records():
 
 def test_runtime_data_source_returns_recent_bounded_events(tmp_path):
     store = WorkflowStore(root=tmp_path / "workflows")
-    agent_store = PersistentAgentStore(root=tmp_path / "agents")
+    agent_store = AgentStore(root=tmp_path / "agents")
     message_store = MessageStore(root=tmp_path / "messages", scoped_agent_store=agent_store)
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "child")
@@ -157,7 +158,7 @@ def test_runtime_data_source_returns_recent_bounded_events(tmp_path):
     event_log.emit(
         event_type="agent_created",
         actor_id=root.agent_id,
-        actor_type=root.agent_type,
+        actor_type=root.actor_category,
         target_id=child.agent_id,
         target_type="agent",
         status="created",
@@ -167,7 +168,7 @@ def test_runtime_data_source_returns_recent_bounded_events(tmp_path):
     event_log.emit(
         event_type="message_sent",
         actor_id=root.agent_id,
-        actor_type=root.agent_type,
+        actor_type=root.actor_category,
         target_id=child.agent_id,
         target_type="agent",
         status="sent",
@@ -177,7 +178,7 @@ def test_runtime_data_source_returns_recent_bounded_events(tmp_path):
     event_log.emit(
         event_type="message_read",
         actor_id=child.agent_id,
-        actor_type=child.agent_type,
+        actor_type=child.actor_category,
         target_id=root.agent_id,
         target_type="agent",
         status="read",
@@ -202,7 +203,7 @@ def test_detail_formatting_for_agent_and_event():
             "run_status": "waiting",
             "lifecycle_status": "active",
             "status_conflict": False,
-            "tree_level": 2,
+            "mr_level": 2,
             "parent_agent_id": "ag-root",
             "security_clearance": 0.8,
             "owned_workflow_ids": ["wf-1"],
@@ -237,7 +238,7 @@ def test_detail_formatting_for_agent_and_event():
     )
 
     assert any("latest_message_ids: msg-1, msg-2" in line for line in agent_lines)
-    assert any("lifecycle: active" in line for line in agent_lines)
+    assert any("activity: active" in line for line in agent_lines)
     assert any("status_conflict: no" in line for line in agent_lines)
     assert any("workflow: wf-1 Demo [running]" in line for line in event_lines)
     assert any("approval: cap_approval_1 read_file [pending]" in line for line in event_lines)

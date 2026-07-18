@@ -220,7 +220,7 @@ def _default_sections() -> dict[str, dict[str, Any]]:
             "agent": {
                 "task_kind": "agent",
                 "required_fields": {
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "string",
                 },
                 "optional_fields": {

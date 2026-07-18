@@ -20,51 +20,51 @@ def logger(tmp_tasks_dir):
 
 class TestLog:
     def test_basic_log(self, logger, tmp_tasks_dir):
-        entry = logger.log("task-001", "kazi", "run", "ok")
+        entry = logger.log("task-001", "worker", "run", "ok")
         assert entry["task_id"] == "task-001"
-        assert entry["agent_type"] == "kazi"
+        assert entry["agent_type"] == "worker"
         assert entry["action"] == "run"
         assert entry["result"] == "ok"
         assert "timestamp" in entry
 
     def test_log_with_metadata(self, logger):
-        entry = logger.log("task-001", "kazi", "run", "ok", metadata={"pid": 123})
+        entry = logger.log("task-001", "worker", "run", "ok", metadata={"pid": 123})
         assert entry["metadata"]["pid"] == 123
 
     def test_log_creates_file(self, logger, tmp_tasks_dir):
-        logger.log("task-001", "kazi", "run", "ok")
-        log_file = Path(tmp_tasks_dir) / "task-001" / "logs" / "kazi.jsonl"
+        logger.log("task-001", "worker", "run", "ok")
+        log_file = Path(tmp_tasks_dir) / "task-001" / "logs" / "worker.jsonl"
         assert log_file.exists()
         content = log_file.read_text()
         parsed = json.loads(content.strip())
         assert parsed["action"] == "run"
 
     def test_multiple_entries_append(self, logger, tmp_tasks_dir):
-        logger.log("task-001", "kazi", "start", "ok")
-        logger.log("task-001", "kazi", "end", "ok")
-        log_file = Path(tmp_tasks_dir) / "task-001" / "logs" / "kazi.jsonl"
+        logger.log("task-001", "worker", "start", "ok")
+        logger.log("task-001", "worker", "end", "ok")
+        log_file = Path(tmp_tasks_dir) / "task-001" / "logs" / "worker.jsonl"
         lines = [l for l in log_file.read_text().strip().split("\n") if l]
         assert len(lines) == 2
 
 
 class TestConvenienceMethods:
     def test_log_spawn(self, logger):
-        entry = logger.log_spawn("task-001", "kazi", 123, ["claude", "-p", "hi"])
+        entry = logger.log_spawn("task-001", "worker", 123, ["claude", "-p", "hi"])
         assert entry["action"] == "spawn"
         assert entry["metadata"]["pid"] == 123
 
     def test_log_kill(self, logger):
-        entry = logger.log_kill("task-001", "kazi", 123, "user_cancel")
+        entry = logger.log_kill("task-001", "worker", 123, "user_cancel")
         assert entry["action"] == "kill"
 
     def test_log_denied(self, logger):
-        entry = logger.log_denied("task-001", "kazi", "flag not allowed")
+        entry = logger.log_denied("task-001", "worker", "flag not allowed")
         assert entry["result"] == "denied"
 
     def test_log_exit(self, logger):
-        entry = logger.log_exit("task-001", "kazi", 123, 0)
+        entry = logger.log_exit("task-001", "worker", 123, 0)
         assert entry["result"] == "ok"
-        entry = logger.log_exit("task-001", "kazi", 123, 1)
+        entry = logger.log_exit("task-001", "worker", 123, 1)
         assert entry["result"] == "error"
 
 
@@ -73,14 +73,14 @@ class TestReadLogs:
         assert logger.read_logs("nonexistent") == []
 
     def test_read_logs_roundtrip(self, logger):
-        logger.log("task-001", "kazi", "start", "ok")
-        logger.log("task-001", "kazi", "end", "ok")
-        entries = logger.read_logs("task-001", "kazi")
+        logger.log("task-001", "worker", "start", "ok")
+        logger.log("task-001", "worker", "end", "ok")
+        entries = logger.read_logs("task-001", "worker")
         assert len(entries) == 2
         assert entries[0]["action"] == "start"
 
     def test_read_all_agents(self, logger):
-        logger.log("task-001", "kazi", "run", "ok")
-        logger.log("task-001", "kami", "delegate", "ok")
+        logger.log("task-001", "worker", "run", "ok")
+        logger.log("task-001", "orchestrator", "delegate", "ok")
         entries = logger.read_logs("task-001")
         assert len(entries) == 2

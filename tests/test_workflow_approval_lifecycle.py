@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 
 from mr1.capability_policy import CapabilityApprovalDecision
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Provenance, TaskStatus, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -17,7 +17,7 @@ def store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def scheduler(store, agent_store, runner, tmp_path):
     sched.shutdown()
 
 
-def _scoped_child(agent_store: PersistentAgentStore, tmp_path, *, clearance: float = 0.1):
+def _scoped_child(agent_store: AgentStore, tmp_path, *, clearance: float = 0.1):
     root = agent_store.ensure_root_agent()
     child = agent_store.create_child_agent(root.agent_id, "research", security_clearance=clearance)
     child.scope_roots = [str(tmp_path)]
@@ -176,7 +176,7 @@ def test_approval_resume_is_not_clobbered_by_stale_scheduler_write(scheduler, st
                     "label": "agent",
                     "title": "Agent",
                     "task_kind": "agent",
-                    "agent_type": "kazi",
+                    "agent_type": "worker",
                     "prompt": "keep running",
                 },
             ],

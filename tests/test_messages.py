@@ -1,4 +1,4 @@
-"""Tests for persistent agent messaging and inbox commands."""
+"""Tests for agent messaging and inbox commands."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 
 from mr1 import workflow_cli
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.messages import MessageStore
 from mr1.mr1 import MR1, StateManager
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentStore
 from mr1.workflow_store import WorkflowStore
 
 
@@ -21,7 +21,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 @pytest.fixture
@@ -127,8 +127,8 @@ def test_mrn_send_permissions_follow_scope(agent_store, message_store):
     assert message_store.can_agent_send_message(child.agent_id, parent.agent_id) is True
     assert message_store.can_agent_send_message(parent.agent_id, child.agent_id) is True
     assert message_store.can_agent_send_message(child.agent_id, sibling.agent_id) is False
-    assert message_store.can_agent_send_message(child.agent_id, "kazi") is False
-    assert message_store.can_agent_send_message("kazi", child.agent_id) is False
+    assert message_store.can_agent_send_message(child.agent_id, "worker") is False
+    assert message_store.can_agent_send_message("worker", child.agent_id) is False
 
 
 def test_cli_inbox_message_read_archive_and_send(workflow_store, agent_store, message_store, capsys, tmp_path):

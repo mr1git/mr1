@@ -30,7 +30,7 @@ from mr1.scheduler import (
     submit_spec_to_disk,
     trigger_watcher_on_disk,
 )
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentStore
 from mr1.workflow_compiler import WorkflowCompilerClient, WorkflowCompilerFailure
 from mr1.workflow_models import (
     Provenance,
@@ -316,7 +316,7 @@ def _cmd_submit(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     spec, error = _load_json_file(args.path)
     if error:
@@ -342,7 +342,7 @@ def _cmd_compile_workflow(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     request_text, error = _load_text_file(args.path)
     if error:
@@ -399,7 +399,7 @@ def _cmd_rerun(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
@@ -419,7 +419,7 @@ def _cmd_cancel_task(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     visible = _visible_workflows(store, scoped_agents, caller_agent_id)
     wf, task = _find_workflow_for_task(store, args.task_id, workflows=visible)
@@ -438,7 +438,7 @@ def _cmd_cancel_workflow(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
@@ -457,7 +457,7 @@ def _cmd_append_workflow(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     spec, error = _load_json_file(args.path)
     if error:
@@ -481,7 +481,7 @@ def _cmd_insert_workflow(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     spec, error = _load_json_file(args.path)
     if error:
@@ -506,7 +506,7 @@ def _cmd_replace_workflow(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     spec, error = _load_json_file(args.path)
     if error:
@@ -530,7 +530,7 @@ def _cmd_replace_workflow(
     return 0
 
 
-def _tick_once_if_unowned(store: WorkflowStore, scoped_agents: PersistentAgentStore) -> None:
+def _tick_once_if_unowned(store: WorkflowStore, scoped_agents: AgentStore) -> None:
     """
     Advance the store once — but only if no other process owns execution (B8).
 
@@ -567,7 +567,7 @@ def _cmd_workflows(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     print(_format_workflows_table(_visible_workflows(store, scoped_agents, caller_agent_id)))
     return 0
@@ -576,7 +576,7 @@ def _cmd_workflow(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         wf = _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
@@ -590,7 +590,7 @@ def _cmd_task(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     wf, task = _find_workflow_for_task(
         store,
@@ -607,7 +607,7 @@ def _cmd_jobs(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     print(_format_jobs(_visible_workflows(store, scoped_agents, caller_agent_id)))
     return 0
@@ -616,7 +616,7 @@ def _cmd_watchers(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     print(_format_watchers(_visible_workflows(store, scoped_agents, caller_agent_id)))
     return 0
@@ -625,7 +625,7 @@ def _cmd_schema(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, caller_agent_id, scoped_agents
     try:
@@ -643,7 +643,7 @@ def _cmd_result(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     wf, task = _find_workflow_for_task(
         store,
@@ -660,7 +660,7 @@ def _cmd_inputs(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     wf, task = _find_workflow_for_task(
         store,
@@ -677,7 +677,7 @@ def _cmd_artifacts(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         wf = _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)
@@ -691,7 +691,7 @@ def _cmd_trigger(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         _load_scoped_workflow(store, args.workflow_id, scoped_agents, caller_agent_id)

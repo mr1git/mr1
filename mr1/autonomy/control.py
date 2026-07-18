@@ -162,7 +162,7 @@ class ControlPlane:
             self._event_log.emit(
                 event_type="control_mode_changed",
                 actor_id=state.requested_by or "operator",
-                actor_type="mr1",
+                actor_type="root_orchestrator",
                 target_id="supervisor",
                 target_type="supervisor",
                 status=state.mode,

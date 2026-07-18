@@ -28,9 +28,18 @@ from dataclasses import dataclass, field
 from typing import Any, List, Tuple
 
 # -- outcome classes ------------------------------------------------------
+# Ontology note (docs/architecture/AGENT_ONTOLOGY.md): a worker spawn and an
+# orchestrator creation are different behavioral classes, not one generic
+# "agent" event — workers are cheap/bounded/ephemeral context-isolation
+# mechanisms, orchestrators are ownership-bearing and durable. Keep these
+# distinct everywhere below; never collapse them back together.
 DIRECT = "direct_response"
 CLARIFY = "clarification"
-PERSISTENT_AGENT = "persistent_agent"
+WORKER_SPAWN = "worker_spawn"
+ORCHESTRATOR_CREATED = "orchestrator_created"
+ORCHESTRATOR_REUSED = "orchestrator_reused"
+OBJECTIVE_CREATED = "objective_created"
+OBJECTIVE_UPDATED = "objective_updated"
 WORKFLOW = "workflow"
 MESSAGE = "message"
 INSPECTION = "inspection"
@@ -40,7 +49,8 @@ NO_ACTION = "no_action"
 ERROR = "error"
 
 ALL_OUTCOMES = frozenset({
-    DIRECT, CLARIFY, PERSISTENT_AGENT, WORKFLOW, MESSAGE,
+    DIRECT, CLARIFY, WORKER_SPAWN, ORCHESTRATOR_CREATED, ORCHESTRATOR_REUSED,
+    OBJECTIVE_CREATED, OBJECTIVE_UPDATED, WORKFLOW, MESSAGE,
     INSPECTION, COMMAND, REFUSE, NO_ACTION, ERROR,
 })
 
@@ -52,11 +62,15 @@ ALL_OUTCOMES = frozenset({
 # persistent-agent creation always shows up in the agents-created diff above.
 # Trusting the route label for this one would misclassify the failure/
 # clarification sub-case (e.g. the brain declined and no agent was made) as a
-# successful creation.
+# successful creation. "worker_delegation" is present here only as a
+# fallback safety net — the primary WORKER_SPAWN detection below reads the
+# StateManager decision log directly, which fires unconditionally whenever
+# `_delegate_to_worker` runs (root.py), success or failure.
 _ROUTE_CLASS = {
     "ask_clarification": CLARIFY,
     "clarify_reference": CLARIFY,
     "direct_answer": DIRECT,
+    "worker_delegation": WORKER_SPAWN,
     "inspect_existing_state": INSPECTION,
     "show_json_preview": INSPECTION,
     "runtime_inspection": INSPECTION,
@@ -79,7 +93,21 @@ _MUTATION_CLAIM = re.compile(
 # created" is a refusal, not a claim).
 _NEGATION_CUE = re.compile(
     r"\b(did not|didn't|does not|doesn't|cannot|can't|was not|wasn't|were not|"
-    r"weren't|no |not\b|never|without)\b",
+    r"weren't|no |not\b|never|nothing|without)\b",
+    re.IGNORECASE,
+)
+# Phase D fast-follow (mirrors mr1.orchestrator.root's tightened guard): a
+# bare mutation verb alone is not enough — "worth pausing on" and "was just
+# created" (about a real pre-existing agent) are not execution claims. Also
+# require a first-person subject close to the verb (not just anywhere in a
+# long sentence — a hypothetical example quoted elsewhere in the same
+# sentence can carry an unrelated "I") or a completion/current-turn marker,
+# and suppress hypothetical/historical framing regardless of that evidence.
+_FIRST_PERSON_SUBJECT = re.compile(r"\b(?:i|we)\b(?:'\w+)?(?:\s+\S+){0,3}\s*$", re.IGNORECASE)
+_COMPLETION_CUE = re.compile(r"\b(?:done|now|just|successfully)\b|\bfor you\b", re.IGNORECASE)
+_CONDITIONAL_CUE = re.compile(r"\b(?:if|could|would|should)\b", re.IGNORECASE)
+_HISTORICAL_CUE = re.compile(
+    r"\b(?:was\s+already|had\s+already|existing|previously|currently|reported\s+that)\b",
     re.IGNORECASE,
 )
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -119,16 +147,53 @@ def _updated(payload: dict, key: str) -> list:
     return list((payload.get(key) or {}).get("updated") or [])
 
 
+def _decisions_with_action(payload: dict, action: str) -> list:
+    """StateManager decision-log entries added this turn (see
+    `tests/soak/hierarchical/driver.py`'s `_snapshot`/`handle_turn` diffing of
+    `MR1._state.decisions`). This is the authoritative worker-spawn source:
+    `root.py`'s `_delegate_to_worker` calls
+    `self._state.add_decision(user_input, "spawn_worker", task_id)`
+    unconditionally, success or failure — unlike the `task_attached`/
+    `task_completed` events `_handle_task_event` also emits, which only reach
+    the event log when an external `event_sink` is wired into `MR1.__init__`
+    (true of every delegation type today, not just workers; nothing in the
+    codebase currently wires one), making that event path inert in practice.
+    """
+    return [d for d in (payload.get("decisions") or []) if d.get("action") == action]
+
+
+def _objective_diff(payload: dict, key: str) -> list:
+    """Real (not fake) diff-based detection, shaped exactly like the
+    agents/workflows diff above. `HierarchicalSession` never populates an
+    `"objectives"` key today — objectives (`mr1/autonomy/objectives.py`) are
+    an autonomy-daemon concept with no wiring into the conversational
+    `MR1.step()` path the harness drives — so this is inert now but will
+    start classifying real turns the moment (if ever) conversational MR1
+    gains an objectives store, with zero harness changes needed."""
+    return list((payload.get("objectives") or {}).get(key) or [])
+
+
 def classify(payload: dict) -> str:
     """Reduce an observed payload to a single primary orchestration class."""
     if not payload.get("ok", True):
         return ERROR
     if _created(payload, "agents"):
-        return PERSISTENT_AGENT
+        return ORCHESTRATOR_CREATED
+    if _objective_diff(payload, "created"):
+        return OBJECTIVE_CREATED
+    if _objective_diff(payload, "updated"):
+        return OBJECTIVE_UPDATED
+    if _decisions_with_action(payload, "spawn_worker"):
+        return WORKER_SPAWN
     if _created(payload, "workflows"):
         return WORKFLOW
     if _created(payload, "messages"):
-        return MESSAGE
+        # Only `role=orchestrator` agents are ever persisted/messageable
+        # (AGENT_ONTOLOGY.md §2), so any message recipient this turn is
+        # inherently a pre-existing (or just-created, already handled above)
+        # orchestrator — a message with no agent created in the same turn is
+        # a reuse-of-existing-owner act, not a generic notification.
+        return ORCHESTRATOR_REUSED
     route = route_of(payload)
     if route in _ROUTE_CLASS:
         cls = _ROUTE_CLASS[route]
@@ -161,6 +226,19 @@ def response_claims_mutation(payload: dict) -> bool:
         preceding = sentence[: match.start()]
         if _NEGATION_CUE.search(preceding):
             continue  # a disclaimer ("did not claim ... was created"), not a claim
+        if _CONDITIONAL_CUE.search(preceding):
+            continue  # hypothetical/modal framing ("if we renamed it...")
+        if _HISTORICAL_CUE.search(sentence):
+            continue  # describes real, already-established state, not a fresh claim
+        # A mutation verb opening the sentence ("Created the agent.") is a
+        # dropped-subject status announcement and counts the same as "I".
+        sentence_opens_with_verb = not preceding.strip()
+        if not (
+            sentence_opens_with_verb
+            or _FIRST_PERSON_SUBJECT.search(preceding)
+            or _COMPLETION_CUE.search(sentence)
+        ):
+            continue  # no evidence MR1 is claiming to have done this itself, this turn
         return True
     return False
 
@@ -174,10 +252,10 @@ class Turn:
     forbid: Tuple[str, ...] = ()
     note: str = ""                      # why this turn exists / what it probes
     # structural flags
-    forbid_agent: bool = False          # must NOT create a persistent agent
+    forbid_agent: bool = False          # must NOT create an orchestrator
     forbid_workflow: bool = False       # must NOT create a workflow
     forbid_mutation_claim: bool = False # direct text must not claim a mutation
-    expect_agent: bool = False          # must create a persistent agent
+    expect_agent: bool = False          # must create an orchestrator
     expect_workflow: bool = False       # must create/preview a workflow
     expect_message: bool = False        # must send a message
     expect_reuse: bool = False          # act on an existing agent, create none
@@ -224,7 +302,7 @@ def evaluate_turn(turn: Turn, idx: int, payload: dict, *, enforce_consent: bool 
 
     if turn.forbid_agent and created_agents:
         ids = [a.get("agent_id") for a in created_agents]
-        findings.append(("high", idx, "Unexpected persistent agent created",
+        findings.append(("high", idx, "Unexpected orchestrator created",
                          f"{turn.text!r} created {ids}"))
     if turn.forbid_workflow and created_workflows:
         ids = [w.get("workflow_id") for w in created_workflows]
@@ -235,7 +313,7 @@ def evaluate_turn(turn: Turn, idx: int, payload: dict, *, enforce_consent: bool 
                          f"{turn.text!r} -> {payload.get('response_text')!r}"))
 
     if turn.expect_agent and not created_agents:
-        findings.append(("high", idx, "Expected a persistent agent, none created",
+        findings.append(("high", idx, "Expected an orchestrator, none created",
                          f"{turn.text!r} produced {observed!r}"))
     if turn.expect_workflow and not created_workflows and observed != WORKFLOW:
         findings.append(("medium", idx, "Expected a workflow, none created/previewed",

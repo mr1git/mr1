@@ -50,7 +50,7 @@ def _task(
         label=task_id,
         title=task_id,
         task_kind="agent",
-        agent_type="kazi",
+        agent_type="worker",
         prompt="do the thing",
         status=status,
         last_error_type=error_type,

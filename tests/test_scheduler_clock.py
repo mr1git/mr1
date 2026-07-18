@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from mr1.clock import VirtualClock
-from mr1.kazi_runner import MockRunner, RunResult, RunStatus
+from mr1.worker_runner import MockRunner, RunResult, RunStatus
 from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore

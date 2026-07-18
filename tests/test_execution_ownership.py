@@ -28,7 +28,7 @@ from mr1.autonomy.ownership import (
     execution_owner,
     read_owner_file,
 )
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.scheduler import Scheduler
 from mr1.workflow_models import Provenance, TaskStatus
 from mr1.workflow_store import WorkflowStore
@@ -55,7 +55,7 @@ SPEC = {
             "label": "only",
             "title": "The one task",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do the thing exactly once",
         }
     ],
@@ -283,7 +283,7 @@ CHILD = textwrap.dedent(
     from pathlib import Path
 
     from mr1.autonomy.ownership import ExecutionOwnership
-    from mr1.kazi_runner import MockRunner
+    from mr1.worker_runner import MockRunner
     from mr1.scheduler import Scheduler
     from mr1.workflow_store import WorkflowStore
 

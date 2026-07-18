@@ -34,7 +34,7 @@ def task_with_comms(tmp_path):
 
     # JSON comm.
     comm_data = {
-        "agent_type": "kazi",
+        "agent_type": "worker",
         "action": "file_read",
         "result": "success",
         "output": "File contents read.",
@@ -50,9 +50,9 @@ def task_with_comms(tmp_path):
 
 class TestFlattenJsonEntry:
     def test_extracts_known_fields(self):
-        data = {"agent_type": "kazi", "action": "read", "result": "ok"}
+        data = {"agent_type": "worker", "action": "read", "result": "ok"}
         text = _flatten_json_entry(data)
-        assert "agent_type: kazi" in text
+        assert "agent_type: worker" in text
         assert "action: read" in text
 
     def test_includes_metadata(self):
@@ -77,7 +77,7 @@ class TestReadComms:
         entries = _read_comms(comms_dir)
         json_entry = [e for e in entries if e["filename"] == "002-read.json"][0]
         assert "data" in json_entry
-        assert json_entry["data"]["agent_type"] == "kazi"
+        assert json_entry["data"]["agent_type"] == "worker"
 
     def test_empty_dir(self, tmp_path):
         empty_dir = tmp_path / "empty_comms"

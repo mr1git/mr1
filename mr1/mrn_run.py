@@ -13,7 +13,7 @@ from mr1.messages import MessageStore
 from mr1.mrn_loop import ALLOWED_MRN_ACTIONS, MRnStepResult, MRnStepRunner
 from mr1.scoped_agents import (
     AgentScopeError,
-    PersistentAgentStore,
+    AgentStore,
     is_agent_terminal,
     new_run_id,
 )
@@ -124,13 +124,13 @@ class MRnRunRunner:
         self,
         *,
         workflow_store: Optional[WorkflowStore] = None,
-        scoped_agent_store: Optional[PersistentAgentStore] = None,
+        scoped_agent_store: Optional[AgentStore] = None,
         message_store: Optional[MessageStore] = None,
         step_runner: Optional[MRnStepRunner] = None,
         workflow_compiler: Optional[Any] = None,
     ):
         self._workflow_store = workflow_store or WorkflowStore()
-        self._scoped_agents = scoped_agent_store or PersistentAgentStore(
+        self._scoped_agents = scoped_agent_store or AgentStore(
             root=self._workflow_store.root.parent / "agents"
         )
         self._message_store = message_store or MessageStore(

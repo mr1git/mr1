@@ -9,7 +9,7 @@ import pytest
 
 from mr1 import workflow_cli
 from mr1.dataflow import ResolvedTaskInput, TaskOutput
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.scheduler import submit_spec_to_disk
 from mr1.workflow_models import Provenance
 from mr1.workflow_store import WorkflowStore
@@ -22,7 +22,7 @@ WORKFLOW_SPEC = {
             "label": "a",
             "title": "Task A",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "do it",
         }
     ],
@@ -49,12 +49,12 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 def _submit(
     workflow_store: WorkflowStore,
-    agent_store: PersistentAgentStore,
+    agent_store: AgentStore,
     owner_agent_id: str,
     spec: dict | None = None,
 ) -> str:
@@ -151,7 +151,7 @@ def test_workflow_commands_deny_out_of_scope_workflows(workflow_store, agent_sto
             "label": "b",
             "title": "Task B",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "next",
             "depends_on": ["a"],
         }]
@@ -161,7 +161,7 @@ def test_workflow_commands_deny_out_of_scope_workflows(workflow_store, agent_sto
             "label": "between",
             "title": "Between",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "between",
         }]
     })
@@ -170,7 +170,7 @@ def test_workflow_commands_deny_out_of_scope_workflows(workflow_store, agent_sto
             "label": "a",
             "title": "Task A replaced",
             "task_kind": "agent",
-            "agent_type": "kazi",
+            "agent_type": "worker",
             "prompt": "replacement",
         }]
     })

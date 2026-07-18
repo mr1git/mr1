@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from mr1 import workflow_cli
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.mr1 import MR1, StateManager
 from mr1.scheduler import Scheduler, WorkflowSpecError, validate_spec
 from mr1.workflow_models import Provenance, TaskStatus
@@ -24,7 +24,7 @@ def _watcher_spec(task: dict, downstream_prompt: str = "after wait") -> dict:
                 "label": "after",
                 "title": "After",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": [task["label"]],
                 "prompt": downstream_prompt,
             },
@@ -286,7 +286,7 @@ class TestWatcherScheduler:
                         "label": "after",
                         "title": "After",
                         "task_kind": "agent",
-                        "agent_type": "kazi",
+                        "agent_type": "worker",
                         "depends_on": ["wait_file"],
                         "inputs": [{"name": "watch_msg", "from": "wait_file.result.text"}],
                         "prompt": "Use the watcher message.",
@@ -366,7 +366,7 @@ class TestWatcherValidation:
                 "label": "a",
                 "title": "A",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "prompt": "x",
             }],
         })

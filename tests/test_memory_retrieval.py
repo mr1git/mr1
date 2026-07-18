@@ -180,7 +180,7 @@ def _seed_events(root):
     log.emit(
         event_type="workflow_created",
         actor_id="cli",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="wf-1",
         target_type="workflow",
         status="pending",
@@ -192,7 +192,7 @@ def _seed_events(root):
     log.emit(
         event_type="workflow_completed",
         actor_id="scheduler",
-        actor_type="mr1",
+        actor_type="root_orchestrator",
         target_id="wf-1",
         target_type="workflow",
         status="succeeded",
@@ -204,7 +204,7 @@ def _seed_events(root):
     log.emit(
         event_type="capability_requested",
         actor_id="ag-1",
-        actor_type="mrn",
+        actor_type="orchestrator",
         target_id="read_file",
         target_type="capability",
         status="requested",

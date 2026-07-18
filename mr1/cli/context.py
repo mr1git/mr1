@@ -30,7 +30,7 @@ from mr1.runtime_access import (
     visible_workflows as _visible_workflows_shared,
 )
 from mr1.scheduler import WorkflowSpecError
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentStore
 from mr1.workflow_models import Task, Workflow
 from mr1.workflow_store import WorkflowStore
 
@@ -50,7 +50,7 @@ def _find_workflow_for_task(
 
 def _visible_workflows(
     store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> list[Workflow]:
     return _visible_workflows_shared(
@@ -63,7 +63,7 @@ def _visible_workflows(
 def _load_scoped_workflow(
     store: WorkflowStore,
     workflow_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> Workflow:
     return _load_scoped_workflow_shared(
@@ -128,7 +128,7 @@ def _load_memory_graph(store: WorkflowStore) -> tuple[MemoryGraph, int]:
 
 def _visible_approvals(
     approval_store: CapabilityApprovalStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> list[CapabilityApprovalRequest]:
     return _visible_approvals_shared(
@@ -141,7 +141,7 @@ def _visible_approvals(
 def _resolve_mailbox_agent_id(
     target_agent_id: Optional[str],
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> str:
     resolved = target_agent_id or caller_agent_id
     if scoped_agents.load_agent(resolved) is None:
@@ -169,7 +169,7 @@ def _event_visible(
     event: SystemEvent,
     *,
     store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     message_store: MessageStore,
     caller_agent_id: str,
 ) -> bool:
@@ -207,7 +207,7 @@ def _event_visible(
 
 def _visible_timeline_events(
     store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     message_store: MessageStore,
     caller_agent_id: str,
 ) -> list[SystemEvent]:
@@ -224,7 +224,7 @@ def _visible_timeline_events(
 def _require_visible_approval(
     approval_store: CapabilityApprovalStore,
     approval_request_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
 ) -> CapabilityApprovalRequest:
     return _require_visible_approval_shared(
@@ -237,7 +237,7 @@ def _require_visible_approval(
 
 def _runtime_access_for(
     store: WorkflowStore,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     message_store: MessageStore,
     *,
     approval_store: Optional[CapabilityApprovalStore] = None,
@@ -251,7 +251,7 @@ def _runtime_access_for(
     )
 
 
-def _audit_entries_for_agent(agent_store: PersistentAgentStore, agent_id: str) -> list[dict[str, Any]]:
+def _audit_entries_for_agent(agent_store: AgentStore, agent_id: str) -> list[dict[str, Any]]:
     path = agent_store.capability_call_log_path(agent_id)
     if not path.exists():
         return []
@@ -269,7 +269,7 @@ def _audit_entries_for_agent(agent_store: PersistentAgentStore, agent_id: str) -
 
 
 def _visible_audit_entries(
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
     target_agent_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
@@ -287,7 +287,7 @@ def _visible_audit_entries(
 
 
 def _find_visible_audit_entry(
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
     caller_agent_id: str,
     audit_id: str,
 ) -> dict[str, Any]:

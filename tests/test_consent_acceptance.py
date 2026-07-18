@@ -21,10 +21,10 @@ from mr1.autonomy.consent import ConsentGrantStore
 from mr1.capability_policy import CapabilityApprovalStore
 from mr1.clock import VirtualClock
 from mr1.event_log import EventLog
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.messages import MessageStore
 from mr1.scheduler import Scheduler
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.workflow_models import Provenance, TaskStatus, WorkflowStatus
 from mr1.workflow_store import WorkflowStore
 
@@ -40,7 +40,7 @@ class _Fixture:
         self.runtime_root = tmp_path / "runtime"
         self.clock = VirtualClock(start=datetime(2026, 1, 1, tzinfo=timezone.utc))
         self.store = WorkflowStore(root=self.runtime_root / "workflows")
-        self.agents = PersistentAgentStore(root=self.runtime_root / "agents")
+        self.agents = AgentStore(root=self.runtime_root / "agents")
         self.messages = MessageStore(
             root=self.runtime_root / "messages",
             scoped_agent_store=self.agents,

@@ -1,8 +1,13 @@
 """
-Persistent scoped-agent registry and workflow access helpers.
+Scoped agent registry and workflow access helpers.
+
+Every record here has three independent properties: `role` (worker |
+orchestrator), `mr_level` (depth in the MR1 hierarchy; MR1 itself is
+mr_level=1), and `lifecycle` (ephemeral | task_scoped | project_scoped |
+standing). See docs/architecture/AGENT_ONTOLOGY.md for the full model.
 
 This module is separate from `mr1.agents`, which continues to describe
-static runtime worker profiles such as `kazi`.
+static runtime worker profiles such as `worker`.
 """
 
 from __future__ import annotations
@@ -108,19 +113,26 @@ def derive_lifecycle_state(
     }
 
 
-def derive_agent_lifecycle(agent: "PersistentAgent") -> dict[str, Any]:
+# NOTE: `derive_lifecycle_state`'s "lifecycle_status" (active/idle/working/
+# terminated, derived from `status` + `run_status`) is a *runtime activity*
+# concept, distinct from `AgentRecord.lifecycle` (ephemeral/task_scoped/
+# project_scoped/standing), which is a *design-time expected duration*
+# property. The two are orthogonal; see docs/architecture/AGENT_ONTOLOGY.md.
+
+
+def derive_agent_lifecycle(agent: "AgentRecord") -> dict[str, Any]:
     return derive_lifecycle_state(agent.status, agent.run_status)
 
 
-def is_agent_terminal(agent: "PersistentAgent") -> bool:
+def is_agent_terminal(agent: "AgentRecord") -> bool:
     return bool(derive_agent_lifecycle(agent)["is_terminal"])
 
 
-def is_agent_live(agent: "PersistentAgent") -> bool:
+def is_agent_live(agent: "AgentRecord") -> bool:
     return bool(derive_agent_lifecycle(agent)["is_live"])
 
 
-def agent_display_status(agent: "PersistentAgent") -> str:
+def agent_display_status(agent: "AgentRecord") -> str:
     return str(derive_agent_lifecycle(agent)["lifecycle_status"])
 
 
@@ -207,13 +219,13 @@ def _normalize_assignment_context(context: Any) -> dict[str, Any]:
 
 
 def build_assignment_packet(
-    parent_agent: "PersistentAgent",
+    parent_agent: "AgentRecord",
     child_title: str,
     user_input: str,
     context: Any,
 ) -> dict[str, Any]:
     normalized_context = _normalize_assignment_context(context)
-    normalized_title = _clean_text(child_title) or "MRn"
+    normalized_title = _clean_text(child_title) or "Unnamed agent"
     full_parent_request = user_input if isinstance(user_input, str) else ""
     delegated_subtask = (
         normalized_context["delegated_subtask"]
@@ -269,8 +281,8 @@ def build_assignment_packet(
     )
     return {
         "parent_agent_id": parent_agent.agent_id,
-        "parent_level": int(parent_agent.tree_level),
-        "child_level": int(parent_agent.tree_level) + 1,
+        "parent_level": int(parent_agent.mr_level),
+        "child_level": int(parent_agent.mr_level) + 1,
         "assigned_clearance": assigned_clearance,
         "child_title": normalized_title,
         "full_parent_request": full_parent_request,
@@ -298,7 +310,7 @@ def build_assignment_packet(
 def render_assignment_mission(assignment_packet: Optional[dict[str, Any]]) -> Optional[str]:
     if not isinstance(assignment_packet, dict):
         return None
-    child_title = _clean_text(assignment_packet.get("child_title")) or "MRn"
+    child_title = _clean_text(assignment_packet.get("child_title")) or "Unnamed agent"
     mission = _clean_text(assignment_packet.get("mission")) or "Own the delegated assignment."
     responsibility = _clean_text(assignment_packet.get("responsibility")) or "-"
     delegated_subtask = _clean_text(assignment_packet.get("delegated_subtask")) or "-"
@@ -311,7 +323,7 @@ def render_assignment_mission(assignment_packet: Optional[dict[str, Any]]) -> Op
     constraints = _normalize_string_list(assignment_packet.get("constraints"))
     success_criteria = _normalize_string_list(assignment_packet.get("success_criteria"))
     lines = [
-        f"You are a persistent {child_title}-style child agent.",
+        f"You are {child_title}, an orchestrator agent owning a scoped assignment.",
         f"Mission: {mission}",
         f"Responsibility: {responsibility}",
         f"Delegated subtask: {delegated_subtask}",
@@ -334,13 +346,32 @@ def render_assignment_mission(assignment_packet: Optional[dict[str, Any]]) -> Op
     return "\n".join(lines)
 
 
+ALLOWED_ROLES = frozenset({"worker", "orchestrator"})
+ALLOWED_LIFECYCLES = frozenset({"ephemeral", "task_scoped", "project_scoped", "standing"})
+
+# Legacy `agent_type` values, retired as a category name but still needed to
+# interpret pre-migration JSON. See AgentRecord.from_dict / migrate_legacy_agent_dict.
+_LEGACY_AGENT_TYPE_TO_ROLE = {"mr1": "orchestrator", "mrn": "orchestrator", "kazi": "worker"}
+
+
+def actor_category(role: str, mr_level: int) -> str:
+    """Collapse (role, mr_level) into the 3-tier category capability_policy prices
+    clearance against. MR1 (mr_level==1) is strictly more trusted than any other
+    orchestrator at a deeper level — that distinction predates this refactor and is
+    preserved here, not reintroduced as a new behavior."""
+    if role == "orchestrator" and mr_level == 1:
+        return "root_orchestrator"
+    return role
+
+
 @dataclass
-class PersistentAgent:
+class AgentRecord:
     agent_id: str
-    agent_type: str
+    role: str
     title: str
-    tree_level: int
+    mr_level: int
     parent_agent_id: Optional[str]
+    lifecycle: str = "project_scoped"
     status: str = "active"
     created_at: str = field(default_factory=_now_iso)
     owned_workflow_ids: list[str] = field(default_factory=list)
@@ -361,14 +392,29 @@ class PersistentAgent:
     def __post_init__(self) -> None:
         if not 0.0 <= float(self.security_clearance) <= 1.0:
             raise ValueError("security_clearance must be between 0.0 and 1.0")
+        if self.role not in ALLOWED_ROLES:
+            raise ValueError(f"invalid role: {self.role!r} (expected one of {sorted(ALLOWED_ROLES)})")
+        if self.lifecycle not in ALLOWED_LIFECYCLES:
+            raise ValueError(
+                f"invalid lifecycle: {self.lifecycle!r} (expected one of {sorted(ALLOWED_LIFECYCLES)})"
+            )
+        if self.mr_level < 1:
+            raise ValueError(f"mr_level must be >= 1, got {self.mr_level}")
+        if self.mr_level == 1 and self.parent_agent_id is not None:
+            raise ValueError("mr_level=1 (root) must not have a parent_agent_id")
+
+    @property
+    def actor_category(self) -> str:
+        return actor_category(self.role, self.mr_level)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "agent_id": self.agent_id,
-            "agent_type": self.agent_type,
+            "role": self.role,
             "title": self.title,
-            "tree_level": self.tree_level,
+            "mr_level": self.mr_level,
             "parent_agent_id": self.parent_agent_id,
+            "lifecycle": self.lifecycle,
             "status": self.status,
             "created_at": self.created_at,
             "owned_workflow_ids": list(self.owned_workflow_ids),
@@ -389,17 +435,18 @@ class PersistentAgent:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "PersistentAgent":
-        agent_type = data["agent_type"]
+    def from_dict(cls, data: dict[str, Any]) -> "AgentRecord":
+        data = migrate_legacy_agent_dict(data)
         security_clearance = data.get("security_clearance")
-        if security_clearance is None and agent_type in {"mr1", "mrn"}:
+        if security_clearance is None and data["role"] == "orchestrator":
             security_clearance = MAX_AUTONOMOUS_CLEARANCE
         return cls(
             agent_id=data["agent_id"],
-            agent_type=agent_type,
+            role=data["role"],
             title=data["title"],
-            tree_level=int(data["tree_level"]),
+            mr_level=int(data["mr_level"]),
             parent_agent_id=data.get("parent_agent_id"),
+            lifecycle=data.get("lifecycle", "project_scoped"),
             status=data.get("status", "active"),
             created_at=data.get("created_at", _now_iso()),
             owned_workflow_ids=list(data.get("owned_workflow_ids", [])),
@@ -424,6 +471,73 @@ class PersistentAgent:
             assignment_packet=_clone_json_value(data["assignment_packet"])
             if isinstance(data.get("assignment_packet"), dict) else None,
         )
+
+
+def migrate_legacy_agent_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Map a pre-ontology-refactor agent JSON payload (`agent_type` + `tree_level`,
+    no `role`/`mr_level`/`lifecycle`) onto the current schema. Idempotent: a
+    payload that already has `role`/`mr_level` is returned unchanged (aside from
+    a shallow copy). Raises on legacy data this mapping can't interpret rather
+    than silently dropping or misclassifying an agent."""
+    if "role" in data and "mr_level" in data:
+        return data
+    data = dict(data)
+    legacy_agent_type = data.pop("agent_type", None)
+    if legacy_agent_type is not None:
+        if legacy_agent_type not in _LEGACY_AGENT_TYPE_TO_ROLE:
+            raise ValueError(f"cannot migrate unknown legacy agent_type: {legacy_agent_type!r}")
+        data.setdefault("role", _LEGACY_AGENT_TYPE_TO_ROLE[legacy_agent_type])
+    if "tree_level" in data:
+        data["mr_level"] = data.pop("tree_level")
+    if "role" not in data:
+        raise ValueError("agent record has neither 'role' nor a recognizable legacy 'agent_type'")
+    if "mr_level" not in data:
+        raise ValueError("agent record has neither 'mr_level' nor a legacy 'tree_level'")
+    if "lifecycle" not in data:
+        data["lifecycle"] = "standing" if int(data["mr_level"]) == 1 else "project_scoped"
+    return data
+
+
+def migrate_agent_store_ontology(root: Path) -> dict[str, Any]:
+    """One-time, idempotent migration of every agent JSON file under `root`
+    (an agent store's root directory, e.g. `<runtime_root>/agents`) from the
+    pre-ontology-refactor schema (`agent_type` + `tree_level`) to the current
+    one (`role` + `mr_level` + `lifecycle`).
+
+    Safe to run repeatedly: a file already in the new shape is left
+    untouched (not even rewritten), so re-running finds nothing to migrate.
+    Never deletes an agent file; a file that can't be migrated is reported
+    in `failed` and left exactly as it was found.
+    """
+    migrated: list[str] = []
+    already_current: list[str] = []
+    failed: list[dict[str, str]] = []
+    for path in sorted(Path(root).glob("ag-*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            failed.append({"agent_id": path.stem, "error": f"unreadable: {exc}"})
+            continue
+        if "role" in raw and "mr_level" in raw:
+            already_current.append(path.stem)
+            continue
+        try:
+            agent = AgentRecord.from_dict(raw)
+        except (KeyError, ValueError) as exc:
+            failed.append({"agent_id": path.stem, "error": str(exc)})
+            continue
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(agent.to_dict(), handle, indent=2)
+        tmp.replace(path)
+        migrated.append(agent.agent_id)
+    return {
+        "root": str(root),
+        "migrated": migrated,
+        "already_current": already_current,
+        "failed": failed,
+    }
 
 
 @dataclass(frozen=True)
@@ -458,7 +572,7 @@ class AgentScopeError(ValueError):
     """Raised when an agent tree operation is outside the caller scope."""
 
 
-class PersistentAgentStore:
+class AgentStore:
     def __init__(self, root: Optional[Path] = None):
         self._root = Path(root) if root else _DEFAULT_ROOT
         self._root.mkdir(parents=True, exist_ok=True)
@@ -538,10 +652,10 @@ class PersistentAgentStore:
         if not memory_path.exists():
             memory_path.write_text("", encoding="utf-8")
 
-    def _read_agent_file(self, path: Path) -> Optional[PersistentAgent]:
+    def _read_agent_file(self, path: Path) -> Optional[AgentRecord]:
         try:
             with open(path, "r", encoding="utf-8") as handle:
-                return PersistentAgent.from_dict(json.load(handle))
+                return AgentRecord.from_dict(json.load(handle))
         except (OSError, json.JSONDecodeError, KeyError, ValueError):
             return None
 
@@ -584,7 +698,7 @@ class PersistentAgentStore:
         title: str,
         *,
         excluding_agent_id: str | None = None,
-    ) -> Optional[PersistentAgent]:
+    ) -> Optional[AgentRecord]:
         """O(1) title conflict check via the title index (one index file read + at most
         one agent file read to verify). Falls back to a full rebuild if the index is
         stale (i.e., the indexed agent no longer has that title)."""
@@ -605,7 +719,7 @@ class PersistentAgentStore:
             return None
         return candidate
 
-    def save_agent(self, agent: PersistentAgent) -> None:
+    def save_agent(self, agent: AgentRecord) -> None:
         with self._lock:
             target = self.agent_path(agent.agent_id)
             existing = self._read_agent_file(target) if target.exists() else None
@@ -637,35 +751,35 @@ class PersistentAgentStore:
                 index[new_normalized] = agent.agent_id
                 self._save_title_index_locked(index)
 
-    def load_agent(self, agent_id: str) -> Optional[PersistentAgent]:
+    def load_agent(self, agent_id: str) -> Optional[AgentRecord]:
         with self._lock:
             path = self.agent_path(agent_id)
             if not path.exists():
                 return None
             with open(path, "r", encoding="utf-8") as handle:
-                agent = PersistentAgent.from_dict(json.load(handle))
+                agent = AgentRecord.from_dict(json.load(handle))
             self.ensure_agent_files(agent.agent_id)
             return agent
 
-    def require_agent(self, agent_id: str) -> PersistentAgent:
+    def require_agent(self, agent_id: str) -> AgentRecord:
         agent = self.load_agent(agent_id)
         if agent is None:
             raise ValueError(f"agent not found: {agent_id}")
         return agent
 
-    def list_agents(self) -> list[PersistentAgent]:
+    def list_agents(self) -> list[AgentRecord]:
         with self._lock:
-            agents: list[PersistentAgent] = []
+            agents: list[AgentRecord] = []
             for path in sorted(self._root.glob("ag-*.json")):
                 agent = self._read_agent_file(path)
                 if agent is None:
                     continue
                 self.ensure_agent_files(agent.agent_id)
                 agents.append(agent)
-            agents.sort(key=lambda item: (item.tree_level, item.created_at, item.agent_id))
+            agents.sort(key=lambda item: (item.mr_level, item.created_at, item.agent_id))
             return agents
 
-    def ensure_root_agent(self) -> PersistentAgent:
+    def ensure_root_agent(self) -> AgentRecord:
         with self._lock:
             pointer = self.root_agent_id_path
             if pointer.exists():
@@ -678,12 +792,13 @@ class PersistentAgentStore:
                             existing.run_status = "idle"
                             self.save_agent(existing)
                         return existing
-            agent = PersistentAgent(
+            agent = AgentRecord(
                 agent_id=new_agent_id(),
-                agent_type="mr1",
+                role="orchestrator",
                 title="MR1",
-                tree_level=1,
+                mr_level=1,
                 parent_agent_id=None,
+                lifecycle="standing",
                 security_clearance=MAX_AUTONOMOUS_CLEARANCE,
             )
             self.save_agent(agent)
@@ -766,14 +881,14 @@ class PersistentAgentStore:
             return self.load_agent(target_agent_id) is not None
         return target_agent_id == caller_agent_id or target_agent_id in self.descendant_ids(caller_agent_id)
 
-    def list_visible_agents(self, caller_agent_id: str) -> list[PersistentAgent]:
+    def list_visible_agents(self, caller_agent_id: str) -> list[AgentRecord]:
         return [
             agent
             for agent in self.list_agents()
             if self.is_visible(caller_agent_id, agent.agent_id)
         ]
 
-    def get_visible_agent(self, caller_agent_id: str, target_agent_id: str) -> PersistentAgent:
+    def get_visible_agent(self, caller_agent_id: str, target_agent_id: str) -> AgentRecord:
         agent = self.require_agent(target_agent_id)
         if not self.is_visible(caller_agent_id, target_agent_id):
             raise AgentScopeError("access denied: agent not in scope")
@@ -790,7 +905,8 @@ class PersistentAgentStore:
         title: str,
         *,
         security_clearance: Optional[float] = None,
-    ) -> PersistentAgent:
+        lifecycle: str = "project_scoped",
+    ) -> AgentRecord:
         title = title.strip()
         if not title:
             raise ValueError("agent title must be non-empty")
@@ -798,6 +914,8 @@ class PersistentAgentStore:
             raise ValueError("agent title 'all' is reserved")
         if _title_has_control_chars(title):
             raise ValueError("agent title must not contain control characters")
+        if lifecycle not in ALLOWED_LIFECYCLES:
+            raise ValueError(f"invalid lifecycle: {lifecycle!r} (expected one of {sorted(ALLOWED_LIFECYCLES)})")
         parent = self.require_agent(caller_agent_id)
         if is_agent_terminal(parent):
             raise ValueError(f"agent is terminated: {caller_agent_id}")
@@ -806,19 +924,20 @@ class PersistentAgentStore:
             raise ValueError("security_clearance must be between 0.0 and 1.0")
         if child_clearance > parent.security_clearance:
             raise ValueError("child security_clearance cannot exceed parent.security_clearance")
-        agent = PersistentAgent(
+        agent = AgentRecord(
             agent_id=new_agent_id(),
-            agent_type="mrn",
+            role="orchestrator",
             title=title,
-            tree_level=parent.tree_level + 1,
+            mr_level=parent.mr_level + 1,
             parent_agent_id=parent.agent_id,
+            lifecycle=lifecycle,
             security_clearance=child_clearance,
         )
         self.save_agent(agent)
         self._event_log.emit(
             event_type="agent_created",
             actor_id=parent.agent_id,
-            actor_type=parent.agent_type,
+            actor_type=parent.actor_category,
             target_id=agent.agent_id,
             target_type="agent",
             status="created",
@@ -826,13 +945,15 @@ class PersistentAgentStore:
             record_path=str(self.agent_path(agent.agent_id)),
             metadata={
                 "title": agent.title,
-                "tree_level": agent.tree_level,
+                "mr_level": agent.mr_level,
+                "role": agent.role,
+                "lifecycle": agent.lifecycle,
                 "parent_agent_id": parent.agent_id,
             },
         )
         return agent
 
-    def terminate_agent(self, caller_agent_id: str, target_agent_id: str) -> PersistentAgent:
+    def terminate_agent(self, caller_agent_id: str, target_agent_id: str) -> AgentRecord:
         if not self.can_manage_agent(caller_agent_id, target_agent_id):
             raise AgentScopeError("access denied: agent not in scope")
         agent = self.require_agent(target_agent_id)
@@ -902,7 +1023,7 @@ class PersistentAgentStore:
         self._event_log.emit(
             event_type="agent_scope_granted",
             actor_id=granting_agent_id,
-            actor_type=granter.agent_type,
+            actor_type=granter.actor_category,
             target_id=target.agent_id,
             target_type="agent",
             status="granted",
@@ -942,7 +1063,7 @@ class PersistentAgentStore:
         self._event_log.emit(
             event_type="agent_scope_revoked",
             actor_id=granting_agent_id,
-            actor_type=granter.agent_type,
+            actor_type=granter.actor_category,
             target_id=target.agent_id,
             target_type="agent",
             status="revoked",
@@ -960,7 +1081,7 @@ class PersistentAgentStore:
         *,
         parent_request: Optional[str] = None,
         assignment_packet: Optional[dict[str, Any]] = None,
-    ) -> PersistentAgent:
+    ) -> AgentRecord:
         if not self.can_manage_agent(caller_agent_id, target_agent_id):
             raise AgentScopeError("access denied: agent not in scope")
         agent = self.require_agent(target_agent_id)
@@ -1095,7 +1216,7 @@ class PersistentAgentStore:
     def write_workflow_report(self, workflow: "Workflow", store: "WorkflowStore") -> Optional[Path]:
         workflow = self.normalize_workflow_ownership(workflow)
         owner = self.load_agent(workflow.owner_agent_id)
-        if owner is None or owner.agent_type != "mrn":
+        if owner is None or owner.mr_level == 1:
             return None
         path = self.report_dir(owner.agent_id) / f"{_report_ts(workflow.finished_at)}.md"
         if path.exists():

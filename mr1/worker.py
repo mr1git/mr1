@@ -1,25 +1,25 @@
 """
-Kazi — Ephemeral Job Agent
-===========================
+Worker — Ephemeral Job Agent (role=worker)
+============================================
 Spawns, does one task, dies. Knows nothing about the broader system.
 
-A Kazi receives a context package (dict) and nothing else. It:
+A worker receives a context package (dict) and nothing else. It:
   1. Validates the context package
-  2. Loads its own agent config from agents/kazi.yml
+  2. Loads its own agent config from agents/worker.yml
   3. Builds the claude CLI command from the context
   4. Passes through dispatcher validation via spawner
   5. Spawns the subprocess and waits (with timeout)
   6. Captures stdout/stderr
   7. Logs the result to tasks/{task_id}/logs/ via logger
-  8. Returns a KaziResult to whoever spawned it
+  8. Returns a WorkerResult to whoever spawned it
   9. Dies — nothing persists in this module
 
 The subprocess command is:
   claude -p "{instructions}" --allowedTools "{tools}" \
          --model {model} --output-format json
 
-The dispatcher has already validated that kazi is permitted to use
-these flags before the process is created.
+The dispatcher has already validated that this worker is permitted to
+use these flags before the process is created.
 """
 
 import subprocess
@@ -43,9 +43,9 @@ from mr1.core import Dispatcher, PermissionDenied, Logger, Spawner
 # Paths
 # ---------------------------------------------------------------------------
 _PKG_ROOT = Path(__file__).resolve().parent
-_KAZI_CONFIG_PATH = _PKG_ROOT / "agents" / "kazi.yml"
+_WORKER_CONFIG_PATH = _PKG_ROOT / "agents" / "worker.yml"
 
-# Default timeout for a kazi job (seconds). Individual jobs can override.
+# Default timeout for a worker job (seconds). Individual jobs can override.
 _DEFAULT_TIMEOUT_S = 300
 
 # Stderr patterns that indicate the claude process hit its context limit.
@@ -78,9 +78,9 @@ def _emit_event(
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class KaziResult:
+class WorkerResult:
     """
-    Immutable result of a single kazi job.
+    Immutable result of a single worker job.
 
     status is one of:
       completed         — clean exit, output captured
@@ -121,8 +121,8 @@ class KaziResult:
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Load the kazi agent YAML definition."""
-    with open(_KAZI_CONFIG_PATH) as f:
+    """Load the worker agent YAML definition."""
+    with open(_WORKER_CONFIG_PATH) as f:
         return yaml.safe_load(f)
 
 
@@ -164,7 +164,7 @@ def _build_prompt(instructions: str, file_paths: list[str]) -> str:
     """
     Build the -p prompt string from the context package fields.
 
-    The prompt is the ONLY thing the kazi sees — all relevant information
+    The prompt is the ONLY thing the worker sees — all relevant information
     must be baked in here.
     """
     parts = [instructions]
@@ -174,9 +174,9 @@ def _build_prompt(instructions: str, file_paths: list[str]) -> str:
     return "\n\n".join(parts)
 
 
-def _fail(task_id: str, error: str) -> KaziResult:
+def _fail(task_id: str, error: str) -> WorkerResult:
     """Shorthand for returning an immediate failure without spawning."""
-    return KaziResult(
+    return WorkerResult(
         task_id=task_id,
         status="invalid",
         output="",
@@ -197,22 +197,22 @@ def run(
     logger: Optional[Logger] = None,
     timeout: Optional[int] = None,
     event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
-) -> KaziResult:
+) -> WorkerResult:
     """
-    Execute a single kazi job end-to-end.
+    Execute a single worker job end-to-end.
 
-    This is the only public entry point. Call it, get a KaziResult, done.
+    This is the only public entry point. Call it, get a WorkerResult, done.
 
     Args:
         context: The context package. Required keys:
             task_id      (str)  — unique task identifier
-            instructions (str)  — what the kazi should do
+            instructions (str)  — what the worker should do
 
           Optional keys:
-            allowed_tools (list[str]) — tools the kazi may use
-                                        (defaults to kazi.yml config)
+            allowed_tools (list[str]) — tools the worker may use
+                                        (defaults to worker.yml config)
             working_dir   (str)       — cwd for the subprocess
-            file_paths    (list[str]) — files the kazi should know about
+            file_paths    (list[str]) — files the worker should know about
             timeout       (int)       — per-job timeout override (seconds)
 
         spawner: Shared Spawner instance. Created fresh if None.
@@ -220,11 +220,11 @@ def run(
         timeout: Fallback timeout if not set in the context package.
 
     Returns:
-        KaziResult — always. Never raises, never hangs.
+        WorkerResult — always. Never raises, never hangs.
     """
     # ----- Validate context package -----
 
-    task_id = context.get("task_id", "kazi-unknown")
+    task_id = context.get("task_id", "worker-unknown")
 
     instructions = context.get("instructions")
     if not instructions or not isinstance(instructions, str):
@@ -244,7 +244,7 @@ def run(
 
     config = _load_config()
     runtime_config = validate_agent_runtime_config(
-        "kazi",
+        "worker",
         {
             "model": config.get("model"),
             "allowed_tools": config.get("allowed_tools"),
@@ -276,7 +276,7 @@ def run(
 
     try:
         record = spawner.spawn(
-            agent_type="kazi",
+            agent_type="worker",
             task_id=task_id,
             prompt=prompt,
             model=model,
@@ -288,13 +288,13 @@ def run(
         )
     except PermissionDenied as e:
         elapsed = time.monotonic() - start
-        logger.log_denied(task_id, "kazi", str(e))
+        logger.log_denied(task_id, "worker", str(e))
         _emit_event(
             event_callback,
             "task_failed",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="denied",
             lane=lane,
             description=description,
@@ -304,12 +304,12 @@ def run(
             "task_detached",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="denied",
             lane=lane,
             description=description,
         )
-        return KaziResult(
+        return WorkerResult(
             task_id=task_id,
             status="denied",
             output="",
@@ -325,7 +325,7 @@ def run(
         "task_spawned",
         task_id=task_id,
         parent_task_id=parent_task_id,
-        agent_type="kazi",
+        agent_type="worker",
         status="running",
         pid=pid,
         lane=lane,
@@ -359,7 +359,7 @@ def run(
 
         elapsed = time.monotonic() - start
         logger.log(
-            task_id, "kazi", "timeout", "error",
+            task_id, "worker", "timeout", "error",
             metadata={
                 "pid": pid,
                 "timeout_s": job_timeout,
@@ -371,7 +371,7 @@ def run(
             "task_failed",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="timeout",
             pid=pid,
             lane=lane,
@@ -382,13 +382,13 @@ def run(
             "task_detached",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="timeout",
             pid=pid,
             lane=lane,
             description=description,
         )
-        return KaziResult(
+        return WorkerResult(
             task_id=task_id,
             status="timeout",
             output=_extract_output(stdout_raw.decode("utf-8", errors="replace")),
@@ -417,7 +417,7 @@ def run(
 
     if parse_error is not None:
         logger.log(
-            task_id, "kazi", "complete", "error",
+            task_id, "worker", "complete", "error",
             metadata={
                 "pid": pid,
                 "returncode": returncode,
@@ -431,7 +431,7 @@ def run(
             "task_failed",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="failed",
             pid=pid,
             lane=lane,
@@ -442,13 +442,13 @@ def run(
             "task_detached",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="failed",
             pid=pid,
             lane=lane,
             description=description,
         )
-        return KaziResult(
+        return WorkerResult(
             task_id=task_id,
             status="failed",
             output="",
@@ -464,7 +464,7 @@ def run(
     if parsed["is_error"]:
         error_type = "auth_error" if is_auth_error_text(parsed["text"]) else "cli_error"
         logger.log(
-            task_id, "kazi", "complete", "error",
+            task_id, "worker", "complete", "error",
             metadata={
                 "pid": pid,
                 "returncode": returncode,
@@ -478,7 +478,7 @@ def run(
             "task_failed",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="failed",
             pid=pid,
             lane=lane,
@@ -489,7 +489,7 @@ def run(
             "task_detached",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="failed",
             pid=pid,
             lane=lane,
@@ -501,7 +501,7 @@ def run(
             "pid": pid,
             "error_type": error_type,
         })
-        return KaziResult(
+        return WorkerResult(
             task_id=task_id,
             status="failed",
             output=parsed["text"],
@@ -514,7 +514,7 @@ def run(
 
     if returncode == 0:
         logger.log(
-            task_id, "kazi", "complete", "ok",
+            task_id, "worker", "complete", "ok",
             metadata={
                 "pid": pid,
                 "returncode": 0,
@@ -526,7 +526,7 @@ def run(
             "task_completed",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="completed",
             pid=pid,
             lane=lane,
@@ -537,13 +537,13 @@ def run(
             "task_detached",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="completed",
             pid=pid,
             lane=lane,
             description=description,
         )
-        return KaziResult(
+        return WorkerResult(
             task_id=task_id,
             status="completed",
             output=parsed["text"],
@@ -560,7 +560,7 @@ def run(
     # Non-zero exit — check for context window exhaustion.
     if _detect_context_exceeded(stderr):
         logger.log(
-            task_id, "kazi", "context_exceeded", "error",
+            task_id, "worker", "context_exceeded", "error",
             metadata={
                 "pid": pid,
                 "returncode": returncode,
@@ -574,7 +574,7 @@ def run(
             "task_failed",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="context_exceeded",
             pid=pid,
             lane=lane,
@@ -585,13 +585,13 @@ def run(
             "task_detached",
             task_id=task_id,
             parent_task_id=parent_task_id,
-            agent_type="kazi",
+            agent_type="worker",
             status="context_exceeded",
             pid=pid,
             lane=lane,
             description=description,
         )
-        return KaziResult(
+        return WorkerResult(
             task_id=task_id,
             status="context_exceeded",
             output=parsed["text"],
@@ -610,7 +610,7 @@ def run(
 
     # Generic failure.
     logger.log(
-        task_id, "kazi", "complete", "error",
+        task_id, "worker", "complete", "error",
         metadata={
             "pid": pid,
             "returncode": returncode,
@@ -624,7 +624,7 @@ def run(
         "task_failed",
         task_id=task_id,
         parent_task_id=parent_task_id,
-        agent_type="kazi",
+        agent_type="worker",
         status="failed",
         pid=pid,
         lane=lane,
@@ -635,13 +635,13 @@ def run(
         "task_detached",
         task_id=task_id,
         parent_task_id=parent_task_id,
-        agent_type="kazi",
+        agent_type="worker",
         status="failed",
         pid=pid,
         lane=lane,
         description=description,
     )
-    return KaziResult(
+    return WorkerResult(
         task_id=task_id,
         status="failed",
         output=parsed["text"],

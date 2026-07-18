@@ -38,7 +38,7 @@ from mr1.autonomy.objectives import KIND_ONCE, ObjectiveStore
 from mr1.clock import VirtualClock
 from mr1.event_log import EventLog
 from mr1.messages import MessageStore
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 
 
 START = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -278,7 +278,7 @@ def test_notify_never_raises(runtime):
 
 def _escalator(runtime, *, notifier=None):
     clock = VirtualClock(start=START)
-    agents = PersistentAgentStore(root=runtime / "agents")
+    agents = AgentStore(root=runtime / "agents")
     objectives = ObjectiveStore(runtime, clock=clock)
     messages = MessageStore(root=runtime / "messages", scoped_agent_store=agents)
     escalator = Escalator(

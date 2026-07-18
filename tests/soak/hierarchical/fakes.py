@@ -2,11 +2,11 @@
 Scripted brain + compiler for the quick fake-planner mode.
 
 The important property of MR1's runtime, established by reading `MR1.step`,
-is that the *orchestration decision* — respond / clarify / persistent agent /
+is that the *orchestration decision* — respond / clarify / orchestrator /
 run command / inspect / workflow — is made deterministically by
 `build_route_advice` on the user's text plus runtime grounding. The brain
 (`MR1Process`) is only invoked *inside* a chosen route, to author content:
-a direct answer, a persistent agent's mission, or (via the compiler) a
+a direct answer, an orchestrator's mission, or (via the compiler) a
 workflow spec.
 
 So a fake brain does not need to "decide" anything. It only needs to return
@@ -25,7 +25,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
+
+from mr1.worker import WorkerResult
 
 # Marker text that only appears in the persistent-agent *design* prompt.
 _AGENT_DESIGN_MARKER = "AGENT_TITLE:"
@@ -173,7 +175,7 @@ def fake_mrn_reasoner(agent, system_prompt: str, prompt: str) -> str:
     """
     Drop-in for `mr1.mrn_loop.run_mrn_step_agent`.
 
-    A freshly-created persistent agent runs its own first step via
+    A freshly-created orchestrator runs its own first step via
     `MRnRunRunner`/`MRnStepRunner`, whose default reasoner spawns a *real*
     `claude` subprocess independent of MR1's own `_process` — so patching only
     MR1's brain is not enough to keep a fake-planner soak free of real LLM
@@ -192,6 +194,62 @@ def fake_mrn_reasoner(agent, system_prompt: str, prompt: str) -> str:
         "report": report,
         "next_status": "reporting",
     })
+
+
+def fake_worker_run(
+    context: Dict[str, Any],
+    spawner: Optional[Any] = None,
+    logger: Optional[Any] = None,
+    timeout: Optional[int] = None,
+    event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> WorkerResult:
+    """Drop-in for `mr1.worker.run` under the fake planner.
+
+    A bounded-investigation turn (`root.py`'s `_route_bounded_investigation`)
+    calls the real `worker.run()`, which spawns a real `claude` subprocess —
+    patching only the brain (`FakeBrainProcess`) and the MRn reasoner
+    (`fake_mrn_reasoner`, above) is not enough to keep a fake-planner run
+    free of real LLM calls; this is the worker-spawn equivalent. Emits the
+    same `task_spawned`/`task_completed`/`task_detached` event sequence the
+    real function does, so `StateManager.tasks` (and therefore anything
+    built on it) stays populated exactly as it would with a real worker.
+    """
+    task_id = context.get("task_id", "worker-unknown")
+    instructions = str(context.get("instructions") or "")
+    parent_task_id = context.get("parent_task_id", "mr1")
+    lane = context.get("lane", "conversation")
+    description = str(context.get("description") or instructions[:200])
+
+    def _emit(event_type: str, status: str) -> None:
+        if event_callback is None:
+            return
+        event_callback({
+            "type": event_type,
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "agent_type": "worker",
+            "status": status,
+            "lane": lane,
+            "description": description,
+        })
+
+    _emit("task_spawned", "running")
+    output = (
+        f"[FAKE WORKER] Reviewed the assigned scope for: {instructions.strip()[:150]!r}. "
+        "Found the persistence paths to be the most fragile part; made no changes."
+    )
+    _emit("task_completed", "completed")
+    _emit("task_detached", "completed")
+
+    return WorkerResult(
+        task_id=task_id,
+        status="completed",
+        output=output,
+        error=None,
+        duration_s=0.01,
+        pid=None,
+        payload={"summary": output, "text": output, "status": "succeeded"},
+    )
 
 
 def _extract_user_request(prompt: str) -> str:

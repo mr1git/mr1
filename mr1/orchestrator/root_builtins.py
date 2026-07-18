@@ -76,13 +76,13 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
         if total == 0:
             return (
                 "No running spawned processes/test agents to kill. "
-                "Persistent agents are not affected. "
-                "Use /agent kill <ag-id> to terminate a persistent agent."
+                "Orchestrator agents are not affected. "
+                "Use /agent kill <ag-id> to terminate an orchestrator agent."
             )
         return (
             f"Killed {total} spawned process/test agent(s). "
-            "Persistent MRn agents are not affected. "
-            "Use /agent kill <ag-id> to terminate a persistent agent."
+            "Other orchestrator agents are not affected. "
+            "Use /agent kill <ag-id> to terminate an orchestrator agent."
         )
     if cmd == "/history":
         recent = root._state._state["decisions"][-10:]
@@ -333,12 +333,12 @@ def handle_builtin(root, cmd: str) -> Optional[str]:
         if total == 0:
             return (
                 "No running spawned processes/test agents to stop. "
-                "Persistent agents are not affected. "
-                "Use /agent kill <ag-id> to terminate a persistent agent."
+                "Orchestrator agents are not affected. "
+                "Use /agent kill <ag-id> to terminate an orchestrator agent."
             )
         return (
             f"Stopped {total} spawned process/test agent(s). "
-            "Persistent MRn agents are not affected."
+            "Other orchestrator agents are not affected."
         )
     if cmd.startswith("/"):
         command = cmd.split(maxsplit=1)[0]
@@ -447,7 +447,7 @@ def handle_agent_builtin(root, cmd: str) -> str:
     usage = (
         "usage: /agent <create <title>|kill <ag-id>|kill-all [all|<title>] [--exclude <agent-id-or-title>]...|assign <ag-id> <mission-file>|"
         "step <ag-id>|run <ag-id> [--steps N] [--max-workflows N] [--no-confirm-workflows]|"
-        "<ag-id>|kazi [health]> [--json] [--brief]"
+        "<ag-id>|worker [health]> [--json] [--brief]"
     )
     try:
         parts = shlex.split(cmd)

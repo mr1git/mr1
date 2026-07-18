@@ -5,12 +5,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from mr1.kazi_runner import MockRunner
+from mr1.worker_runner import MockRunner
 from mr1.memory_curator import EvidenceRef, InsightStore, MemoryInsight
 from mr1.memory_graph import MemoryGraph, MemoryGraphStore, MemoryNode, agent_node_id
 from mr1.memory_retrieval import update_memory_retrieval
 from mr1.mr1 import MR1, MR1Process, StateManager
-from mr1.scoped_agents import PersistentAgentStore
+from mr1.scoped_agents import AgentStore
 from mr1.scheduler import Scheduler, WorkflowSpecError, submit_spec_to_disk
 from mr1.workflow_compiler import WorkflowCompilerClient, WorkflowCompilerFailure
 from mr1.workflow_models import Provenance
@@ -32,7 +32,7 @@ def _spec(tmp_path) -> dict:
                 "label": "summarize",
                 "title": "Summarize",
                 "task_kind": "agent",
-                "agent_type": "kazi",
+                "agent_type": "worker",
                 "depends_on": ["read_notes"],
                 "inputs": [{"name": "notes", "from": "read_notes.result.text"}],
                 "prompt": "Summarize the notes.",
@@ -110,7 +110,7 @@ def workflow_store(tmp_path):
 
 @pytest.fixture
 def agent_store(tmp_path):
-    return PersistentAgentStore(root=tmp_path / "agents")
+    return AgentStore(root=tmp_path / "agents")
 
 
 def test_compiler_output_envelope_parses(tmp_path, agent_store):

@@ -20,7 +20,7 @@ from mr1.capability_policy import (
     CapabilityApprovalStore,
 )
 from mr1.event_log import bind_correlation_id, cli_correlation_id
-from mr1.scoped_agents import AgentScopeError, PersistentAgentStore
+from mr1.scoped_agents import AgentScopeError, AgentStore
 from mr1.tools import ToolRegistry, default_tool_registry
 from mr1.workflow_store import WorkflowStore
 
@@ -266,7 +266,7 @@ def _cmd_capabilities(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
@@ -279,7 +279,7 @@ def _cmd_capability(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
@@ -301,7 +301,7 @@ def _cmd_capability_call(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     from mr1.capability_runner import CapabilityRunner
     config_path = Path(args.config_file)
@@ -338,7 +338,7 @@ def _cmd_tools(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
@@ -351,7 +351,7 @@ def _cmd_tool(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store, caller_agent_id, scoped_agents
     rc = _reject_invalid_flag_combination(args)
@@ -373,7 +373,7 @@ def _cmd_approvals_list(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     approvals = _visible_approvals(_approval_store_for(store), scoped_agents, caller_agent_id)
     print(_format_approvals_table(approvals, json_output=args.json))
@@ -383,7 +383,7 @@ def _cmd_approvals_show(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     try:
         approval = _require_visible_approval(
@@ -402,7 +402,7 @@ def _cmd_approvals_decide(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     approval_store = _approval_store_for(store)
     try:
@@ -438,7 +438,7 @@ def _cmd_capability_audit_list(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     try:
@@ -453,7 +453,7 @@ def _cmd_capability_audit_show(
     args: argparse.Namespace,
     store: WorkflowStore,
     caller_agent_id: str,
-    scoped_agents: PersistentAgentStore,
+    scoped_agents: AgentStore,
 ) -> int:
     del store
     try:
